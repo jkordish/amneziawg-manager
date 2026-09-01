@@ -78,7 +78,10 @@ class SystemdSandboxTests(unittest.TestCase):
         for directive in (
             "NoNewPrivileges=yes",
             "ProtectSystem=strict",
-            "ReadWritePaths=/opt/amneziawg/generated /run/lock",
+            "ReadWritePaths=/opt/amneziawg/generated /run/awgctl",
+            "RuntimeDirectory=awgctl",
+            "RuntimeDirectoryMode=0700",
+            "RuntimeDirectoryPreserve=yes",
             "ProtectHome=yes",
             "PrivateDevices=yes",
             "ProtectKernelModules=yes",

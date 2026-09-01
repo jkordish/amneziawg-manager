@@ -6,8 +6,11 @@ import datetime as dt
 import subprocess
 import io
 import pathlib
+import shutil
 import sys
 import tempfile
+import stat
+import threading
 import unittest
 from unittest import mock
 import base64
@@ -46,8 +49,10 @@ def patched_layout(root):
         "PENDING_TRANSITIONS": root / "pending/obfuscation",
         "TRANSITION_FILE": root / "transitions/obfuscation.json",
         "TRANSITION_OUTCOME_FILE": root / "transitions/obfuscation-outcome.json",
+        "ACTIVATION_JOURNAL_FILE": root / "transitions/obfuscation-activation.json",
         "RUNTIME_CONFIG": root / "runtime/awg0.conf",
-        "LOCK_FILE": root / "run/awgctl.lock",
+        "RUNTIME_DIR": root / "run/awgctl",
+        "LOCK_FILE": root / "run/awgctl/mutation.lock",
     }
     with mock.patch.multiple(core, **values):
         yield values
@@ -169,9 +174,11 @@ def prepared_state():
     core.atomic_write(
         pending_root / "clients/kat-iphone/kat-iphone.png", b"pending qr", 0o600
     )
-    backup = core.BACKUPS / "20260901T100000Z"
-    backup.mkdir(parents=True, mode=0o700)
+    backup = make_transition_backup()
     document = transition_document(pending_base=core.PENDING_TRANSITIONS)
+    document["backup_identity"] = core.backup_snapshot_identity(
+        core.read_protected_tree(backup)
+    )
     document["prestate_sha256"] = "ab" * 32
     document["pending_sha256"] = core.pending_transition_artifact_digest(pending_root)
     core.compare_and_swap_transition(
@@ -180,6 +187,27 @@ def prepared_state():
         expected_state=None,
     )
     return document, config, client, new_config, server, profile, backup
+
+
+def make_transition_backup():
+    backup = core.BACKUPS / "20260901T100000Z"
+    backup.mkdir(parents=True, mode=0o700)
+    for component in core.RESTORE_COMPONENTS:
+        source = core.ROOT / component
+        destination = backup / component
+        if source.is_dir():
+            shutil.copytree(source, destination)
+        else:
+            destination.mkdir(mode=0o700)
+    core.chmod_secret_tree(backup)
+    manifest = core.create_backup_manifest(
+        backup,
+        product_version=core.VERSION,
+        created_at="2026-09-01T10:00:00Z",
+    )
+    core.atomic_json(backup / "manifest.json", manifest, 0o600)
+    core.chmod_secret_tree(backup)
+    return backup
 
 
 def active_state():
@@ -199,6 +227,7 @@ def active_state():
         deadline_at="2026-09-01T10:11:00Z",
         pre_rx=100,
         pre_tx=200,
+        pre_handshake=0,
     )
     core.compare_and_swap_transition(
         active,
@@ -224,6 +253,10 @@ def transition_document(state="prepared", pending_base=None):
         "old_port": 55323,
         "new_port": 4242,
         "backup_name": "20260901T100000Z",
+        "backup_identity": {
+            "manifest_sha256": "de" * 32,
+            "snapshot_sha256": "ef" * 32,
+        },
         "pending": {
             "root": str(root),
             "server_state": str(root / "server.json"),
@@ -250,6 +283,7 @@ def transition_document(state="prepared", pending_base=None):
         "deadline_at": deadline,
         "pre_rx": counter,
         "pre_tx": counter + 1 if counter is not None else None,
+        "pre_handshake": 0 if state == "active" else None,
         "prestate_sha256": "ab" * 32,
         "pending_sha256": "cd" * 32,
     }
@@ -344,7 +378,249 @@ class ObfuscationGrammarTests(unittest.TestCase):
         timeout.assert_called_once_with(internal_args)
 
 
+class MutationLockTests(unittest.TestCase):
+    def test_mutation_lock_creates_one_protected_runtime_inode(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with patched_layout(pathlib.Path(directory)), mock.patch.object(core, "require_root"):
+                with core.mutation_lock():
+                    parent = core.RUNTIME_DIR.lstat()
+                    lock = core.LOCK_FILE.lstat()
+                    self.assertTrue(stat.S_ISDIR(parent.st_mode))
+                    self.assertEqual(stat.S_IMODE(parent.st_mode), 0o700)
+                    self.assertEqual((parent.st_uid, parent.st_gid), (core.os.geteuid(), core.os.getegid()))
+                    self.assertTrue(stat.S_ISREG(lock.st_mode))
+                    self.assertEqual(stat.S_IMODE(lock.st_mode), 0o600)
+                    self.assertEqual(lock.st_nlink, 1)
+                    self.assertEqual((lock.st_uid, lock.st_gid), (core.os.geteuid(), core.os.getegid()))
+
+    def test_mutation_lock_rejects_unsafe_parent_and_file_types_or_identity(self):
+        unsafe_kinds = ("parent-mode", "parent-symlink", "file-symlink", "hardlink", "fifo", "owner")
+        for kind in unsafe_kinds:
+            with self.subTest(kind=kind), tempfile.TemporaryDirectory() as directory:
+                root = pathlib.Path(directory)
+                with patched_layout(root):
+                    core.RUNTIME_DIR.parent.mkdir(parents=True, mode=0o700)
+                    if kind == "parent-symlink":
+                        target = root / "attacker"
+                        target.mkdir(mode=0o700)
+                        core.RUNTIME_DIR.symlink_to(target, target_is_directory=True)
+                    else:
+                        core.RUNTIME_DIR.mkdir(mode=0o700)
+                    if kind == "parent-mode":
+                        core.RUNTIME_DIR.chmod(0o777)
+                    elif kind == "file-symlink":
+                        target = root / "target"
+                        target.write_bytes(b"")
+                        core.LOCK_FILE.symlink_to(target)
+                    elif kind == "hardlink":
+                        target = root / "target"
+                        target.write_bytes(b"")
+                        core.os.link(target, core.LOCK_FILE)
+                    elif kind == "fifo":
+                        core.os.mkfifo(core.LOCK_FILE, 0o600)
+
+                    patches = [mock.patch.object(core, "require_root")]
+                    if kind == "owner":
+                        patches.extend([
+                            mock.patch.object(core.os, "geteuid", return_value=12345),
+                            mock.patch.object(core.os, "getegid", return_value=12345),
+                        ])
+                    with contextlib.ExitStack() as stack:
+                        for patcher in patches:
+                            stack.enter_context(patcher)
+                        with self.assertRaisesRegex(core.AwgctlError, "mutation.*unsafe"):
+                            with core.mutation_lock():
+                                self.fail("unsafe lock acquired")
+
+    def test_internal_lock_timeout_is_bounded_and_controlled(self):
+        monotonic = mock.Mock(side_effect=[0.0, 0.2, 0.6])
+        with tempfile.TemporaryDirectory() as directory:
+            with (
+                patched_layout(pathlib.Path(directory)),
+                mock.patch.object(core, "require_root"),
+                mock.patch.object(core.fcntl, "flock", side_effect=BlockingIOError),
+                mock.patch.object(core.time, "monotonic", side_effect=monotonic),
+            ):
+                with self.assertRaisesRegex(core.AwgctlError, "lock.*timeout"):
+                    with core.mutation_lock(timeout_seconds=0.5):
+                        self.fail("contended lock acquired")
+
+
+class TransitionInterlockTests(unittest.TestCase):
+    def test_profile_reader_waits_for_complete_multi_client_activation_snapshot(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with patched_layout(pathlib.Path(directory)), mock.patch.object(core, "require_root"):
+                prepared_state()
+                second = core.CLIENTS / "macbook/macbook.conf"
+                core.atomic_write(second, "classic second\n", 0o600)
+                first = core.CLIENTS / "kat-iphone/kat-iphone.conf"
+                first_written = threading.Event()
+                allow_finish = threading.Event()
+                exported = threading.Event()
+                observed = []
+
+                def activation_writer():
+                    with core.mutation_lock(transition_lifecycle=True):
+                        core.atomic_write(first, "new first\n", 0o600)
+                        first_written.set()
+                        allow_finish.wait(timeout=5)
+                        core.atomic_write(second, "new second\n", 0o600)
+
+                def capture_output(path, content):
+                    observed.append(content)
+                    exported.set()
+                    return path
+
+                def reader():
+                    core.cmd_client_export(
+                        argparse.Namespace(
+                            client_name="macbook",
+                            stdout=False,
+                            output=pathlib.Path("/tmp/exported.conf"),
+                            json=False,
+                        )
+                    )
+
+                writer_thread = threading.Thread(target=activation_writer)
+                reader_thread = threading.Thread(target=reader)
+                with (
+                    mock.patch.object(core, "write_operator_secret", side_effect=capture_output),
+                    mock.patch.object(core, "audit"),
+                ):
+                    writer_thread.start()
+                    self.assertTrue(first_written.wait(timeout=5))
+                    reader_thread.start()
+                    self.assertFalse(exported.wait(timeout=0.1))
+                    allow_finish.set()
+                    writer_thread.join(timeout=5)
+                    reader_thread.join(timeout=5)
+
+                self.assertFalse(writer_thread.is_alive())
+                self.assertFalse(reader_thread.is_alive())
+                self.assertEqual(observed, [b"new second\n"])
+
+    def test_every_unrelated_public_and_internal_mutator_is_rejected_before_handler_work(self):
+        public_cases = (
+            (["start", "--dry-run"], "cmd_service"),
+            (["backup", "--dry-run"], "cmd_backup"),
+            (["restore", "missing", "--dry-run"], "cmd_restore"),
+            (["diagnose", "--dry-run"], "cmd_diagnose"),
+            (["update", "apply", "--dry-run"], "cmd_update"),
+            (["self-test", "--experimental", "--dry-run"], "cmd_self_test"),
+            (["config", "set", "dns", "1.1.1.1", "--dry-run"], "cmd_config_set"),
+            (["client", "add", "new-phone", "--dry-run"], "cmd_client_add"),
+            (["client", "edit", "kat-iphone", "--owner", "Kat", "--dry-run"], "cmd_client_edit"),
+            (["client", "import", "kat-iphone", "--config", "missing", "--dry-run"], "cmd_client_import"),
+            (["client", "revoke", "kat-iphone", "--dry-run"], "cmd_client_revoke"),
+            (["client", "rotate", "kat-iphone", "--dry-run"], "cmd_client_rotate"),
+            (["client", "qr", "kat-iphone", "--dry-run"], "cmd_client_qr"),
+            (["client", "expire", "--dry-run"], "cmd_client_expire"),
+        )
+        internal_cases = (
+            (["_firewall", "up"], "cmd_firewall"),
+            (["_expire-clients", "--dry-run"], "cmd_expire_clients"),
+            (
+                [
+                    "_initialize-fresh",
+                    "--endpoint",
+                    "vpn.example.com",
+                    "--external-interface",
+                    "ens5",
+                ],
+                "cmd_initialize_fresh",
+            ),
+            (
+                [
+                    "_migrate-existing",
+                    "--server-config",
+                    "server.conf",
+                    "--client-config",
+                    "client.conf",
+                ],
+                "cmd_migrate_existing",
+            ),
+        )
+        cases = (
+            *(("public", argv, handler) for argv, handler in public_cases),
+            *(("internal", argv, handler) for argv, handler in internal_cases),
+        )
+        for state in ("prepared", "active"):
+            for entrypoint, argv, handler_name in cases:
+                with (
+                    self.subTest(state=state, argv=argv),
+                    tempfile.TemporaryDirectory() as directory,
+                ):
+                    with patched_layout(pathlib.Path(directory)):
+                        prepared = transition_document(
+                            "prepared",
+                            pending_base=core.PENDING_TRANSITIONS,
+                        )
+                        core.compare_and_swap_transition(
+                            prepared,
+                            expected_transaction_id=None,
+                            expected_state=None,
+                        )
+                        if state == "active":
+                            core.compare_and_swap_transition(
+                                transition_document(
+                                    "active",
+                                    pending_base=core.PENDING_TRANSITIONS,
+                                ),
+                                expected_transaction_id=TRANSACTION_ID,
+                                expected_state="prepared",
+                            )
+                        args = core.build_parser(entrypoint=entrypoint).parse_args(argv)
+                        with (
+                            mock.patch.object(core, "require_root"),
+                            mock.patch.object(
+                                core,
+                                handler_name,
+                                side_effect=AssertionError(
+                                    "handler ran before transition interlock"
+                                ),
+                            ),
+                        ):
+                            with self.assertRaisesRegex(
+                                core.AwgctlError,
+                                "transition.*pending",
+                            ):
+                                core.dispatch(args)
+
+
 class TransitionDocumentTests(unittest.TestCase):
+    def test_transition_scalar_types_and_uint64_counters_fail_with_controlled_errors(self):
+        active = transition_document("active")
+        invalid_values = {
+            "state": [],
+            "mode": {},
+            "profile_name": None,
+            "client_name": ["kat-iphone"],
+            "backup_name": False,
+            "ingress_boundary": {},
+            "prepared_at": 0,
+            "activated_at": True,
+            "pre_rx": -1,
+            "pre_tx": 2**64,
+            "pre_handshake": -1,
+        }
+        for field, value in invalid_values.items():
+            with self.subTest(field=field, value=value):
+                candidate = copy.deepcopy(active)
+                candidate[field] = value
+                try:
+                    core.normalize_transition_document(candidate)
+                except core.AwgctlError:
+                    pass
+                except Exception as exc:
+                    self.fail(f"{field} leaked an uncontrolled {type(exc).__name__}")
+                else:
+                    self.fail(f"{field} accepted invalid value {value!r}")
+
+        nested = copy.deepcopy(active)
+        nested["pending"]["profiles"][0]["name"] = {"kat": "iphone"}
+        with self.assertRaises(core.AwgctlError):
+            core.normalize_transition_document(nested)
+
     def test_completed_outcome_is_strict_bounded_and_nonsecret(self):
         outcome = {
             "schema_version": 1,
@@ -356,6 +632,8 @@ class TransitionDocumentTests(unittest.TestCase):
             "profile_name": "russia-ios-v1",
             "old_port": 55323,
             "new_port": 4242,
+            "cleanup_phase": "complete",
+            "profile_updates": [],
         }
         self.assertEqual(core.normalize_transition_outcome(outcome), outcome)
         invalid = copy.deepcopy(outcome)
@@ -468,6 +746,66 @@ class TransitionDocumentTests(unittest.TestCase):
 
 
 class TransitionPortTests(unittest.TestCase):
+    def test_listener_inspection_fails_closed_and_detects_ipv6_only_use(self):
+        failed = subprocess.CompletedProcess(["ss"], 1, b"", b"permission denied")
+        with mock.patch.object(core, "run", return_value=failed):
+            with self.assertRaises(core.AwgctlError):
+                core.udp_port_is_listening(4242)
+
+        ipv6 = subprocess.CompletedProcess(
+            ["ss"],
+            0,
+            b"UNCONN 0 0 [::]:4242 [::]:*\n",
+            b"",
+        )
+        with mock.patch.object(core, "run", return_value=ipv6):
+            self.assertTrue(core.udp_port_is_listening(4242))
+
+    def test_dual_family_port_reservation_holds_both_sockets_and_cleans_partial_failure(self):
+        sockets = []
+
+        class FakeSocket:
+            def __init__(self, family, kind):
+                self.family = family
+                self.kind = kind
+                self.bound = None
+                self.closed = False
+                self.options = []
+                sockets.append(self)
+
+            def setsockopt(self, *values):
+                self.options.append(values)
+
+            def bind(self, address):
+                self.bound = address
+
+            def close(self):
+                self.closed = True
+
+        reservation = core.acquire_udp_port_reservation(4242, socket_factory=FakeSocket)
+        self.assertEqual(
+            [(item.family, item.bound) for item in sockets],
+            [
+                (core.socket.AF_INET, ("0.0.0.0", 4242)),
+                (core.socket.AF_INET6, ("::", 4242)),
+            ],
+        )
+        self.assertTrue(all(not item.closed for item in sockets))
+        reservation.release()
+        self.assertTrue(all(item.closed for item in sockets))
+
+        sockets.clear()
+
+        class RacingSocket(FakeSocket):
+            def bind(self, address):
+                if self.family == core.socket.AF_INET6:
+                    raise OSError("raced")
+                super().bind(address)
+
+        with self.assertRaises(core.AwgctlError):
+            core.acquire_udp_port_reservation(4242, socket_factory=RacingSocket)
+        self.assertTrue(sockets[0].closed)
+
     def test_port_selection_uses_unbiased_sampling_and_rejects_every_conflict_class(self):
         self.assertTrue(
             hasattr(core, "select_transition_port"),
@@ -500,6 +838,33 @@ class TransitionPortTests(unittest.TestCase):
 
 
 class ObfuscationPrepareTests(unittest.TestCase):
+    def test_unqualified_prepare_fails_before_runtime_lock_path_creation(self):
+        args = argparse.Namespace(
+            mode="awg31",
+            profile="russia-ios-v1",
+            client="kat-iphone",
+            dry_run=False,
+            json=True,
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            with (
+                patched_layout(pathlib.Path(directory)),
+                mock.patch.object(
+                    core,
+                    "require_awg31_capability",
+                    side_effect=core.AwgctlError("installed pair is unqualified"),
+                ) as gate,
+                mock.patch.object(
+                    core,
+                    "mutation_lock",
+                    side_effect=AssertionError("lock path touched before capability gate"),
+                ),
+            ):
+                with self.assertRaisesRegex(core.AwgctlError, "unqualified"):
+                    core.cmd_obfuscation_prepare(args)
+                self.assertFalse(core.RUNTIME_DIR.exists())
+        gate.assert_called_once_with()
+
     def test_prepare_dry_run_performs_nonsecret_gates_without_any_mutation_or_randomness(self):
         self.assertTrue(
             hasattr(core, "cmd_obfuscation_prepare"),
@@ -665,7 +1030,8 @@ class ObfuscationPrepareTests(unittest.TestCase):
                     core.atomic_write(path, b"pending qr", 0o600)
 
                 @contextlib.contextmanager
-                def locked():
+                def locked(**kwargs):
+                    self.assertTrue(kwargs.get("transition_lifecycle"))
                     self.assertEqual(
                         PrepareClock.calls,
                         0,
@@ -682,6 +1048,14 @@ class ObfuscationPrepareTests(unittest.TestCase):
                     mock.patch.object(core.secrets, "token_hex", side_effect=token_hex),
                     mock.patch.object(core, "select_transition_port", side_effect=choose_port),
                     mock.patch.object(core, "create_backup", side_effect=create_backup),
+                    mock.patch.object(
+                        core,
+                        "capture_transition_backup_identity",
+                        return_value={
+                            "manifest_sha256": "de" * 32,
+                            "snapshot_sha256": "ef" * 32,
+                        },
+                    ),
                     mock.patch.object(core, "build_russia_ios_obfuscation", side_effect=build_profile),
                     mock.patch.object(core, "write_header_protection_key", side_effect=write_header),
                     mock.patch.object(core, "generate_qr", side_effect=write_qr),
@@ -734,6 +1108,326 @@ class ObfuscationPrepareTests(unittest.TestCase):
 
 
 class ObfuscationActivateTests(unittest.TestCase):
+    def test_every_activation_journal_phase_recovers_exact_id_before_next_command(self):
+        for phase in sorted(core.ACTIVATION_JOURNAL_PHASES):
+            with self.subTest(phase=phase), tempfile.TemporaryDirectory() as directory:
+                with patched_layout(pathlib.Path(directory)):
+                    if phase in {"active", "final-armed"}:
+                        document, classic, client, awg31, server, profile, backup = active_state()
+                    else:
+                        document, classic, client, awg31, server, profile, backup = prepared_state()
+                    core.write_activation_journal(
+                        TRANSACTION_ID,
+                        phase=phase,
+                        created_at=document["prepared_at"],
+                    )
+                    restored = []
+
+                    def restore(name, current, *, now):
+                        restored.append((name, current["transaction_id"], now))
+
+                    with (
+                        mock.patch.object(core, "restore_obfuscation_backup", side_effect=restore),
+                        mock.patch.object(core, "cancel_transition_timeout"),
+                        mock.patch.object(core, "cancel_transition_recovery"),
+                        mock.patch.object(core, "audit"),
+                    ):
+                        core.reconcile_transition_recovery_locked()
+
+                    self.assertEqual(len(restored), 1)
+                    self.assertEqual(restored[0][0], document["backup_name"])
+                    self.assertIsNone(core.load_transition_document(required=False))
+                    self.assertIsNone(core.load_activation_journal())
+                    outcome = core.load_transition_outcome()
+                    self.assertEqual(outcome["transaction_id"], TRANSACTION_ID)
+                    self.assertEqual(outcome["outcome"], "rolled_back")
+                    self.assertEqual(outcome["cleanup_phase"], "complete")
+
+    def test_proof_floor_is_captured_only_after_reload_and_exact_postcondition(self):
+        class ActivationClock(dt.datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return cls(2026, 9, 1, 10, 1, tzinfo=dt.timezone.utc)
+
+        with tempfile.TemporaryDirectory() as directory:
+            with patched_layout(pathlib.Path(directory)):
+                document, classic, client, awg31, server, profile, backup = prepared_state()
+                with mock.patch.object(core, "validate_native_server"):
+                    snapshot = core.validate_pending_transition_artifacts(
+                        document,
+                        [client],
+                        now=dt.datetime(2026, 9, 1, 10, 0, tzinfo=dt.timezone.utc),
+                    )
+                events = []
+
+                class Reservation:
+                    def release(self):
+                        events.append("reservation-released")
+
+                def commit(text, *, runtime_action):
+                    events.append("reloaded")
+                    return True
+
+                def verified(*args, **kwargs):
+                    events.append("postcondition")
+
+                def handshakes(interface):
+                    self.assertIn("postcondition", events)
+                    events.append("handshake-floor")
+                    return {key(3): 1_777_891_200}
+
+                def transfers(interface):
+                    self.assertIn("postcondition", events)
+                    events.append("counter-floor")
+                    return {key(3): (300, 400)}
+
+                with (
+                    mock.patch.object(core.dt, "datetime", ActivationClock),
+                    mock.patch.object(core, "install_pending_transition_snapshot"),
+                    mock.patch.object(core, "verify_installed_transition_snapshot"),
+                    mock.patch.object(core, "commit_server_config", side_effect=commit),
+                    mock.patch.object(core, "verify_active_transition_postcondition", side_effect=verified),
+                    mock.patch.object(core, "load_clients", return_value=[client]),
+                    mock.patch.object(core, "handshake_map", side_effect=handshakes),
+                    mock.patch.object(core, "transfer_map", side_effect=transfers),
+                    mock.patch.object(core, "write_activation_journal", side_effect=lambda *a, **k: events.append(f"journal:{k['phase']}")),
+                    mock.patch.object(core, "schedule_transition_recovery", side_effect=lambda *a, **k: events.append("recovery-armed")),
+                    mock.patch.object(core, "schedule_transition_timeout", side_effect=lambda *a, **k: events.append("final-armed")),
+                    mock.patch.object(core, "cancel_transition_recovery", side_effect=lambda *a, **k: events.append("recovery-cancelled")),
+                    mock.patch.object(core, "delete_activation_journal", side_effect=lambda *a, **k: events.append("journal-deleted")),
+                ):
+                    active = core._install_active_transition(
+                        document,
+                        snapshot,
+                        [client],
+                        reservation=Reservation(),
+                        timeout="10m",
+                    )
+
+                self.assertLess(events.index("reloaded"), events.index("postcondition"))
+                self.assertLess(events.index("postcondition"), events.index("handshake-floor"))
+                self.assertLess(events.index("postcondition"), events.index("counter-floor"))
+                self.assertEqual(active["pre_handshake"], 1_777_891_200)
+                self.assertEqual((active["pre_rx"], active["pre_tx"]), (300, 400))
+                self.assertEqual(active["deadline_at"], "2026-09-01T10:11:00Z")
+
+    def test_activation_window_rejects_non_target_expiry_at_or_before_deadline(self):
+        now = dt.datetime(2026, 9, 1, 23, 50, tzinfo=dt.timezone.utc)
+        target = {"name": "kat-iphone", "management": "managed", "status": "active", "expires": None}
+        non_target = {
+            "name": "macbook",
+            "management": "managed",
+            "status": "active",
+            "expires": "2026-09-02",
+        }
+        with self.assertRaisesRegex(core.AwgctlError, "expiry.*rollback deadline"):
+            core.ensure_activation_window(
+                [target, non_target],
+                now=now,
+                deadline=now + dt.timedelta(minutes=10),
+            )
+        core.ensure_activation_window(
+            [target, {**non_target, "expires": "2026-09-03"}],
+            now=now,
+            deadline=now + dt.timedelta(minutes=10),
+        )
+
+    def test_delayed_final_clock_recheck_rejects_midnight_crossing_before_artifact_mutation(self):
+        instants = iter(
+            (
+                dt.datetime(2026, 9, 1, 23, 48, tzinfo=dt.timezone.utc),
+                dt.datetime(2026, 9, 1, 23, 49, tzinfo=dt.timezone.utc),
+                dt.datetime(2026, 9, 1, 23, 50, tzinfo=dt.timezone.utc),
+                dt.datetime(2026, 9, 1, 23, 51, tzinfo=dt.timezone.utc),
+            )
+        )
+
+        class DelayedClock(dt.datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return next(instants)
+
+        class Reservation:
+            def release(self):
+                pass
+
+        with tempfile.TemporaryDirectory() as directory:
+            with patched_layout(pathlib.Path(directory)):
+                document, classic, client, awg31, server, profile, backup = prepared_state()
+                non_target = {
+                    **client,
+                    "name": "macbook",
+                    "address": "10.77.42.3/32",
+                    "public_key": key(6),
+                    "private_key": key(7),
+                    "psk": key(8),
+                    "expires": "2026-09-02",
+                }
+                installer = mock.Mock(
+                    side_effect=AssertionError("expiry crossing reached artifact installation")
+                )
+                pending_validator = mock.Mock(return_value=mock.sentinel.pending_snapshot)
+                with (
+                    mock.patch.object(core.dt, "datetime", DelayedClock),
+                    mock.patch.object(core, "mutation_lock", return_value=contextlib.nullcontext()),
+                    mock.patch.object(core, "ensure_no_drift"),
+                    mock.patch.object(core, "verify_transition_backup_precondition"),
+                    mock.patch.object(core, "managed_transition_prestate_digest", return_value="ab" * 32),
+                    mock.patch.object(core, "ingress_boundary_attestation", return_value="lightsail"),
+                    mock.patch.object(core, "require_awg31_capability", return_value=document["capability"]),
+                    mock.patch.object(core, "udp_port_is_listening", return_value=False),
+                    mock.patch.object(core, "is_service_active", return_value=True),
+                    mock.patch.object(core, "acquire_udp_port_reservation", return_value=Reservation()),
+                    mock.patch.object(core, "load_clients", return_value=[client, non_target]),
+                    mock.patch.object(
+                        core,
+                        "validate_pending_transition_artifacts",
+                        pending_validator,
+                    ),
+                    mock.patch.object(core, "_install_active_transition", installer),
+                    mock.patch.object(core, "restore_obfuscation_backup"),
+                    mock.patch.object(core, "cancel_transition_timeout"),
+                    mock.patch.object(core, "cancel_transition_recovery"),
+                ):
+                    with self.assertRaisesRegex(core.AwgctlError, "classic state restored"):
+                        core.cmd_obfuscation_activate(
+                            argparse.Namespace(
+                                transaction_id=TRANSACTION_ID,
+                                ingress_ready=True,
+                                timeout="10m",
+                                json=True,
+                            )
+                        )
+                installer.assert_not_called()
+                pending_validator.assert_called_once()
+
+    def test_backup_identity_rejects_valid_substitution_and_hardlinks(self):
+        now = dt.datetime(2026, 9, 1, 10, 1, tzinfo=dt.timezone.utc)
+        with tempfile.TemporaryDirectory() as directory:
+            with patched_layout(pathlib.Path(directory)):
+                document, classic, client, awg31, server, profile, backup = prepared_state()
+                def pubkey_runner(argv, **kwargs):
+                    supplied = kwargs["input_data"].decode().strip()
+                    public = {key(1): key(2), key(4): key(3)}[supplied]
+                    return subprocess.CompletedProcess(argv, 0, (public + "\n").encode(), b"")
+
+                anchored_reader = core.read_protected_tree
+
+                def capture_then_swap(path, **kwargs):
+                    snapshot = anchored_reader(path, **kwargs)
+                    core.atomic_write(
+                        backup / "config/server.json",
+                        b'{"substituted": true}\n',
+                        0o600,
+                    )
+                    return snapshot
+
+                with (
+                    mock.patch.object(core, "read_protected_tree", side_effect=capture_then_swap),
+                    mock.patch.object(core, "run", side_effect=pubkey_runner),
+                    mock.patch.object(core, "validate_native_server"),
+                    mock.patch.object(core, "validate_nftables_text"),
+                ):
+                    try:
+                        snapshot = core.verify_transition_backup_precondition(
+                            document,
+                            classic,
+                            now=now,
+                        )
+                    except core.AwgctlError as exc:
+                        self.fail(f"valid immutable backup identity was rejected: {exc}")
+
+                metadata_path = backup / "clients/kat-iphone/metadata.json"
+                metadata = json.loads(metadata_path.read_text())
+                metadata["owner"] = "Substituted Owner"
+                core.atomic_json(metadata_path, metadata, 0o600)
+                manifest = core.create_backup_manifest(
+                    backup,
+                    product_version=core.VERSION,
+                    created_at="2026-09-01T10:00:00Z",
+                )
+                core.atomic_json(backup / "manifest.json", manifest, 0o600)
+                with (
+                    mock.patch.object(core, "mutation_lock", return_value=contextlib.nullcontext()),
+                    mock.patch.object(
+                        core,
+                        "run",
+                        side_effect=pubkey_runner,
+                    ),
+                    mock.patch.object(core, "validate_native_server"),
+                    mock.patch.object(core, "validate_nftables_text"),
+                    self.assertRaisesRegex(core.AwgctlError, "identity"),
+                ):
+                    core.verify_transition_backup_precondition(document, classic, now=now)
+
+                metadata_path.unlink()
+                core.os.link(core.CONFIG_FILE, metadata_path)
+                with self.assertRaisesRegex(core.AwgctlError, "unsafe"):
+                    core.read_protected_tree(backup)
+
+    def test_pending_inventory_is_exact_and_install_uses_the_validated_byte_snapshot(self):
+        now = dt.datetime(2026, 9, 1, 10, 1, tzinfo=dt.timezone.utc)
+        with tempfile.TemporaryDirectory() as directory:
+            with patched_layout(pathlib.Path(directory)):
+                document, classic, client, awg31, server, profile, backup = prepared_state()
+                pending_root = pathlib.Path(document["pending"]["root"])
+
+                (pending_root / "unexpected").mkdir(mode=0o700)
+                with self.assertRaisesRegex(core.AwgctlError, "inventory"):
+                    core.validate_pending_transition_artifacts(
+                        document,
+                        [client],
+                        now=now,
+                    )
+                (pending_root / "unexpected").rmdir()
+
+                core.atomic_write(pending_root / "extra", b"surprise", 0o600)
+                document["pending_sha256"] = core.pending_transition_artifact_digest(
+                    pending_root
+                )
+                with self.assertRaisesRegex(core.AwgctlError, "inventory"):
+                    core.validate_pending_transition_artifacts(
+                        document,
+                        [client],
+                        now=now,
+                    )
+                (pending_root / "extra").unlink()
+                document["pending_sha256"] = core.pending_transition_artifact_digest(
+                    pending_root
+                )
+
+                with mock.patch.object(core, "validate_native_server"):
+                    snapshot = core.validate_pending_transition_artifacts(
+                        document,
+                        [client],
+                        now=now,
+                    )
+                pathlib.Path(document["pending"]["server_config"]).write_text(
+                    "swapped server\n"
+                )
+                pathlib.Path(document["pending"]["profiles"][0]["config"]).write_text(
+                    "swapped profile\n"
+                )
+                pathlib.Path(document["pending"]["profiles"][0]["qr"]).write_bytes(
+                    b"swapped qr"
+                )
+                core.install_pending_transition_snapshot(document, snapshot)
+
+                self.assertEqual(core.CONFIG_FILE.read_bytes(), snapshot.server_state)
+                self.assertEqual(core.HEADER_PROTECTION_KEY.read_bytes(), snapshot.header_key)
+                self.assertEqual(
+                    (core.CLIENTS / "kat-iphone/kat-iphone.conf").read_bytes(),
+                    snapshot.profile_bytes("kat-iphone"),
+                )
+                self.assertEqual(
+                    (core.CLIENTS / "kat-iphone/kat-iphone.png").read_bytes(),
+                    snapshot.qr_bytes("kat-iphone"),
+                )
+
+                (core.CLIENTS / "kat-iphone/kat-iphone.conf").write_text("corrupt")
+                with self.assertRaisesRegex(core.AwgctlError, "installed.*snapshot"):
+                    core.verify_installed_transition_snapshot(document, snapshot)
+
     def test_activate_installs_once_verifies_and_schedules_exact_root_timeout(self):
         self.assertTrue(
             hasattr(core, "cmd_obfuscation_activate"),
@@ -774,7 +1468,12 @@ class ObfuscationActivateTests(unittest.TestCase):
 
                 def runner(argv, **kwargs):
                     run_calls.append((list(argv), kwargs))
-                    return subprocess.CompletedProcess(argv, 0, b"", b"")
+                    return subprocess.CompletedProcess(
+                        argv,
+                        3 if argv[:3] == ["systemctl", "is-active", "--quiet"] else 0,
+                        b"",
+                        b"",
+                    )
 
                 patches = [
                     mock.patch.object(core.dt, "datetime", ActivationClock),
@@ -788,7 +1487,11 @@ class ObfuscationActivateTests(unittest.TestCase):
                     mock.patch.object(core, "require_awg31_capability", return_value=document["capability"]),
                     mock.patch.object(core, "ingress_boundary_attestation", return_value="lightsail"),
                     mock.patch.object(core, "udp_port_is_listening", return_value=False),
-                    mock.patch.object(core, "udp_port_bind_available", return_value=True),
+                    mock.patch.object(
+                        core,
+                        "acquire_udp_port_reservation",
+                        return_value=mock.Mock(),
+                    ),
                     mock.patch.object(core, "validate_native_server"),
                     mock.patch.object(core, "is_service_active", return_value=True),
                     mock.patch.object(
@@ -797,6 +1500,7 @@ class ObfuscationActivateTests(unittest.TestCase):
                         return_value={key(3): (100, 200)},
                         create=True,
                     ),
+                    mock.patch.object(core, "handshake_map", return_value={key(3): 0}),
                     mock.patch.object(core, "commit_server_config", side_effect=commit),
                     mock.patch.object(
                         core,
@@ -820,7 +1524,7 @@ class ObfuscationActivateTests(unittest.TestCase):
                         self.fail(f"activation is incomplete: {exc}")
 
                 self.assertEqual(result, 0)
-                self.assertEqual(ActivationClock.calls, 1)
+                self.assertEqual(ActivationClock.calls, 6)
                 self.assertEqual(reloads, ["reload"])
                 active = core.load_transition_document()
                 self.assertEqual(active["state"], "active")
@@ -834,22 +1538,32 @@ class ObfuscationActivateTests(unittest.TestCase):
                 )
                 self.assertEqual(metadata_path.read_bytes(), metadata_before)
                 self.assertEqual(
-                    run_calls,
+                    run_calls[0][0],
                     [
-                        (
-                            [
-                                "systemd-run",
-                                "--quiet",
-                                "--collect",
-                                "--unit",
-                                f"awgctl-obfuscation-rollback-{TRANSACTION_ID}",
-                                "--on-active=10m",
-                                str(core.INTERNAL_ENTRYPOINT),
-                                "_obfuscation-timeout",
-                                TRANSACTION_ID,
-                            ],
-                            {"timeout": 15},
-                        )
+                        "systemd-run",
+                        "--quiet",
+                        "--collect",
+                        "--unit",
+                        f"awgctl-obfuscation-recovery-{TRANSACTION_ID}",
+                        "--on-active=10m",
+                        str(core.INTERNAL_ENTRYPOINT),
+                        "_obfuscation-timeout",
+                        TRANSACTION_ID,
+                    ],
+                )
+                self.assertEqual(
+                    run_calls[1][0],
+                    [
+                        "systemd-run",
+                        "--quiet",
+                        "--collect",
+                        "--unit",
+                        f"awgctl-obfuscation-rollback-{TRANSACTION_ID}",
+                        "--timer-property=AccuracySec=1s",
+                        "--on-calendar=2026-09-01T10:11:00Z",
+                        str(core.INTERNAL_ENTRYPOINT),
+                        "_obfuscation-timeout",
+                        TRANSACTION_ID,
                     ],
                 )
                 payload = json.loads(output.getvalue())
@@ -875,6 +1589,7 @@ class ObfuscationActivateTests(unittest.TestCase):
                 classic_server = core.GENERATED_CONFIG.read_bytes()
                 classic_profile = (core.CLIENTS / "kat-iphone/kat-iphone.conf").read_bytes()
                 systemd_calls = []
+                recovery_events = []
 
                 def commit(text, *, runtime_action):
                     core.atomic_write(core.GENERATED_CONFIG, text, 0o600)
@@ -884,14 +1599,29 @@ class ObfuscationActivateTests(unittest.TestCase):
                 def runner(argv, **kwargs):
                     systemd_calls.append(list(argv))
                     if argv[0] == "systemd-run":
-                        raise core.AwgctlError("timer creation failed")
+                        if any(
+                            item == f"awgctl-obfuscation-recovery-{TRANSACTION_ID}"
+                            for item in argv
+                        ):
+                            recovery_events.append("recovery-armed")
+                            return subprocess.CompletedProcess(argv, 0, b"", b"")
+                        if any(
+                            item == f"awgctl-obfuscation-rollback-{TRANSACTION_ID}"
+                            for item in argv
+                        ):
+                            recovery_events.append("final-timer-failed")
+                            raise core.AwgctlError("timer creation failed")
+                        raise AssertionError(f"unexpected transient unit: {argv}")
                     if argv[:2] == ["systemctl", "stop"]:
+                        if any("obfuscation-recovery" in item for item in argv):
+                            recovery_events.append("recovery-cancelled")
                         return subprocess.CompletedProcess(argv, 0, b"", b"")
                     if argv[:3] == ["systemctl", "is-active", "--quiet"]:
                         return subprocess.CompletedProcess(argv, 3, b"", b"")
                     raise AssertionError(f"unexpected command: {argv}")
 
                 def restore(backup_name, expected_document, *, now):
+                    recovery_events.append("classic-restored")
                     self.assertEqual(backup_name, document["backup_name"])
                     self.assertEqual(expected_document["transaction_id"], TRANSACTION_ID)
                     core.atomic_json(core.CONFIG_FILE, classic, 0o600)
@@ -915,10 +1645,15 @@ class ObfuscationActivateTests(unittest.TestCase):
                     mock.patch.object(core, "require_awg31_capability", return_value=document["capability"]),
                     mock.patch.object(core, "ingress_boundary_attestation", return_value="lightsail"),
                     mock.patch.object(core, "udp_port_is_listening", return_value=False),
-                    mock.patch.object(core, "udp_port_bind_available", return_value=True),
+                    mock.patch.object(
+                        core,
+                        "acquire_udp_port_reservation",
+                        return_value=mock.Mock(),
+                    ),
                     mock.patch.object(core, "validate_native_server"),
                     mock.patch.object(core, "is_service_active", return_value=True),
                     mock.patch.object(core, "transfer_map", return_value={key(3): (100, 200)}),
+                    mock.patch.object(core, "handshake_map", return_value={key(3): 0}),
                     mock.patch.object(core, "commit_server_config", side_effect=commit),
                     mock.patch.object(
                         core,
@@ -952,6 +1687,11 @@ class ObfuscationActivateTests(unittest.TestCase):
                 self.assertEqual(outcome["transaction_id"], TRANSACTION_ID)
                 self.assertEqual(outcome["outcome"], "rolled_back")
                 self.assertEqual(outcome["reason"], "activation-failed")
+                self.assertEqual(
+                    recovery_events[:3],
+                    ["recovery-armed", "final-timer-failed", "classic-restored"],
+                    "the recovery timer must remain armed until classic restore is proven",
+                )
                 self.assertTrue(
                     any(call[:2] == ["systemctl", "stop"] for call in systemd_calls)
                 )
@@ -992,25 +1732,224 @@ class ObfuscationActivateTests(unittest.TestCase):
                     mock.patch.object(core, "require_awg31_capability", return_value=document["capability"]),
                     mock.patch.object(core, "ingress_boundary_attestation", return_value="lightsail"),
                     mock.patch.object(core, "udp_port_is_listening", return_value=False),
-                    mock.patch.object(core, "udp_port_bind_available", return_value=True),
+                    mock.patch.object(
+                        core,
+                        "acquire_udp_port_reservation",
+                        return_value=mock.Mock(),
+                    ),
                     mock.patch.object(core, "is_service_active", return_value=True),
+                    mock.patch.object(core, "restore_obfuscation_backup"),
+                    mock.patch.object(core, "cancel_transition_timeout"),
+                    mock.patch.object(core, "cancel_transition_recovery"),
                     mock.patch.object(
                         core,
                         "commit_server_config",
                         side_effect=AssertionError("tampered artifacts must not be installed"),
                     ),
                 ):
-                    with self.assertRaisesRegex(core.AwgctlError, "integrity"):
+                    with self.assertRaisesRegex(core.AwgctlError, "classic state restored"):
                         core.cmd_obfuscation_activate(args)
 
-                self.assertEqual(core.load_transition_document()["state"], "prepared")
+                self.assertIsNone(core.load_transition_document(required=False))
                 self.assertEqual(core.load_config()["obfuscation"]["mode"], "classic")
                 self.assertEqual(
                     {path: path.read_bytes() for path in active_paths}, active_paths
                 )
+                self.assertEqual(core.load_transition_outcome()["outcome"], "rolled_back")
 
 
 class ObfuscationConfirmTests(unittest.TestCase):
+    def test_complete_outcome_coexisting_with_exact_current_resumes_cleanup(self):
+        args = argparse.Namespace(transaction_id=TRANSACTION_ID, json=True)
+        with tempfile.TemporaryDirectory() as directory:
+            with patched_layout(pathlib.Path(directory)):
+                active, classic, client, awg31, server, profile, backup = active_state()
+                outcome = core.normalize_transition_outcome(
+                    {
+                        "schema_version": 1,
+                        "transaction_id": TRANSACTION_ID,
+                        "outcome": "confirmed",
+                        "reason": "confirmed",
+                        "completed_at": "2026-09-01T10:02:00Z",
+                        "client_name": "kat-iphone",
+                        "profile_name": "russia-ios-v1",
+                        "old_port": 55323,
+                        "new_port": 4242,
+                        "cleanup_phase": "complete",
+                        "profile_updates": [
+                            {
+                                "name": "kat-iphone",
+                                "from_revision": 3,
+                                "to_revision": 4,
+                            }
+                        ],
+                    }
+                )
+                core.atomic_json(core.TRANSITION_OUTCOME_FILE, outcome, 0o600)
+                pending_root = pathlib.Path(active["pending"]["root"])
+
+                with (
+                    mock.patch.object(core, "cancel_transition_recovery"),
+                ):
+                    core.reconcile_transition_recovery_locked()
+
+                self.assertIsNone(core.load_transition_document(required=False))
+                self.assertFalse(pending_root.exists())
+
+                with (
+                    mock.patch.object(
+                        core, "mutation_lock", return_value=contextlib.nullcontext()
+                    ),
+                    mock.patch.object(core, "cancel_transition_recovery"),
+                    contextlib.redirect_stdout(io.StringIO()),
+                ):
+                    self.assertEqual(core.cmd_obfuscation_confirm(args), 0)
+
+                metadata = json.loads(
+                    (core.CLIENTS / "kat-iphone/metadata.json").read_text()
+                )
+                self.assertEqual(metadata["profile_revision"], 4)
+                self.assertEqual(metadata["distribution_status"], "pending")
+
+    def test_complete_outcome_never_interferes_with_a_later_transaction(self):
+        outcome = core.normalize_transition_outcome(
+            {
+                "schema_version": 1,
+                "transaction_id": TRANSACTION_ID,
+                "outcome": "rolled_back",
+                "reason": "operator",
+                "completed_at": "2026-09-01T10:02:00Z",
+                "client_name": "kat-iphone",
+                "profile_name": "russia-ios-v1",
+                "old_port": 55323,
+                "new_port": 4242,
+                "cleanup_phase": "complete",
+                "profile_updates": [],
+            }
+        )
+        later = {"transaction_id": "fedcba9876543210fedcba9876543210"}
+        with (
+            mock.patch.object(core, "load_transition_outcome", return_value=outcome),
+            mock.patch.object(core, "load_transition_document", return_value=later),
+            mock.patch.object(core, "load_activation_journal", return_value=None),
+            mock.patch.object(core, "resume_transition_cleanup") as resume,
+        ):
+            core.reconcile_transition_recovery_locked()
+        resume.assert_not_called()
+
+    def test_terminal_cleanup_resumes_after_each_authoritative_checkpoint_boundary(self):
+        boundaries = (
+            "after-outcome",
+            "after-metadata",
+            "after-pending",
+            "after-current",
+        )
+        for boundary in boundaries:
+            with self.subTest(boundary=boundary), tempfile.TemporaryDirectory() as directory:
+                with patched_layout(pathlib.Path(directory)):
+                    active, classic, client, awg31, server, profile, backup = active_state()
+                    outcome = core.begin_transition_outcome(
+                        active,
+                        outcome="confirmed",
+                        reason="confirmed",
+                        completed_at="2026-09-01T10:02:00Z",
+                        profile_updates=[
+                            {"name": "kat-iphone", "from_revision": 3, "to_revision": 4}
+                        ],
+                    )
+
+                    patcher = contextlib.nullcontext()
+                    if boundary != "after-outcome":
+                        helper_name = {
+                            "after-metadata": "apply_confirmed_profile_updates",
+                            "after-pending": "remove_transition_pending",
+                            "after-current": "remove_current_transition",
+                        }[boundary]
+                        original = getattr(core, helper_name)
+                        fired = False
+
+                        def crash_after(*args, _original=original, **kwargs):
+                            nonlocal fired
+                            result = _original(*args, **kwargs)
+                            if not fired:
+                                fired = True
+                                raise RuntimeError("injected crash after durable boundary")
+                            return result
+
+                        patcher = mock.patch.object(core, helper_name, side_effect=crash_after)
+                    with patcher, mock.patch.object(core, "cancel_transition_recovery"):
+                        if boundary == "after-outcome":
+                            pass
+                        else:
+                            with self.assertRaisesRegex(RuntimeError, "injected crash"):
+                                core.resume_transition_cleanup(active, outcome)
+
+                    with (
+                        mock.patch.object(core, "mutation_lock", return_value=contextlib.nullcontext()),
+                        mock.patch.object(core, "cancel_transition_recovery"),
+                        contextlib.redirect_stdout(io.StringIO()),
+                    ):
+                        self.assertEqual(
+                            core.cmd_obfuscation_confirm(
+                                argparse.Namespace(transaction_id=TRANSACTION_ID, json=True)
+                            ),
+                            0,
+                        )
+                    completed = core.load_transition_outcome()
+
+                    self.assertEqual(completed["cleanup_phase"], "complete")
+                    self.assertIsNone(core.load_transition_document(required=False))
+                    self.assertFalse(pathlib.Path(active["pending"]["root"]).exists())
+                    metadata = json.loads((core.CLIENTS / "kat-iphone/metadata.json").read_text())
+                    self.assertEqual(metadata["profile_revision"], 4)
+                    self.assertEqual(metadata["distribution_status"], "pending")
+
+    def test_confirm_rechecks_every_active_and_pending_postcondition_before_timer_mutation(self):
+        class ConfirmClock(dt.datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return cls(2026, 9, 1, 10, 2, tzinfo=dt.timezone.utc)
+
+        cases = ("profile", "qr", "pending", "generated", "runtime", "live-port", "live-peer")
+        for case in cases:
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as directory:
+                with patched_layout(pathlib.Path(directory)):
+                    active, classic, client, awg31, server, profile, backup = active_state()
+                    metadata_before = (core.CLIENTS / "kat-iphone/metadata.json").read_bytes()
+                    transition_before = core.TRANSITION_FILE.read_bytes()
+                    if case == "profile":
+                        core.atomic_write(core.CLIENTS / "kat-iphone/kat-iphone.conf", "tampered\n", 0o600)
+                    elif case == "qr":
+                        core.atomic_write(core.CLIENTS / "kat-iphone/kat-iphone.png", b"tampered", 0o600)
+                    elif case == "pending":
+                        core.atomic_write(pathlib.Path(active["pending"]["server_config"]), "tampered\n", 0o600)
+                    elif case == "generated":
+                        core.atomic_write(core.GENERATED_CONFIG, "tampered\n", 0o600)
+                    elif case == "runtime":
+                        core.atomic_write(core.RUNTIME_CONFIG, "tampered\n", 0o600)
+
+                    timer = mock.Mock(side_effect=AssertionError("timer mutated before exact postcondition"))
+                    with (
+                        mock.patch.object(core.dt, "datetime", ConfirmClock),
+                        mock.patch.object(core, "mutation_lock", return_value=contextlib.nullcontext()),
+                        mock.patch.object(core, "validate_native_server"),
+                        mock.patch.object(core, "is_service_active", return_value=True),
+                        mock.patch.object(core, "safe_awg_query", side_effect=lambda interface, field: key(2) if field == "public-key" else ("9999" if case == "live-port" else "4242")),
+                        mock.patch.object(core, "live_peers", return_value=set() if case == "live-peer" else {key(3)}),
+                        mock.patch.object(core, "handshake_map", return_value={key(3): int(ConfirmClock.now().timestamp()) - 30}),
+                        mock.patch.object(core, "transfer_map", return_value={key(3): (101, 201)}),
+                        mock.patch.object(core, "cancel_transition_timeout", timer),
+                    ):
+                        with self.assertRaises(core.AwgctlError):
+                            core.cmd_obfuscation_confirm(
+                                argparse.Namespace(transaction_id=TRANSACTION_ID, json=True)
+                            )
+
+                    timer.assert_not_called()
+                    self.assertEqual((core.CLIENTS / "kat-iphone/metadata.json").read_bytes(), metadata_before)
+                    self.assertEqual(core.TRANSITION_FILE.read_bytes(), transition_before)
+                    self.assertIsNone(core.load_transition_outcome())
+
     def test_confirm_requires_fresh_bidirectional_progress_then_marks_all_new_profiles_pending(self):
         self.assertTrue(
             hasattr(core, "cmd_obfuscation_confirm"),
@@ -1038,6 +1977,8 @@ class ObfuscationConfirmTests(unittest.TestCase):
 
                 def runner(argv, **kwargs):
                     systemd_calls.append(list(argv))
+                    if argv[0] == "systemd-run":
+                        return subprocess.CompletedProcess(argv, 0, b"", b"")
                     if argv[:2] == ["systemctl", "stop"]:
                         return subprocess.CompletedProcess(argv, 0, b"", b"")
                     if argv[:3] == ["systemctl", "is-active", "--quiet"]:
@@ -1047,7 +1988,10 @@ class ObfuscationConfirmTests(unittest.TestCase):
                 with (
                     mock.patch.object(core.dt, "datetime", ConfirmClock),
                     mock.patch.object(core, "mutation_lock", return_value=contextlib.nullcontext()),
+                    mock.patch.object(core, "validate_native_server"),
                     mock.patch.object(core, "is_service_active", return_value=True),
+                    mock.patch.object(core, "safe_awg_query", side_effect=lambda interface, field: key(2) if field == "public-key" else "4242"),
+                    mock.patch.object(core, "live_peers", return_value={key(3)}),
                     mock.patch.object(core, "handshake_map", return_value={key(3): handshake}),
                     mock.patch.object(core, "transfer_map", return_value={key(3): (101, 201)}),
                     mock.patch.object(core, "run", side_effect=runner),
@@ -1056,10 +2000,12 @@ class ObfuscationConfirmTests(unittest.TestCase):
                 ):
                     try:
                         result = core.cmd_obfuscation_confirm(args)
+                        with contextlib.redirect_stdout(io.StringIO()):
+                            retry = core.cmd_obfuscation_confirm(args)
                     except core.AwgctlError as exc:
                         self.fail(f"confirm is incomplete: {exc}")
 
-                self.assertEqual(result, 0)
+                self.assertEqual((result, retry), (0, 0))
                 self.assertEqual(ConfirmClock.calls, 1)
                 metadata = json.loads(
                     (core.CLIENTS / "kat-iphone/metadata.json").read_text()
@@ -1074,7 +2020,7 @@ class ObfuscationConfirmTests(unittest.TestCase):
                 outcome = core.load_transition_outcome()
                 self.assertEqual(outcome["outcome"], "confirmed")
                 self.assertEqual(
-                    systemd_calls[0],
+                    next(call for call in systemd_calls if call[:2] == ["systemctl", "stop"]),
                     [
                         "systemctl",
                         "stop",
@@ -1105,33 +2051,43 @@ class ObfuscationConfirmTests(unittest.TestCase):
             dt.datetime(2026, 9, 1, 10, 1, 30, tzinfo=dt.timezone.utc).timestamp()
         )
         cases = (
-            ("rx-only", (101, 200), False, handshake),
-            ("tx-only", (100, 201), False, handshake),
-            ("future-handshake", (101, 201), False, handshake + 31),
-            ("timer-still-active", (101, 201), True, handshake),
+            ("rx-only", (101, 200), 3, handshake, 0),
+            ("tx-only", (100, 201), 3, handshake, 0),
+            ("future-handshake", (101, 201), 3, handshake + 31, 0),
+            ("preserved-classic-stats", (101, 201), 3, handshake, handshake),
+            ("timer-still-active", (101, 201), 0, handshake, 0),
+            ("timer-query-failed", (101, 201), 1, handshake, 0),
         )
-        for label, counters, timer_active, observed_handshake in cases:
+        for label, counters, timer_status, observed_handshake, handshake_floor in cases:
             with self.subTest(case=label), tempfile.TemporaryDirectory() as directory:
                 with patched_layout(pathlib.Path(directory)):
                     active, classic, client, awg31, server, profile, backup = active_state()
+                    if handshake_floor:
+                        active["pre_handshake"] = handshake_floor
+                        core.atomic_json(core.TRANSITION_FILE, active, 0o600)
                     metadata_path = core.CLIENTS / "kat-iphone/metadata.json"
                     metadata_before = metadata_path.read_bytes()
                     transition_before = core.TRANSITION_FILE.read_bytes()
                     pending_root = pathlib.Path(active["pending"]["root"])
 
                     def runner(argv, **kwargs):
+                        if argv[0] == "systemd-run":
+                            return subprocess.CompletedProcess(argv, 0, b"", b"")
                         if argv[:2] == ["systemctl", "stop"]:
                             return subprocess.CompletedProcess(argv, 0, b"", b"")
                         if argv[:3] == ["systemctl", "is-active", "--quiet"]:
                             return subprocess.CompletedProcess(
-                                argv, 0 if timer_active else 3, b"", b""
+                                argv, timer_status, b"", b""
                             )
                         raise AssertionError(f"unexpected command: {argv}")
 
                     with (
                         mock.patch.object(core.dt, "datetime", ConfirmClock),
                         mock.patch.object(core, "mutation_lock", return_value=contextlib.nullcontext()),
+                        mock.patch.object(core, "validate_native_server"),
                         mock.patch.object(core, "is_service_active", return_value=True),
+                        mock.patch.object(core, "safe_awg_query", side_effect=lambda interface, field: key(2) if field == "public-key" else "4242"),
+                        mock.patch.object(core, "live_peers", return_value={key(3)}),
                         mock.patch.object(
                             core,
                             "handshake_map",
@@ -1150,6 +2106,64 @@ class ObfuscationConfirmTests(unittest.TestCase):
 
 
 class ObfuscationRollbackTests(unittest.TestCase):
+    def test_internal_timeout_uses_bounded_lock_wait_and_never_restores_without_it(self):
+        seen = []
+
+        @contextlib.contextmanager
+        def contended(**kwargs):
+            seen.append(kwargs)
+            raise core.AwgctlError("mutation lock acquisition timeout")
+            yield
+
+        with (
+            mock.patch.object(core, "mutation_lock", side_effect=contended),
+            mock.patch.object(
+                core,
+                "restore_obfuscation_backup",
+                side_effect=AssertionError("timeout restored without the mutation lock"),
+            ),
+        ):
+            with self.assertRaisesRegex(core.AwgctlError, "lock.*timeout"):
+                core.cmd_obfuscation_timeout(
+                    argparse.Namespace(transaction_id=TRANSACTION_ID, json=False)
+                )
+        self.assertEqual(
+            seen,
+            [{"timeout_seconds": 5, "transition_lifecycle": True}],
+        )
+
+    def test_real_transaction_backup_restore_uses_captured_snapshot_and_proves_classic_state(self):
+        now = dt.datetime(2026, 9, 1, 10, 3, tzinfo=dt.timezone.utc)
+        with tempfile.TemporaryDirectory() as directory:
+            with patched_layout(pathlib.Path(directory)):
+                active, classic, client, awg31, server, profile, backup = active_state()
+
+                def pubkey_runner(argv, **kwargs):
+                    supplied = kwargs["input_data"].decode().strip()
+                    public = {key(1): key(2), key(4): key(3)}[supplied]
+                    return subprocess.CompletedProcess(argv, 0, (public + "\n").encode(), b"")
+
+                with (
+                    mock.patch.object(core, "run", side_effect=pubkey_runner),
+                    mock.patch.object(core, "validate_native_server"),
+                    mock.patch.object(core, "validate_nftables_text"),
+                    mock.patch.object(core, "service_action") as reload_service,
+                    mock.patch.object(core, "safe_awg_query", side_effect=lambda interface, field: key(2) if field == "public-key" else "55323"),
+                    mock.patch.object(core, "live_peers", return_value={key(3)}),
+                ):
+                    core.restore_obfuscation_backup(
+                        active["backup_name"],
+                        active,
+                        now=now,
+                    )
+
+                self.assertEqual(core.load_config(), classic)
+                self.assertEqual(core.load_config()["obfuscation"]["mode"], "classic")
+                self.assertFalse(core.HEADER_PROTECTION_KEY.exists())
+                self.assertEqual(core.GENERATED_CONFIG.read_bytes(), core.RUNTIME_CONFIG.read_bytes())
+                reload_service.assert_called_once_with("reload", "awg0")
+                self.assertTrue(backup.is_dir(), "ordinary backup must be retained")
+
     def test_rollback_binds_one_utc_instant_to_restore_and_outcome(self):
         class RollbackClock(dt.datetime):
             calls = 0
@@ -1329,6 +2343,48 @@ class ObfuscationRollbackTests(unittest.TestCase):
 
 
 class ObfuscationStatusTests(unittest.TestCase):
+    def test_status_and_health_hold_one_locked_snapshot_for_their_complete_read(self):
+        events = []
+
+        @contextlib.contextmanager
+        def snapshot_lock(*, transition_lifecycle):
+            self.assertTrue(transition_lifecycle)
+            events.append("locked")
+            try:
+                yield
+            finally:
+                events.append("unlocked")
+
+        def status_reader(args):
+            self.assertEqual(events, ["locked"])
+            events.append("status-read")
+            return 17
+
+        def health_reader(args):
+            self.assertEqual(events, ["locked", "status-read", "unlocked", "locked"])
+            events.append("health-read")
+            return 23
+
+        with (
+            mock.patch.object(core, "mutation_lock", side_effect=snapshot_lock),
+            mock.patch.object(core, "_cmd_status_locked", side_effect=status_reader),
+            mock.patch.object(core, "_cmd_health_locked", side_effect=health_reader),
+        ):
+            self.assertEqual(core.cmd_status(argparse.Namespace(json=True)), 17)
+            self.assertEqual(core.cmd_health(argparse.Namespace(json=True)), 23)
+
+        self.assertEqual(
+            events,
+            [
+                "locked",
+                "status-read",
+                "unlocked",
+                "locked",
+                "health-read",
+                "unlocked",
+            ],
+        )
+
     def test_obfuscation_show_reports_versions_revision_transition_and_consistency_without_secrets(self):
         self.assertTrue(
             hasattr(core, "cmd_obfuscation_show"),
@@ -1344,6 +2400,7 @@ class ObfuscationStatusTests(unittest.TestCase):
             with patched_layout(pathlib.Path(directory)):
                 active, classic, client, awg31, server, profile, backup = active_state()
                 with (
+                    mock.patch.object(core, "mutation_lock", return_value=contextlib.nullcontext()),
                     mock.patch.object(
                         core, "inspect_awg_versions", return_value=live_versions
                     ) as inspect_versions,
@@ -1381,6 +2438,7 @@ class ObfuscationStatusTests(unittest.TestCase):
             with patched_layout(pathlib.Path(directory)):
                 active_state()
                 with (
+                    mock.patch.object(core, "mutation_lock", return_value=contextlib.nullcontext()),
                     mock.patch.object(core, "systemctl_state", return_value=("active", "enabled")),
                     mock.patch.object(core, "run", return_value=completed),
                     mock.patch.object(core, "imds_value", return_value="203.0.113.7"),
@@ -1429,6 +2487,7 @@ class ObfuscationStatusTests(unittest.TestCase):
             with patched_layout(pathlib.Path(directory)):
                 active_state()
                 with (
+                    mock.patch.object(core, "mutation_lock", return_value=contextlib.nullcontext()),
                     mock.patch.object(core, "systemctl_state", return_value=("active", "enabled")),
                     mock.patch.object(core, "run", side_effect=runner),
                     mock.patch.object(core, "safe_awg_query", return_value="4242"),
