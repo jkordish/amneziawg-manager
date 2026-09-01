@@ -7,7 +7,8 @@ import json
 import os
 import pathlib
 import re
-import tempfile
+import secrets
+import stat
 from collections.abc import Mapping
 
 
@@ -35,21 +36,54 @@ def _safe_relative(name: str) -> pathlib.PurePosixPath:
     return relative
 
 
-def _write_private(path: pathlib.Path, data: bytes) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    os.chmod(path.parent, 0o700)
-    fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
-    temporary_path = pathlib.Path(temporary)
+def _set_private_descriptor(fd: int, mode: int) -> None:
+    os.fchown(fd, os.geteuid(), os.getegid())
+    os.fchmod(fd, mode)
+
+
+def _open_private_directory(parent_fd: int, name: str) -> int:
     try:
-        os.fchmod(fd, 0o600)
-        with os.fdopen(fd, "wb") as handle:
-            handle.write(data)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(temporary_path, path)
-    except Exception:
-        temporary_path.unlink(missing_ok=True)
-        raise
+        os.mkdir(name, mode=0o700, dir_fd=parent_fd)
+    except FileExistsError:
+        pass
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
+    fd = os.open(name, flags, dir_fd=parent_fd)
+    metadata = os.fstat(fd)
+    if not stat.S_ISDIR(metadata.st_mode):
+        os.close(fd)
+        raise DiagnosticsError(f"unsafe diagnostic directory: {name}")
+    _set_private_descriptor(fd, 0o700)
+    return fd
+
+
+def _write_private(parent_fd: int, name: str, data: bytes) -> None:
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
+    try:
+        fd = os.open(name, flags, 0o600, dir_fd=parent_fd)
+    except OSError as exc:
+        raise DiagnosticsError(f"cannot create diagnostic file: {name}") from exc
+    try:
+        _set_private_descriptor(fd, 0o600)
+        view = memoryview(data)
+        while view:
+            written = os.write(fd, view)
+            if written <= 0:
+                raise DiagnosticsError(f"cannot write diagnostic file: {name}")
+            view = view[written:]
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def _same_open_directory(path: pathlib.Path, metadata: os.stat_result) -> bool:
+    try:
+        current = os.stat(path, follow_symlinks=False)
+    except OSError:
+        return False
+    return stat.S_ISDIR(current.st_mode) and (current.st_dev, current.st_ino) == (
+        metadata.st_dev,
+        metadata.st_ino,
+    )
 
 
 def create_bundle(
@@ -59,22 +93,52 @@ def create_bundle(
     created_at: str,
     files: Mapping[str, bytes],
 ) -> pathlib.Path:
-    if parent.exists() and (not parent.is_dir() or parent.is_symlink()):
-        raise DiagnosticsError(f"diagnostic parent is not a safe directory: {parent}")
-    parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
+    try:
+        parent_fd = os.open(parent, flags)
+    except OSError as exc:
+        raise DiagnosticsError(f"diagnostic parent is not a safe directory: {parent}") from exc
+    parent_metadata = os.fstat(parent_fd)
+    if parent_metadata.st_uid != os.geteuid():
+        os.close(parent_fd)
+        raise DiagnosticsError("diagnostic parent is not owned by the effective user")
+    if stat.S_IMODE(parent_metadata.st_mode) & 0o022:
+        os.close(parent_fd)
+        raise DiagnosticsError("diagnostic parent is writable by group or other users")
     stem = created_at.replace("-", "").replace(":", "").replace("Z", "Z").replace("T", "T")
-    candidate = parent / stem
-    counter = 1
-    while candidate.exists():
-        candidate = parent / f"{stem}-{counter:02d}"
-        counter += 1
-    candidate.mkdir(mode=0o700)
+    candidate_name = ""
+    candidate_fd: int | None = None
+    for _ in range(128):
+        candidate_name = f"{stem}-{secrets.token_hex(16)}"
+        try:
+            os.mkdir(candidate_name, mode=0o700, dir_fd=parent_fd)
+        except FileExistsError:
+            continue
+        candidate_fd = os.open(
+            candidate_name,
+            os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0),
+            dir_fd=parent_fd,
+        )
+        _set_private_descriptor(candidate_fd, 0o700)
+        break
+    if candidate_fd is None:
+        os.close(parent_fd)
+        raise DiagnosticsError("could not allocate a unique diagnostic bundle")
+    candidate = parent / candidate_name
     manifest_files: list[dict[str, object]] = []
+    directory_fds: dict[tuple[str, ...], int] = {(): candidate_fd}
     try:
         for name, data in sorted(files.items()):
             relative = _safe_relative(name)
-            target = candidate / pathlib.Path(*relative.parts)
-            _write_private(target, data)
+            parent_parts = relative.parts[:-1]
+            for length in range(1, len(parent_parts) + 1):
+                parts = parent_parts[:length]
+                if parts not in directory_fds:
+                    directory_fds[parts] = _open_private_directory(
+                        directory_fds[parts[:-1]],
+                        parts[-1],
+                    )
+            _write_private(directory_fds[parent_parts], relative.name, data)
             manifest_files.append(
                 {
                     "path": relative.as_posix(),
@@ -89,10 +153,14 @@ def create_bundle(
             "file_count": len(manifest_files),
             "files": manifest_files,
         }
-        _write_private(candidate / "manifest.json", (json.dumps(manifest, indent=2, sort_keys=True) + "\n").encode())
-    except Exception:
-        import shutil
-
-        shutil.rmtree(candidate, ignore_errors=True)
-        raise
+        _write_private(candidate_fd, "manifest.json", (json.dumps(manifest, indent=2, sort_keys=True) + "\n").encode())
+        for fd in directory_fds.values():
+            os.fsync(fd)
+        os.fsync(parent_fd)
+        if not _same_open_directory(parent, parent_metadata):
+            raise DiagnosticsError("diagnostic parent path changed during bundle creation")
+    finally:
+        for _, fd in sorted(directory_fds.items(), key=lambda item: len(item[0]), reverse=True):
+            os.close(fd)
+        os.close(parent_fd)
     return candidate

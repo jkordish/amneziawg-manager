@@ -12,10 +12,23 @@ SRC_ROOT = REPO_ROOT / "src"
 sys.path.insert(0, str(SRC_ROOT))
 
 from awgctl.version import VERSION
-from awginstall.deploy import active_release, install_release
+from awginstall.deploy import DeploymentError, active_release, install_release
 
 
 class VersionedDeploymentTests(unittest.TestCase):
+    def test_install_release_rejects_invalid_semver_directory(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory) / "opt/amneziawg"
+            artifact = pathlib.Path(directory) / "awgctl"
+            artifact.write_bytes(b"artifact")
+            with self.assertRaisesRegex(DeploymentError, "version"):
+                install_release(
+                    root=root,
+                    artifact=artifact,
+                    version="0.1.0-beta.01",
+                )
+            self.assertFalse((root / "releases").exists())
+
     def test_install_release_uses_versioned_directory_and_atomic_selector(self):
         with tempfile.TemporaryDirectory() as directory:
             root = pathlib.Path(directory) / "opt/amneziawg"

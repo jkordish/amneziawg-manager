@@ -10,6 +10,8 @@ import shutil
 import tempfile
 from collections.abc import Mapping
 
+from awgctl.semver import InvalidVersion, precedence_key
+
 
 class DeploymentError(RuntimeError):
     """A safe deployment error suitable for operator output."""
@@ -80,7 +82,11 @@ def install_release(
     share_files: Mapping[str, bytes] | None = None,
 ) -> pathlib.Path:
     """Install an immutable release and atomically make it active."""
-    if not version or "/" in version or version in {".", ".."}:
+    try:
+        precedence_key(version)
+    except InvalidVersion as exc:
+        raise DeploymentError("invalid release version") from exc
+    if "/" in version or version in {".", ".."}:
         raise DeploymentError("invalid release version")
     if not artifact.is_file():
         raise DeploymentError(f"release artifact not found: {artifact}")
