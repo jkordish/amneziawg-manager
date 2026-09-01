@@ -1002,6 +1002,7 @@ class Awg31RenderingTests(unittest.TestCase):
 
 class CpsDisclosureTests(unittest.TestCase):
     MARKER = "deadbeefc001d00d"
+    ALT_MARKER = "feedfacecafebeef"
 
     def config_with_marker(self) -> dict:
         config, _ = awg31_config()
@@ -1045,8 +1046,10 @@ class CpsDisclosureTests(unittest.TestCase):
             generated.write_text(awg_text, encoding="utf-8")
             runtime.write_text(awg_text, encoding="utf-8")
             prefixed_error = (
-                "Sep 01 awgctl[42]: Line unrecognized: "
-                f"'I1 = <b 0x{self.MARKER}>'"
+                "Sep 01 awgctl[42]: native parser: "
+                f'I1 = \\"<b 0x{self.MARKER}>\\" at input line 7\n'
+                "Sep 01 awgctl[42]: native parser: "
+                f'I2 = "<b 0x{self.ALT_MARKER}> at input line 8'
             )
             diagnostic_result = subprocess.CompletedProcess(
                 ["journalctl"],
@@ -1082,6 +1085,7 @@ class CpsDisclosureTests(unittest.TestCase):
                 if path.is_file():
                     content = path.read_bytes()
                     self.assertNotIn(self.MARKER.encode(), content, path)
+                    self.assertNotIn(self.ALT_MARKER.encode(), content, path)
             for relative in (
                 "manager/server.json",
                 "manager/generated-awg0.conf",
@@ -1090,43 +1094,84 @@ class CpsDisclosureTests(unittest.TestCase):
                 self.assertIn(b"[redacted]", (bundles[0] / relative).read_bytes())
 
     def test_native_selftest_cps_error_is_safe_in_public_text_and_json(self):
-        native_error = (
-            "Line unrecognized: "
-            f"'I1 = <b 0x{self.MARKER}>'"
+        native_errors = (
+            (
+                self.MARKER,
+                f'native parser: I1 = \\"<b 0x{self.MARKER}>\\" at input line 7',
+            ),
+            (
+                self.ALT_MARKER,
+                f'native parser: I2 = "<b 0x{self.ALT_MARKER}> at input line 8',
+            ),
         )
-        failed = subprocess.CompletedProcess(
-            ["ip", "netns", "exec", "test", "awg", "setconf"],
-            1,
-            b"",
-            native_error.encode("utf-8"),
-        )
-        with mock.patch.object(selftest_module.subprocess, "run", return_value=failed):
-            with self.assertRaises(selftest_module.SelfTestError) as raised:
-                selftest_module._run(
-                    ["ip", "netns", "exec", "test", "awg", "setconf", "awgt", "config"]
-                )
-        self.assertNotIn(self.MARKER, str(raised.exception))
-        self.assertIn("Line unrecognized", str(raised.exception))
-        self.assertIn("[redacted]", str(raised.exception))
-
-        for argv, as_json in (
-            (["self-test", "--experimental"], False),
-            (["--json", "self-test", "--experimental"], True),
-        ):
-            output = io.StringIO()
-            errors = io.StringIO()
-            with (
-                self.subTest(json=as_json),
-                mock.patch.object(core, "dispatch", side_effect=raised.exception),
-                mock.patch.object(core, "audit"),
-                contextlib.redirect_stdout(output),
-                contextlib.redirect_stderr(errors),
+        for marker, native_error in native_errors:
+            failed = subprocess.CompletedProcess(
+                ["ip", "netns", "exec", "test", "awg", "setconf"],
+                1,
+                b"",
+                native_error.encode("utf-8"),
+            )
+            with self.subTest(boundary="selftest", marker=marker), mock.patch.object(
+                selftest_module.subprocess, "run", return_value=failed
             ):
-                self.assertEqual(core.main(argv), 1)
-            public = output.getvalue() + errors.getvalue()
-            self.assertNotIn(self.MARKER, public)
-            self.assertIn("Line unrecognized", public)
-            self.assertIn("[redacted]", public)
+                with self.assertRaises(selftest_module.SelfTestError) as raised:
+                    selftest_module._run(
+                        ["ip", "netns", "exec", "test", "awg", "setconf", "awgt", "config"]
+                    )
+            safe_error = str(raised.exception)
+            self.assertNotIn(marker, safe_error)
+            self.assertIn("native parser", safe_error)
+            self.assertIn("[redacted]", safe_error)
+
+            for argv, as_json in (
+                (["self-test", "--experimental"], False),
+                (["--json", "self-test", "--experimental"], True),
+            ):
+                output = io.StringIO()
+                errors = io.StringIO()
+                with (
+                    self.subTest(boundary="public", marker=marker, json=as_json),
+                    mock.patch.object(core, "dispatch", side_effect=raised.exception),
+                    mock.patch.object(core, "audit"),
+                    contextlib.redirect_stdout(output),
+                    contextlib.redirect_stderr(errors),
+                ):
+                    self.assertEqual(core.main(argv), 1)
+                public = output.getvalue() + errors.getvalue()
+                self.assertNotIn(marker, public)
+                self.assertIn("native parser", public)
+                self.assertIn("[redacted]", public)
+
+    def test_cps_sanitizer_handles_multiple_wrappers_and_bounded_malformed_text(self):
+        source = (
+            "prefix "
+            f'I1 = \\"<b 0x{self.MARKER}>\\" at input line 7; '
+            f"I2=`<r 4><t>` beside I3 = '<b 0x{self.ALT_MARKER}>' suffix"
+        )
+        sanitized = diagnostics.sanitize_cps_text(source)
+        self.assertNotIn(self.MARKER, sanitized)
+        self.assertNotIn(self.ALT_MARKER, sanitized)
+        self.assertEqual(sanitized.count("[redacted]"), 3)
+        self.assertIn("prefix I1 = [redacted] at input line 7", sanitized)
+        self.assertIn("beside I3 = [redacted] suffix", sanitized)
+
+        wrapper_cases = (
+            (
+                f"tabbed I4\t=\t\\'<b 0x{self.MARKER}>\\' after",
+                "tabbed I4\t=\t[redacted] after",
+            ),
+            (
+                f"escaped I5 = \\`<b 0x{self.MARKER}>\\` after",
+                "escaped I5 = [redacted] after",
+            ),
+            (
+                f"unclosed I1 = `<b 0x{self.MARKER}> safe context",
+                "unclosed I1 = [redacted] safe context",
+            ),
+        )
+        for wrapped, expected in wrapper_cases:
+            with self.subTest(wrapper=wrapped[:12]):
+                self.assertEqual(diagnostics.sanitize_cps_text(wrapped), expected)
 
         quoted_value = (
             "native detail I2 = "
@@ -1139,6 +1184,38 @@ class CpsDisclosureTests(unittest.TestCase):
         sanitized = diagnostics.sanitize_cps_text(unquoted_value)
         self.assertNotIn(self.MARKER, sanitized)
         self.assertIn("I3=[redacted] at input line 7", sanitized)
+
+        malformed = (
+            "before\tI4 = \\`<b 0x"
+            + self.MARKER
+            + ("a" * 100_000)
+            + "\nafter"
+        )
+        sanitized = diagnostics.sanitize_cps_text(malformed)
+        self.assertNotIn(self.MARKER, sanitized)
+        self.assertEqual(sanitized, "before\tI4 = [redacted]\nafter")
+        self.assertLess(len(sanitized), 64)
+
+        malformed_multiple = (
+            f"I1=<b 0x{self.MARKER} I2=<b 0x{self.ALT_MARKER}> suffix"
+        )
+        sanitized = diagnostics.sanitize_cps_text(malformed_multiple)
+        self.assertNotIn(self.MARKER, sanitized)
+        self.assertNotIn(self.ALT_MARKER, sanitized)
+        self.assertEqual(sanitized, "I1=[redacted]I2=[redacted] suffix")
+        for invalid_tags in ("<b 0xabc>", "<r 1001>", "<r 600><rc 600>"):
+            ambiguous = f"I5={invalid_tags} {self.MARKER}\nnext"
+            with self.subTest(invalid_tags=invalid_tags):
+                self.assertEqual(
+                    diagnostics.sanitize_cps_text(ambiguous),
+                    "I5=[redacted]\nnext",
+                )
+        self.assertEqual(
+            diagnostics.sanitize_cps_text("empty I3=I4=\nnext"),
+            "empty I3=[redacted]I4=[redacted]\nnext",
+        )
+        harmless = "native parser: interface I count = 5"
+        self.assertEqual(diagnostics.sanitize_cps_text(harmless), harmless)
 
 
 if __name__ == "__main__":
