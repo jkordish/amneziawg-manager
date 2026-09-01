@@ -82,8 +82,12 @@ traffic. Delivery acknowledgement and network acceptance are separate records.
 
 Capability inspection binds the exact native tools version to matching loaded
 and packaged module versions. Only pairs in the versioned source allowlist may
-prepare AWG 3.1. The production allowlist is intentionally empty in this
-release, so the state machine is present but cannot activate a real pair.
+prepare AWG 3.1. Policy version 1 contains only tools/module
+`3.1.20260812`/`3.1.20260812`, qualified on the target Ubuntu 24.04 amd64 host
+through isolated native classic and AWG 3.1 traffic, recreation, counters,
+rollback, cleanup, and unchanged production invariants. This does not qualify
+other package builds or prove package upgrades, future kernels,
+Russian-network reachability, or physical-device acceptance.
 
 Preparation is non-serving: it validates Kat and the complete managed client
 set, selects an unused UDP port, creates an ordinary verified classic backup,

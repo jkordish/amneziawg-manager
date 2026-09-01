@@ -93,19 +93,20 @@ and integrity fields already describe.
   nftables tables, or explicitly attest the supported equivalent external
   firewall; never infer that boundary from platform metadata.
 - Never query `I1`–`I5` with the affected AmneziaWG 3.1 tooling.
-- Keep `AWG31_QUALIFIED_PAIRS_V1` empty until an exact tools/module candidate
-  has completed the reviewed qualification policy. Adding a pair is a reviewed
-  release decision based on a passing redacted receipt, not an automatic
-  package-discovery side effect.
+- Keep `AWG31_QUALIFIED_PAIRS_V1` limited to exact tools/module candidates that
+  have completed the reviewed qualification policy. Policy version 1 currently
+  contains only `3.1.20260812`/`3.1.20260812`, backed by the reviewed redacted
+  exact-host receipt. Adding or changing a pair is a reviewed release decision,
+  not an automatic package-discovery side effect.
 - Preserve unknown/unrelated host firewall, Docker, service, and application
   state.
 
 Repository tests, source review, generated profiles, mocked dry runs, and a
 local namespace self-test are separate non-deployment evidence lanes. Fresh
 installation stays beta until the release candidate passes the disposable-host
-checklist. AWG 3.1 remains separately unqualified until an exact native pair has
-a reviewed live qualification receipt; Kat's in-Russia native-iOS checklist is
-still a separate final acceptance lane.
+checklist. AWG 3.1 pair qualification, disposable installation,
+package/future-kernel behavior, and Kat's in-Russia native-iOS checklist remain
+separate evidence lanes.
 
 `make verify` supplies `equivalent-external-firewall` only as an explicit
 non-live parser/platform fixture for the read-only installer check. It does not

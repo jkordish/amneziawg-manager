@@ -91,10 +91,11 @@ instance.
 
 ## AWG 3.1 qualification gates
 
-The production `AWG31_QUALIFIED_PAIRS_V1` allowlist is intentionally empty for
-this release. Do not publish a release as AWG 3.1-capable merely because the
-model, dry runs, namespace renderer, or transaction tests pass, and do not add
-the currently installed/newest package pair merely because it is available.
+The production `AWG31_QUALIFIED_PAIRS_V1` policy version 1 contains only
+tools/module `3.1.20260812`/`3.1.20260812`. It was qualified on the target
+Ubuntu 24.04 amd64 host through the reviewed source-only process below. Do not
+add the currently installed/newest package pair merely because it is available,
+and do not generalize this exact-host result to another build or platform.
 
 The source-only qualifier may be run only by an operator, as root, from clean
 connected `main` after its implementation has merged:
@@ -116,6 +117,8 @@ packages, DKMS, manager state, clients, or transitions.
 An allowlist change must name the exact native tools and matching loaded and
 packaged module versions from a reviewed passing receipt. The current in-place
 policy supplies exact target-host Ubuntu 24.04 amd64 native traffic evidence.
+The reviewed repository record is
+[`qualification/2026-09-01-awg31-3.1.20260812.md`](qualification/2026-09-01-awg31-3.1.20260812.md).
 The receipt must explicitly retain
 `disposable_host=false`, `package_upgrade_test=false`,
 `future_kernel_test=false`, `russia_network=false`, and
