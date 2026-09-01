@@ -44,15 +44,17 @@ def _cps_wrapper_at(text: str, position: int) -> tuple[str | None, int]:
 
 def _cps_ambiguous_end(text: str, position: int) -> int:
     """Bound an untrusted assignment at the next line or assignment boundary."""
+    following = _CPS_ASSIGNMENT_START.search(text, position)
+    boundary = following.start() if following is not None else len(text)
     candidates = [
         index
-        for index in (text.find("\r", position), text.find("\n", position))
+        for index in (
+            text.find("\r", position, boundary),
+            text.find("\n", position, boundary),
+        )
         if index >= 0
     ]
-    following = _CPS_ASSIGNMENT_START.search(text, position)
-    if following is not None:
-        candidates.append(following.start())
-    return min(candidates, default=len(text))
+    return min(candidates, default=boundary)
 
 
 def _cps_payload_end(text: str, position: int) -> int:
