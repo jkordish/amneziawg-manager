@@ -18,20 +18,86 @@ _KEY_LINE = re.compile(
     r"(?P<value>\S+)(\s*)$",
     re.MULTILINE,
 )
-_CPS_ASSIGNMENT = re.compile(
-    r"(\bI[1-5][ \t]*=[ \t]*)(?:"
-    r"'[^'\r\n]*'|\"[^\"\r\n]*\"|(?:<[^>\r\n]*>)+|[^'\"\r\n]*"
-    r")"
+_CPS_ASSIGNMENT_START = re.compile(r"\bI[1-5][ \t]*=[ \t]*")
+_CPS_TAG = re.compile(
+    r"<(?:b 0x(?P<bytes>[0-9a-fA-F]+)|(?P<timestamp>t)|"
+    r"(?:r|rc|rd) (?P<size>[1-9][0-9]{0,3}))>"
 )
+_CPS_WRAPPERS = frozenset("'\"`")
 
 
 class DiagnosticsError(RuntimeError):
     """A diagnostic bundle could not be created safely."""
 
 
+def _cps_wrapper_at(text: str, position: int) -> tuple[str | None, int]:
+    if position < len(text) and text[position] in _CPS_WRAPPERS:
+        return text[position], 1
+    if (
+        position + 1 < len(text)
+        and text[position] == "\\"
+        and text[position + 1] in _CPS_WRAPPERS
+    ):
+        return text[position + 1], 2
+    return None, 0
+
+
+def _cps_ambiguous_end(text: str, position: int) -> int:
+    """Bound an untrusted assignment at the next line or assignment boundary."""
+    candidates = [
+        index
+        for index in (text.find("\r", position), text.find("\n", position))
+        if index >= 0
+    ]
+    following = _CPS_ASSIGNMENT_START.search(text, position)
+    if following is not None:
+        candidates.append(following.start())
+    return min(candidates, default=len(text))
+
+
+def _cps_payload_end(text: str, position: int) -> int:
+    wrapper, wrapper_width = _cps_wrapper_at(text, position)
+    cursor = position + wrapper_width
+    tags = 0
+    rendered_size = 0
+    while cursor < len(text) and text[cursor] == "<":
+        tag = _CPS_TAG.match(text, cursor)
+        if tag is None:
+            return _cps_ambiguous_end(text, position)
+        encoded = tag.group("bytes")
+        if encoded is not None:
+            if len(encoded) % 2:
+                return _cps_ambiguous_end(text, position)
+            contribution = len(encoded) // 2
+        elif tag.group("timestamp") is not None:
+            contribution = 4
+        else:
+            contribution = int(tag.group("size"))
+        rendered_size += contribution
+        if contribution > 1000 or rendered_size > 1000:
+            return _cps_ambiguous_end(text, position)
+        tags += 1
+        cursor = tag.end()
+    if tags == 0:
+        return _cps_ambiguous_end(text, position)
+    if wrapper is not None:
+        closing, closing_width = _cps_wrapper_at(text, cursor)
+        if closing == wrapper:
+            cursor += closing_width
+    return cursor
+
+
 def sanitize_cps_text(text: str) -> str:
     """Remove CPS assignment payloads from standalone or embedded native text."""
-    return _CPS_ASSIGNMENT.sub(r"\1[redacted]", text)
+    parts: list[str] = []
+    cursor = 0
+    while assignment := _CPS_ASSIGNMENT_START.search(text, cursor):
+        parts.append(text[cursor:assignment.end()])
+        parts.append("[redacted]")
+        payload_end = _cps_payload_end(text, assignment.end())
+        cursor = max(payload_end, assignment.end())
+    parts.append(text[cursor:])
+    return "".join(parts)
 
 
 def redact_awg_config(text: str) -> str:
