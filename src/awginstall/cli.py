@@ -122,20 +122,34 @@ def _install_amneziawg_packages() -> None:
 
 
 def _install_entrypoints(root: pathlib.Path, repo_root: pathlib.Path) -> None:
-    if root != DEFAULT_ROOT:
-        return
-    public = pathlib.Path("/usr/local/sbin/awgctl")
-    public.parent.mkdir(parents=True, exist_ok=True)
-    temporary = public.parent / f".awgctl.{os.getpid()}"
-    temporary.unlink(missing_ok=True)
-    os.symlink(str(root / "bin/awgctl"), temporary)
-    os.replace(temporary, public)
-    completion_source = repo_root / "awgctl-completion.bash"
-    if completion_source.is_file():
-        completion = pathlib.Path("/etc/bash_completion.d/awgctl")
-        completion.parent.mkdir(parents=True, exist_ok=True)
-        completion.write_bytes(completion_source.read_bytes())
-        os.chmod(completion, 0o644)
+    def atomic_public_file(path: pathlib.Path, data: bytes, mode: int) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        descriptor, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+        temporary_path = pathlib.Path(temporary_name)
+        try:
+            os.fchmod(descriptor, mode)
+            with os.fdopen(descriptor, "wb") as handle:
+                handle.write(data)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temporary_path, path)
+        except Exception:
+            temporary_path.unlink(missing_ok=True)
+            raise
+
+    readme = repo_root / "README.md"
+    if readme.is_file():
+        atomic_public_file(root / "README.md", readme.read_bytes(), 0o644)
+    if root == DEFAULT_ROOT:
+        public = pathlib.Path("/usr/local/sbin/awgctl")
+        public.parent.mkdir(parents=True, exist_ok=True)
+        temporary = public.parent / f".awgctl.{os.getpid()}"
+        temporary.unlink(missing_ok=True)
+        os.symlink(str(root / "bin/awgctl"), temporary)
+        os.replace(temporary, public)
+        completion_source = repo_root / "awgctl-completion.bash"
+        if completion_source.is_file():
+            atomic_public_file(pathlib.Path("/etc/bash_completion.d/awgctl"), completion_source.read_bytes(), 0o644)
 
 
 def _deploy_source_release(root: pathlib.Path, repo_root: pathlib.Path, *, health: bool) -> None:

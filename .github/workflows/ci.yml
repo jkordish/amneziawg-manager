@@ -1,0 +1,32 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Unit tests
+        run: python3 -m unittest discover -s tests -v
+      - name: Compile
+        run: python3 -m py_compile src/awgctl/*.py src/awginstall/*.py tools/*.py install.py
+      - name: Build executable and release manifest
+        run: make build
+      - name: Smoke test executable
+        run: |
+          dist/awgctl.pyz version
+          python3 install.py --help
+          python3 install.py install --dry-run --endpoint vpn.example.com --external-interface ens5
+      - name: Secret-pattern guard
+        run: |
+          if git grep -nE '(^|[^A-Za-z0-9+/])[A-Za-z0-9+/]{43}=($|[^A-Za-z0-9+/=])' -- ':!tests/**' ':!release-signing-key.pub' ':!src/awgctl/releases.py'; then
+            echo 'Possible WireGuard/AmneziaWG key material found in tracked source'
+            exit 1
+          fi

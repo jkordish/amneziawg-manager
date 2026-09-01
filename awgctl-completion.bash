@@ -6,7 +6,7 @@ _awgctl_complete() {
   case "${COMP_WORDS[1]:-}" in
     client)
       if [[ $COMP_CWORD -eq 2 ]]; then
-        COMPREPLY=( $(compgen -W 'list add show export qr revoke rotate' -- "$cur") )
+        COMPREPLY=( $(compgen -W 'list add show edit import export qr revoke rotate' -- "$cur") )
       fi
       ;;
     config)
@@ -16,9 +16,19 @@ _awgctl_complete() {
         COMPREPLY=( $(compgen -W 'endpoint dns mtu listen-port' -- "$cur") )
       fi
       ;;
+    backup)
+      if [[ $COMP_CWORD -eq 2 ]]; then
+        COMPREPLY=( $(compgen -W 'list verify' -- "$cur") )
+      fi
+      ;;
+    update)
+      if [[ $COMP_CWORD -eq 2 ]]; then
+        COMPREPLY=( $(compgen -W 'check apply' -- "$cur") )
+      fi
+      ;;
     *)
       if [[ $COMP_CWORD -eq 1 ]]; then
-        COMPREPLY=( $(compgen -W 'status health check start stop restart reload client config backup aws-rule' -- "$cur") )
+        COMPREPLY=( $(compgen -W 'status health check start stop restart reload client config backup restore diagnose self-test update aws-rule version' -- "$cur") )
       fi
       ;;
   esac

@@ -10,10 +10,13 @@ import unittest
 REPO_ROOT = pathlib.Path(__file__).parents[1]
 sys.path.insert(0, str(REPO_ROOT / "src"))
 
-from awgctl.releases import ReleaseError, parse_manifest, verify_artifact, verify_ssh_signature
+from awgctl.releases import RELEASE_PUBLIC_KEY, ReleaseError, parse_manifest, verify_artifact, verify_ssh_signature
 
 
 class ReleaseVerificationTests(unittest.TestCase):
+    def test_committed_and_embedded_release_public_keys_match(self):
+        self.assertEqual((REPO_ROOT / "release-signing-key.pub").read_text().strip(), RELEASE_PUBLIC_KEY)
+
     def manifest(self, artifact: bytes = b"zipapp") -> bytes:
         value = {
             "schema_version": 1,

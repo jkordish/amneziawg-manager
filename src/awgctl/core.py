@@ -10,6 +10,7 @@ import datetime as dt
 import fcntl
 import hashlib
 import ipaddress
+import io
 import json
 import os
 import pathlib
@@ -2669,6 +2670,10 @@ def cmd_initialize_fresh(args: argparse.Namespace) -> int:
             if safe_awg_query(config["interface"], "public-key") != server_public:
                 raise AwgctlError("fresh server identity verification failed")
             verify_peer_state(config["interface"], client_public, present=True)
+            with contextlib.redirect_stdout(io.StringIO()):
+                health_result = cmd_health(argparse.Namespace(json=True))
+            if health_result != 0:
+                raise AwgctlError("fresh server failed its complete health postcondition")
             backup = create_backup()
         except Exception as original:
             run(["systemctl", "stop", service], check=False, timeout=45)
@@ -2965,13 +2970,21 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parser.parse_args(argv)
     try:
         return dispatch(args)
-    except AwgctlError as exc:
+    except (
+        AwgctlError, BackupError, ContractError, DiagnosticsError, InstallerError,
+        PlatformError, ReleaseError, SelfTestError,
+    ) as exc:
         audit(f"command failed: {args.command}")
-        print(f"awgctl: {exc}", file=sys.stderr)
-        return 1
-    except (BackupError, ContractError, DiagnosticsError, InstallerError, PlatformError, ReleaseError, SelfTestError) as exc:
-        audit(f"command failed: {args.command}")
-        print(f"awgctl: {exc}", file=sys.stderr)
+        if getattr(args, "json", False):
+            command = args.command
+            for attribute in ("config_command", "client_command", "backup_command", "update_action"):
+                value = getattr(args, attribute, None)
+                if value:
+                    command += f" {value}"
+                    break
+            print(json.dumps(json_envelope(command, errors=[str(exc)]), indent=2, sort_keys=True))
+        else:
+            print(f"awgctl: {exc}", file=sys.stderr)
         return 1
     except KeyboardInterrupt:
         print("awgctl: interrupted", file=sys.stderr)

@@ -1,0 +1,17 @@
+[project]
+name = "amneziawg-manager"
+version = "0.1.0b1"
+description = "Production-oriented AmneziaWG management for Ubuntu 24.04 AWS Lightsail"
+readme = "README.md"
+requires-python = ">=3.12"
+license = {text = "MIT"}
+authors = [{name = "jkordish and contributors"}]
+dependencies = []
+
+[project.urls]
+Homepage = "https://github.com/jkordish/amneziawg-manager"
+Issues = "https://github.com/jkordish/amneziawg-manager/issues"
+
+[tool.awgctl]
+supported-platform = "ubuntu-24.04-amd64-lightsail"
+runtime-root = "/opt/amneziawg"

@@ -5,7 +5,7 @@ import json
 import sys
 import tempfile
 import unittest
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from unittest import mock
 
 
@@ -121,6 +121,21 @@ class JsonContractTests(unittest.TestCase):
             result = core.main(["version", "--json"])
         self.assertEqual(result, 0)
         self.assertEqual(json.loads(output.getvalue())["data"]["version"], "0.1.0-beta.1")
+
+    def test_json_errors_use_the_same_envelope_and_not_plain_stderr(self):
+        output = io.StringIO()
+        errors = io.StringIO()
+        with (
+            mock.patch.object(core, "require_root", side_effect=core.AwgctlError("root required")),
+            redirect_stdout(output),
+            redirect_stderr(errors),
+        ):
+            result = core.main(["--json", "config", "show"])
+        payload = json.loads(output.getvalue())
+        self.assertEqual(result, 1)
+        self.assertFalse(payload["ok"])
+        self.assertEqual(payload["errors"], ["root required"])
+        self.assertEqual(errors.getvalue(), "")
 
 
 class ClientMetadataTests(unittest.TestCase):
