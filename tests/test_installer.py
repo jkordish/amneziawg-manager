@@ -36,6 +36,26 @@ class PlatformValidationTests(unittest.TestCase):
 
 
 class UpgradeTests(unittest.TestCase):
+    def test_release_selector_layout_is_installed_before_post_upgrade_health(self):
+        from awginstall import cli
+        from awginstall.settings import resolve_installation_settings
+
+        events = []
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory) / "opt/amneziawg"
+            with (
+                mock.patch.object(cli, "_install_entrypoints", side_effect=lambda *_: events.append("entrypoints")),
+                mock.patch.object(cli, "_build_artifact", side_effect=lambda *_args, **_kwargs: events.append("build")),
+                mock.patch.object(cli, "upgrade_product", side_effect=lambda **_kwargs: events.append("upgrade")),
+            ):
+                cli._deploy_source_release(
+                    root,
+                    REPO_ROOT,
+                    health=True,
+                    settings=resolve_installation_settings(sudo_user=None),
+                )
+        self.assertEqual(events, ["entrypoints", "build", "upgrade", "entrypoints"])
+
     def make_artifact(self, directory: pathlib.Path, content: bytes = b"new executable\n") -> pathlib.Path:
         artifact = directory / "artifact"
         artifact.write_bytes(content)
@@ -93,10 +113,30 @@ class UpgradeTests(unittest.TestCase):
 
     def test_installer_parser_exposes_all_product_workflows(self):
         parser = build_parser()
-        for command in ("check", "install", "adopt", "upgrade"):
+        for command in ("check", "install", "adopt", "upgrade", "configure"):
             with self.subTest(command=command):
                 parsed = parser.parse_args([command, "--dry-run"] if command != "check" else [command])
                 self.assertEqual(parsed.command, command)
+
+    def test_installer_exposes_security_overrides_and_filtered_dns_default(self):
+        parser = build_parser()
+        defaults = parser.parse_args(["install", "--dry-run", "--endpoint", "vpn.example.com"])
+        custom = parser.parse_args([
+            "configure", "--dry-run",
+            "--staging-user", "vpn-stage",
+            "--operator-group", "vpn-admins",
+            "--operator", "deploy",
+            "--sudo-policy", "existing-sudo",
+            "--systemd-hardening", "off",
+            "--default-dns", "9.9.9.9,149.112.112.112",
+            "--adopt-existing-identities",
+        ])
+        self.assertIsNone(defaults.dns)
+        self.assertEqual(custom.staging_user, "vpn-stage")
+        self.assertEqual(custom.operator_group, "vpn-admins")
+        self.assertEqual(custom.operator, ["deploy"])
+        self.assertEqual(custom.default_dns, "9.9.9.9,149.112.112.112")
+        self.assertTrue(custom.adopt_existing_identities)
 
     def test_top_level_installer_help_is_runnable_without_pip(self):
         result = subprocess.run(
@@ -134,6 +174,27 @@ class UpgradeTests(unittest.TestCase):
             )
         self.assertEqual(result, 0)
         self.assertIn("official Amnezia PPA", output.getvalue())
+        self.assertIn("1.1.1.2,1.0.0.2", output.getvalue())
+
+    def test_configure_dry_run_reports_privilege_boundary_without_mutation(self):
+        output = io.StringIO()
+        report = mock.Mock(
+            identity=mock.Mock(commands=(("groupadd", "--system", "awgctl"),)),
+            sudoers="scoped",
+            service_hardening="sandbox",
+        )
+        with mock.patch("awginstall.cli.configure_host", return_value=report) as configure:
+            result = installer_main(
+                ["configure", "--dry-run", "--json"],
+                root=pathlib.Path("/opt/amneziawg"),
+                repo_root=REPO_ROOT,
+                output=output,
+            )
+        self.assertEqual(result, 0)
+        payload = json.loads(output.getvalue())
+        self.assertEqual(payload["settings"]["dns"]["policy"], "cloudflare-malware")
+        self.assertEqual(payload["identity_commands"], [["groupadd", "--system", "awgctl"]])
+        configure.assert_called_once()
 
 
 if __name__ == "__main__":

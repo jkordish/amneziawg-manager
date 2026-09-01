@@ -1,0 +1,321 @@
+"""Transactional host identity, sudo, and systemd configuration."""
+
+from __future__ import annotations
+
+import grp
+import json
+import os
+import pathlib
+import pwd
+import shutil
+import stat
+import subprocess
+import tempfile
+from collections.abc import Callable, Sequence
+from dataclasses import dataclass
+
+from .identity import (
+    GroupRecord,
+    IdentityPlan,
+    IdentitySnapshot,
+    UserRecord,
+    build_identity_plan,
+    render_sudoers,
+)
+from .sandbox import render_module_load, render_service_hardening
+from .settings import InstallationSettings
+
+
+class HostConfigurationError(RuntimeError):
+    """Host privilege-boundary configuration failed safely."""
+
+
+Runner = Callable[[Sequence[str]], subprocess.CompletedProcess[bytes]]
+
+
+@dataclass(frozen=True)
+class HostPaths:
+    sudoers: pathlib.Path = pathlib.Path("/etc/sudoers.d/amneziawg-manager")
+    service_dropin: pathlib.Path = pathlib.Path(
+        "/etc/systemd/system/awg-quick@awg0.service.d/20-awgctl-hardening.conf"
+    )
+    module_load: pathlib.Path = pathlib.Path("/etc/modules-load.d/amneziawg-manager.conf")
+
+    @classmethod
+    def under(cls, root: pathlib.Path) -> "HostPaths":
+        return cls(
+            sudoers=root / "etc/sudoers.d/amneziawg-manager",
+            service_dropin=root / "etc/systemd/system/awg-quick@awg0.service.d/20-awgctl-hardening.conf",
+            module_load=root / "etc/modules-load.d/amneziawg-manager.conf",
+        )
+
+
+@dataclass(frozen=True)
+class HostConfigurationReport:
+    identity: IdentityPlan
+    sudoers: str
+    service_hardening: str
+    module_load: str
+    settings: dict[str, object]
+    dry_run: bool
+
+
+@dataclass(frozen=True)
+class _FileSnapshot:
+    exists: bool
+    data: bytes = b""
+    mode: int = 0
+
+
+def _file_snapshot(path: pathlib.Path) -> _FileSnapshot:
+    try:
+        metadata = path.lstat()
+    except FileNotFoundError:
+        return _FileSnapshot(False)
+    if not stat.S_ISREG(metadata.st_mode):
+        raise HostConfigurationError(f"managed host path is not a regular file: {path}")
+    return _FileSnapshot(True, path.read_bytes(), stat.S_IMODE(metadata.st_mode))
+
+
+def _atomic_write(path: pathlib.Path, data: bytes, mode: int) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    temporary = pathlib.Path(temporary_name)
+    try:
+        os.fchmod(descriptor, mode)
+        with os.fdopen(descriptor, "wb") as handle:
+            handle.write(data)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+        os.chmod(path, mode)
+    except Exception:
+        temporary.unlink(missing_ok=True)
+        raise
+
+
+def _restore_file(path: pathlib.Path, snapshot: _FileSnapshot) -> None:
+    if snapshot.exists:
+        _atomic_write(path, snapshot.data, snapshot.mode)
+    else:
+        path.unlink(missing_ok=True)
+
+
+def _run_local(argv: Sequence[str]) -> subprocess.CompletedProcess[bytes]:
+    try:
+        result = subprocess.run(
+            list(argv), stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            check=False, timeout=60,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise HostConfigurationError(f"could not run host command: {argv[0]}") from exc
+    if result.returncode != 0:
+        detail = result.stderr.decode("utf-8", "replace").strip().splitlines()
+        raise HostConfigurationError(
+            f"host command failed: {argv[0]}{': ' + detail[-1] if detail else ''}"
+        )
+    return result
+
+
+def _password_locked(name: str, runner: Runner) -> bool:
+    result = runner(("passwd", "--status", name))
+    fields = result.stdout.decode("utf-8", "replace").split()
+    return len(fields) >= 2 and fields[1] in {"L", "LK"}
+
+
+def snapshot_identities(
+    settings: InstallationSettings,
+    *,
+    runner: Runner | None = None,
+) -> IdentitySnapshot:
+    runner = runner or _run_local
+    names = {settings.staging_user, *settings.operators}
+    users: dict[str, UserRecord | None] = {}
+    locked: set[str] = set()
+    for name in names:
+        try:
+            record = pwd.getpwnam(name)
+        except KeyError:
+            continue
+        users[name] = UserRecord(
+            name=name,
+            uid=record.pw_uid,
+            gid=record.pw_gid,
+            home=record.pw_dir,
+            shell=record.pw_shell,
+        )
+        if name == settings.staging_user and _password_locked(name, runner):
+            locked.add(name)
+
+    all_groups = grp.getgrall()
+    wanted_groups = {settings.staging_group, settings.operator_group}
+    groups = {
+        record.gr_name: GroupRecord(record.gr_name, record.gr_gid, tuple(record.gr_mem))
+        for record in all_groups
+        if record.gr_name in wanted_groups
+    }
+    supplementary: dict[str, tuple[str, ...]] = {}
+    staging = users.get(settings.staging_user)
+    if isinstance(staging, UserRecord):
+        supplementary[settings.staging_user] = tuple(
+            sorted(
+                record.gr_name
+                for record in all_groups
+                if settings.staging_user in record.gr_mem and record.gr_gid != staging.gid
+            )
+        )
+    return IdentitySnapshot(
+        users=users,
+        groups=groups,
+        locked_users=locked,
+        supplementary_groups=supplementary,
+    )
+
+
+def _resolve_created_user(name: str) -> UserRecord:
+    try:
+        record = pwd.getpwnam(name)
+    except KeyError as exc:
+        raise HostConfigurationError(f"created staging account is unavailable: {name}") from exc
+    return UserRecord(name, record.pw_uid, record.pw_gid, record.pw_dir, record.pw_shell)
+
+
+def _prepare_staging_root(settings: InstallationSettings, user: UserRecord) -> None:
+    root = settings.staging_root
+    if root.exists() and root.is_symlink():
+        raise HostConfigurationError("staging root must not be a symbolic link")
+    root.mkdir(parents=True, exist_ok=True)
+    metadata = root.stat()
+    if not stat.S_ISDIR(metadata.st_mode):
+        raise HostConfigurationError("staging root must be a directory")
+    if metadata.st_uid not in {0, user.uid}:
+        raise HostConfigurationError("staging root is owned by an unexpected account")
+    os.chown(root, user.uid, user.gid)
+    os.chmod(root, 0o700)
+    jobs = root / "jobs"
+    jobs.mkdir(mode=0o700, exist_ok=True)
+    os.chown(jobs, user.uid, user.gid)
+    os.chmod(jobs, 0o700)
+
+
+def _install_validated_sudoers(path: pathlib.Path, content: str, runner: Runner) -> None:
+    if not content:
+        path.unlink(missing_ok=True)
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    temporary = pathlib.Path(temporary_name)
+    try:
+        os.fchmod(descriptor, 0o440)
+        with os.fdopen(descriptor, "wb") as handle:
+            handle.write(content.encode("utf-8"))
+            handle.flush()
+            os.fsync(handle.fileno())
+        runner(("visudo", "-cf", str(temporary)))
+        os.replace(temporary, path)
+        os.chmod(path, 0o440)
+    except Exception:
+        temporary.unlink(missing_ok=True)
+        raise
+
+
+def _rollback_identities(plan: IdentityPlan, runner: Runner) -> None:
+    for user, group in reversed(plan.added_memberships):
+        try:
+            runner(("gpasswd", "--delete", user, group))
+        except Exception:
+            pass
+    for user in reversed(plan.created_users):
+        try:
+            runner(("userdel", "--remove", user))
+        except Exception:
+            pass
+    for group in reversed(plan.created_groups):
+        try:
+            runner(("groupdel", group))
+        except Exception:
+            pass
+
+
+def configure_host(
+    settings: InstallationSettings,
+    *,
+    product_root: pathlib.Path,
+    paths: HostPaths | None = None,
+    allow_existing: bool,
+    dry_run: bool,
+    snapshot: IdentitySnapshot | None = None,
+    runner: Runner | None = None,
+) -> HostConfigurationReport:
+    """Apply the host privilege boundary and compensate new state on failure."""
+    paths = paths or HostPaths()
+    runner = runner or _run_local
+    initial_snapshot = snapshot or snapshot_identities(settings, runner=runner)
+    identity_plan = build_identity_plan(settings, initial_snapshot, allow_existing=allow_existing)
+    sudoers = render_sudoers(settings.operator_group, settings.sudo_policy)
+    hardening = render_service_hardening(settings.systemd_hardening)
+    module_load = render_module_load()
+    settings_document = settings.to_dict()
+    report = HostConfigurationReport(
+        identity=identity_plan,
+        sudoers=sudoers,
+        service_hardening=hardening,
+        module_load=module_load,
+        settings=settings_document,
+        dry_run=dry_run,
+    )
+    if dry_run:
+        return report
+
+    installation_path = product_root / "config/installation.json"
+    managed_paths = (paths.sudoers, paths.service_dropin, paths.module_load, installation_path)
+    file_snapshots = {path: _file_snapshot(path) for path in managed_paths}
+    commands_started = False
+    try:
+        for command in identity_plan.commands:
+            commands_started = True
+            runner(command)
+        staging_user = (
+            _resolve_created_user(settings.staging_user)
+            if identity_plan.created_users
+            else initial_snapshot.users.get(settings.staging_user)
+        )
+        if not isinstance(staging_user, UserRecord):
+            raise HostConfigurationError("staging account validation failed")
+        _prepare_staging_root(settings, staging_user)
+
+        _install_validated_sudoers(paths.sudoers, sudoers, runner)
+        if hardening:
+            _atomic_write(paths.service_dropin, hardening.encode("utf-8"), 0o644)
+        else:
+            paths.service_dropin.unlink(missing_ok=True)
+        _atomic_write(paths.module_load, module_load.encode("utf-8"), 0o644)
+        _atomic_write(
+            installation_path,
+            (json.dumps(settings_document, indent=2, sort_keys=True) + "\n").encode("utf-8"),
+            0o600,
+        )
+        runner(("systemd-analyze", "verify", "awg-quick@awg0.service"))
+        runner(("systemctl", "daemon-reload"))
+
+        if snapshot is None:
+            verified = snapshot_identities(settings, runner=runner)
+            post_plan = build_identity_plan(settings, verified, allow_existing=True)
+            if post_plan.commands:
+                raise HostConfigurationError("host identities did not converge to the requested policy")
+        return report
+    except Exception as exc:
+        for path, previous in file_snapshots.items():
+            try:
+                _restore_file(path, previous)
+            except Exception:
+                pass
+        try:
+            runner(("systemctl", "daemon-reload"))
+        except Exception:
+            pass
+        if commands_started:
+            _rollback_identities(identity_plan, runner)
+        if isinstance(exc, HostConfigurationError):
+            raise
+        raise HostConfigurationError(str(exc)) from exc

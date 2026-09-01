@@ -71,9 +71,34 @@ files, use a verified backup, and run health after restore. Never use
 `nft flush ruleset`; `_firewall down` removes only manager-owned rules:
 
 ```bash
-sudo /opt/amneziawg/bin/awgctl _firewall down
+sudo /opt/amneziawg/libexec/awgctl-internal _firewall down
 sudo awgctl restart
 sudo awgctl health
 ```
 
 Do not claim client connectivity until a new handshake is observed.
+
+## Host-policy rollback
+
+VPN data and host identity policy are separate. Before changing identity,
+sudo, or systemd settings, create `sudo awgctl backup` and preserve these
+manager-owned files:
+
+```text
+/opt/amneziawg/config/installation.json
+/etc/sudoers.d/amneziawg-manager
+/etc/modules-load.d/amneziawg-manager.conf
+/etc/systemd/system/awg-quick@awg0.service.d/20-awgctl-hardening.conf
+```
+
+The installer restores those files and removes only accounts, groups, and
+memberships it created if validation fails. To disable an applied service
+sandbox for diagnosis, change the declared policy rather than editing the
+drop-in:
+
+```bash
+sudo python3 install.py configure --yes --systemd-hardening off --apply-live
+```
+
+Re-enable it with `--systemd-hardening conservative --apply-live`. Do not delete
+the staging account while a worker job is running.

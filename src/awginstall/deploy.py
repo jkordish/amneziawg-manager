@@ -112,6 +112,7 @@ def install_release(
             hashes[path_name] = hashlib.sha256(data).hexdigest()
         manifest = {
             "schema_version": 1,
+            "installation_schema_version": 1,
             "version": version,
             "files": files,
             "sha256": hashes,
@@ -149,6 +150,7 @@ def preserve_legacy_release(root: pathlib.Path) -> str | None:
         _atomic_write(staging / "awgctl", data, 0o755)
         manifest = {
             "schema_version": 1,
+            "installation_schema_version": 1,
             "version": version,
             "files": ["awgctl"],
             "sha256": {"awgctl": hashlib.sha256(data).hexdigest()},

@@ -9,7 +9,7 @@ there is no `shell=True`.
 
 ```text
 src/awgctl/       product CLI, contracts, backups, diagnostics, releases, self-test
-src/awginstall/   platform checks, immutable deployment, installer transactions
+src/awginstall/   settings, identities, confined workers, host/deploy transactions
 tools/            zipapp and signed-manifest builders
 tests/            dependency-free unittest suite
 docs/             operator and contributor runbooks
@@ -24,11 +24,18 @@ make build
 dist/awgctl.pyz version
 python3 install.py check
 python3 install.py install --dry-run --endpoint vpn.example.com
+python3 install.py configure --dry-run --json
 ```
 
 Tests run without root and must not read live credentials. The network namespace
 self-test's renderer is unit-tested; the actual namespace test is explicitly
 root-only and operator-triggered.
+
+The production build path is deliberately stricter than `make build`: the
+installer creates the staging identity, copies only `src/` and `tools/` into a
+protected job, and invokes `tools/build_release.py` through `systemd-run` with
+`PrivateNetwork=yes`. Tests may inject a local runner but exercise the same
+command construction and output validation.
 
 ## Design rules
 

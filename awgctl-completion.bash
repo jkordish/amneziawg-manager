@@ -7,6 +7,8 @@ _awgctl_complete() {
     client)
       if [[ $COMP_CWORD -eq 2 ]]; then
         COMPREPLY=( $(compgen -W 'list add show edit import export qr revoke rotate' -- "$cur") )
+      elif [[ ${COMP_WORDS[2]:-} == edit && $COMP_CWORD -ge 4 ]]; then
+        COMPREPLY=( $(compgen -W '--owner --device --expires --mark-distributed --dry-run --json' -- "$cur") )
       fi
       ;;
     config)

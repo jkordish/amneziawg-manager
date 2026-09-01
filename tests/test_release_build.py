@@ -34,6 +34,7 @@ class ReleaseBuildTests(unittest.TestCase):
             manifest = json.loads(output.read_text())
             self.assertEqual(manifest["tag"], "v0.1.0-beta.1")
             self.assertEqual(manifest["platform"], "ubuntu-24.04-amd64")
+            self.assertEqual(manifest["installation_schema_version"], 1)
             self.assertEqual(manifest["artifact"]["name"], "awgctl.pyz")
 
 

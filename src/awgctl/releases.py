@@ -40,7 +40,8 @@ def parse_manifest(data: bytes, *, expected_platform: str) -> dict[str, Any]:
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise ReleaseError("release manifest is not valid JSON") from exc
     if not isinstance(manifest, dict) or set(manifest) != {
-        "schema_version", "version", "tag", "channel", "platform", "artifact"
+        "schema_version", "version", "tag", "channel", "platform",
+        "installation_schema_version", "artifact"
     }:
         raise ReleaseError("release manifest fields are incomplete or unexpected")
     version = manifest["version"]
@@ -52,6 +53,8 @@ def parse_manifest(data: bytes, *, expected_platform: str) -> dict[str, Any]:
         raise ReleaseError("unsupported release channel")
     if manifest["platform"] != expected_platform:
         raise ReleaseError(f"release platform mismatch: expected {expected_platform}")
+    if manifest["installation_schema_version"] != 1:
+        raise ReleaseError("unsupported installation settings schema")
     artifact = manifest["artifact"]
     if not isinstance(artifact, dict) or set(artifact) != {"name", "sha256", "size"}:
         raise ReleaseError("release artifact fields are incomplete or unexpected")

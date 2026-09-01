@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
 import base64
 import ipaddress
+import os
 import pathlib
+import pwd
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 
 BUILD_ROOT = pathlib.Path(__file__).parents[1]
@@ -107,8 +110,8 @@ class RenderingTests(unittest.TestCase):
             "MTU = 1280\n"
             "Jc = 12\nJmin = 56\nJmax = 852\nS1 = 149\nS2 = 149\n"
             "H1 = 1603259132\nH2 = 1601077912\nH3 = 738660798\nH4 = 1722938668\n"
-            "PostUp = /opt/amneziawg/bin/awgctl _firewall up\n"
-            "PostDown = /opt/amneziawg/bin/awgctl _firewall down\n\n"
+            "PostUp = /opt/amneziawg/libexec/awgctl-internal _firewall up\n"
+            "PostDown = /opt/amneziawg/libexec/awgctl-internal _firewall down\n\n"
             "[Peer]\n# kat\n"
             f"PublicKey = {key(2)}\nPresharedKey = {key(3)}\n"
             "AllowedIPs = 10.77.42.2/32\n"
@@ -150,8 +153,29 @@ class OperationalContractTests(unittest.TestCase):
         self.assertEqual(parser.parse_args(["client", "add", "kat-iphone"]).client_name, "kat-iphone")
         export = parser.parse_args(["client", "export", "kat", "--output", "/tmp/kat.conf"])
         self.assertEqual(export.output, pathlib.Path("/tmp/kat.conf"))
+        qr = parser.parse_args(["client", "qr", "kat", "--output", "/secure/kat.png"])
+        self.assertEqual(qr.output, pathlib.Path("/secure/kat.png"))
         self.assertEqual(parser.parse_args(["config", "set", "listen-port", "55323"]).key, "listen-port")
         self.assertEqual(parser.parse_args(["aws-rule"]).command, "aws-rule")
+
+    def test_operator_secret_copy_is_owned_by_invoker_and_rejects_writable_parent(self):
+        invoker = pwd.getpwuid(os.getuid()).pw_name
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            safe = root / "safe"
+            safe.mkdir(mode=0o700)
+            with mock.patch.dict(os.environ, {"SUDO_USER": invoker}):
+                output = awgctl.write_operator_secret(safe / "kat.conf", b"secret\n")
+            self.assertEqual(output.read_bytes(), b"secret\n")
+            self.assertEqual(output.stat().st_mode & 0o777, 0o600)
+            self.assertEqual(output.stat().st_uid, os.getuid())
+
+            unsafe = root / "unsafe"
+            unsafe.mkdir(mode=0o777)
+            unsafe.chmod(0o777)
+            with mock.patch.dict(os.environ, {"SUDO_USER": invoker}):
+                with self.assertRaisesRegex(awgctl.AwgctlError, "writable"):
+                    awgctl.write_operator_secret(unsafe / "kat.conf", b"secret\n")
 
     def test_handshake_age_never_claims_contact_for_zero(self):
         self.assertEqual(awgctl.format_age(0, now=2_000_000_000), "never")

@@ -67,8 +67,21 @@ def _optional_text(value: Any, field: str) -> str | None:
     return value
 
 
+def _optional_timestamp(value: Any, field: str) -> str | None:
+    value = _optional_text(value, field)
+    if value is None:
+        return None
+    try:
+        parsed = dt.datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise ContractError(f"{field} must be an ISO 8601 timestamp or null") from exc
+    if parsed.tzinfo is None:
+        raise ContractError(f"{field} must include a timezone")
+    return value
+
+
 def normalize_client_metadata(metadata: dict[str, Any]) -> dict[str, Any]:
-    """Read schema 1 state and return the strict schema 2 representation."""
+    """Read historical client state and return the strict schema 3 representation."""
     if not isinstance(metadata, dict):
         raise ContractError("client metadata must be an object")
     result = dict(metadata)
@@ -76,14 +89,25 @@ def normalize_client_metadata(metadata: dict[str, Any]) -> dict[str, Any]:
     if schema == 1:
         result.update(
             {
-                "schema_version": 2,
                 "management": "managed",
                 "owner": None,
                 "device": None,
                 "expires": None,
             }
         )
-    elif schema != 2:
+    if schema in {1, 2}:
+        generated_at = result.get("updated_at") or result.get("created_at")
+        result.update(
+            {
+                "schema_version": 3,
+                "profile_revision": 1,
+                "profile_generated_at": generated_at,
+                "profile_change_reason": "legacy-import",
+                "distribution_status": "unknown",
+                "distributed_at": None,
+            }
+        )
+    elif schema != 3:
         raise ContractError("unsupported client metadata schema")
     if result.get("management") not in {"managed", "external"}:
         raise ContractError("client management must be managed or external")
@@ -99,4 +123,44 @@ def normalize_client_metadata(metadata: dict[str, Any]) -> dict[str, Any]:
             raise ContractError("expires must be YYYY-MM-DD or null") from exc
         if parsed.isoformat() != expires:
             raise ContractError("expires must be YYYY-MM-DD or null")
+    revision = result.get("profile_revision")
+    if not isinstance(revision, int) or isinstance(revision, bool) or revision < 1:
+        raise ContractError("profile_revision must be a positive integer")
+    result["profile_generated_at"] = _optional_timestamp(
+        result.get("profile_generated_at"), "profile_generated_at"
+    )
+    if result["profile_generated_at"] is None:
+        raise ContractError("profile_generated_at must be an ISO 8601 timestamp")
+    result["profile_change_reason"] = _optional_text(
+        result.get("profile_change_reason"), "profile_change_reason"
+    )
+    if result["profile_change_reason"] is None:
+        raise ContractError("profile_change_reason is required")
+    distribution = result.get("distribution_status")
+    if distribution not in {"unknown", "pending", "distributed"}:
+        raise ContractError("distribution_status must be unknown, pending, or distributed")
+    result["distributed_at"] = _optional_timestamp(result.get("distributed_at"), "distributed_at")
+    if distribution == "distributed" and result["distributed_at"] is None:
+        raise ContractError("distributed_at is required when distribution_status is distributed")
+    if distribution != "distributed" and result["distributed_at"] is not None:
+        raise ContractError("distributed_at must be null unless distribution_status is distributed")
     return result
+
+
+def mark_profile_regenerated(
+    metadata: dict[str, Any], *, reason: str, timestamp: str
+) -> dict[str, Any]:
+    """Return metadata for a newly generated, not-yet-distributed profile revision."""
+    result = normalize_client_metadata(metadata)
+    result.update(
+        {
+            "schema_version": 3,
+            "profile_revision": result["profile_revision"] + 1,
+            "profile_generated_at": timestamp,
+            "profile_change_reason": reason,
+            "distribution_status": "pending",
+            "distributed_at": None,
+            "updated_at": timestamp,
+        }
+    )
+    return normalize_client_metadata(result)

@@ -3,6 +3,21 @@
 All notable changes are documented here. The project follows semantic
 versioning while preserving explicit beta labels for unqualified host paths.
 
+## 0.1.0-beta.3 - 2026-09-01
+
+- Added locked staging and separate operator identities with validated adoption,
+  configurable scoped sudo, and transactional rollback.
+- Added no-network transient systemd source builds and conservative hardening
+  for the native awg-quick unit.
+- Split public and internal entrypoints so lifecycle and migration helpers are
+  outside the operator-facing grammar.
+- Made Cloudflare's malware-blocking resolvers the fresh-install default while
+  retaining named and custom DNS policies.
+- Added client profile revision/delivery metadata and explicit distribution
+  acknowledgement without changing peer identity.
+- Added secure operator-owned profile/QR export paths and installation-schema
+  declarations in release manifests.
+
 ## 0.1.0-beta.2 - 2026-09-01
 
 - Made successful mutation commands honor the stable JSON response envelope.

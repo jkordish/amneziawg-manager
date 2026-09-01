@@ -1,0 +1,22 @@
+{
+  "schema_version": 1,
+  "staging": {
+    "user": "awgctl",
+    "group": "awgctl",
+    "uid": null,
+    "gid": null,
+    "root": "/var/lib/amneziawg-manager"
+  },
+  "operators": {
+    "group": "awgctl-admin",
+    "users": [],
+    "enroll_sudo_invoker": true,
+    "sudo_policy": "scoped-nopasswd"
+  },
+  "systemd": {
+    "hardening": "conservative"
+  },
+  "dns": {
+    "default": "cloudflare-malware"
+  }
+}

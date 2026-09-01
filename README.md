@@ -25,6 +25,8 @@ port, AWS credential, or generic host firewall.
 - Stable JSON output, dry runs, redacted diagnostics, and an opt-in namespace
   self-test.
 - Immutable product releases and Ed25519-signed operator-triggered updates.
+- A locked, nologin staging identity for confined builds and a separate scoped
+  operator group.
 
 ## Quick start
 
@@ -49,6 +51,11 @@ sudo python3 install.py install --yes \
   --first-client admin-iphone \
   --owner admin --device iphone
 ```
+
+The default client DNS policy is Cloudflare's malware-blocking resolver pair,
+`1.1.1.2,1.0.0.2`. It blocks known malicious destinations; DNS filtering is
+not a complete advertisement blocker. Override it with `--dns`,
+`--default-dns`, or [install-settings.example.json](install-settings.example.json).
 
 For a working host with exactly one existing server peer and its matching
 client profile:
@@ -77,6 +84,30 @@ Custom / UDP / 55323 / 0.0.0.0/0
 `awgctl aws-rule` reports the exact rule for the current port. The installer
 never changes AWS resources and never enables UFW.
 
+## Build, configure, and upgrade
+
+The Git checkout is the one repository and build context. The installed product
+under `/opt/amneziawg` is root-owned generated state and is never a Git working
+tree. A normal source upgrade is:
+
+```bash
+git pull --ff-only
+python3 install.py check
+python3 install.py upgrade --dry-run
+sudo python3 install.py upgrade --yes
+```
+
+On first installation the script creates locked `awgctl:awgctl` staging
+identity, `/var/lib/amneziawg-manager`, and the `awgctl-admin` operator group.
+The invoking sudo user is enrolled by default. Builds run as `awgctl` in a
+transient no-network systemd worker; root validates and installs the artifact.
+To migrate existing managed profiles to the configured DNS and activate the
+native service sandbox immediately:
+
+```bash
+sudo python3 install.py upgrade --yes --apply-default-dns --apply-live
+```
+
 ## Everyday use
 
 ```bash
@@ -85,7 +116,9 @@ sudo awgctl health
 sudo awgctl client add kat-iphone --owner Kat --device iPhone
 sudo awgctl client list
 sudo awgctl client show kat-iphone
-sudo awgctl client export kat-iphone --output /secure/path/kat-iphone.conf
+sudo awgctl client export kat-iphone --output /home/OPERATOR/kat-iphone.conf
+sudo awgctl client qr kat-iphone --output /home/OPERATOR/kat-iphone.png
+sudo awgctl client edit kat-iphone --mark-distributed
 sudo awgctl client revoke kat-iphone --dry-run
 sudo awgctl client revoke kat-iphone
 sudo awgctl backup

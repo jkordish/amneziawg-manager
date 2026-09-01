@@ -13,7 +13,13 @@ REPO_ROOT = pathlib.Path(__file__).parents[1]
 sys.path.insert(0, str(REPO_ROOT / "src"))
 
 from awgctl import core
-from awgctl.contracts import ContractError, health_envelope, json_envelope, normalize_client_metadata
+from awgctl.contracts import (
+    ContractError,
+    health_envelope,
+    json_envelope,
+    mark_profile_regenerated,
+    normalize_client_metadata,
+)
 
 
 class JsonContractTests(unittest.TestCase):
@@ -100,6 +106,8 @@ class JsonContractTests(unittest.TestCase):
             "owner": "Kat",
             "device": "phone",
             "expires": None,
+            "profile_revision": 2,
+            "distribution_status": "pending",
         }
         output = io.StringIO()
         with (
@@ -113,7 +121,16 @@ class JsonContractTests(unittest.TestCase):
         self.assertEqual(result, 0)
         payload = json.loads(output.getvalue())
         self.assertEqual(payload["data"]["clients"][0]["owner"], "Kat")
+        self.assertEqual(payload["data"]["clients"][0]["profile_revision"], 2)
+        self.assertEqual(payload["data"]["clients"][0]["distribution_status"], "pending")
         self.assertNotIn("RAW_PUBLIC_KEY", output.getvalue())
+
+    def test_management_security_health_requires_installed_policy(self):
+        with tempfile.TemporaryDirectory() as directory:
+            missing = pathlib.Path(directory) / "installation.json"
+            with mock.patch.object(core, "INSTALLATION_CONFIG", missing):
+                checks = core.management_security_checks()
+        self.assertEqual(checks, [("FAIL", "manager privilege policy", f"missing {missing}")])
 
     def test_version_command_does_not_require_root(self):
         output = io.StringIO()
@@ -154,12 +171,31 @@ class ClientMetadataTests(unittest.TestCase):
 
     def test_schema_one_metadata_is_normalized_without_losing_identity(self):
         normalized = normalize_client_metadata(self.legacy_metadata())
-        self.assertEqual(normalized["schema_version"], 2)
+        self.assertEqual(normalized["schema_version"], 3)
         self.assertEqual(normalized["management"], "managed")
         self.assertEqual(normalized["public_key"], "public")
         self.assertIsNone(normalized["owner"])
         self.assertIsNone(normalized["device"])
         self.assertIsNone(normalized["expires"])
+        self.assertEqual(normalized["profile_revision"], 1)
+        self.assertEqual(normalized["profile_generated_at"], normalized["updated_at"])
+        self.assertEqual(normalized["profile_change_reason"], "legacy-import")
+        self.assertEqual(normalized["distribution_status"], "unknown")
+        self.assertIsNone(normalized["distributed_at"])
+
+    def test_schema_two_metadata_is_normalized_with_unknown_delivery_state(self):
+        metadata = self.legacy_metadata()
+        metadata.update({
+            "schema_version": 2,
+            "management": "managed",
+            "owner": "Kat",
+            "device": "iPhone",
+            "expires": None,
+        })
+        normalized = normalize_client_metadata(metadata)
+        self.assertEqual(normalized["schema_version"], 3)
+        self.assertEqual(normalized["distribution_status"], "unknown")
+        self.assertEqual(normalized["profile_revision"], 1)
 
     def test_metadata_rejects_control_characters_and_invalid_expiry(self):
         for field, value in (("owner", "Kat\nAdmin"), ("device", "x" * 65), ("expires", "31-08-2027")):
@@ -170,7 +206,7 @@ class ClientMetadataTests(unittest.TestCase):
             with self.subTest(field=field), self.assertRaises(ContractError):
                 normalize_client_metadata(metadata)
 
-    def test_new_client_state_persists_schema_two_device_metadata(self):
+    def test_new_client_state_persists_schema_three_device_and_delivery_metadata(self):
         with tempfile.TemporaryDirectory() as directory_text:
             root = pathlib.Path(directory_text)
             clients = root / "clients"
@@ -196,12 +232,41 @@ class ClientMetadataTests(unittest.TestCase):
                     expires="2027-08-31",
                 )
             metadata = json.loads((clients / "kat-phone/metadata.json").read_text())
-            self.assertEqual(metadata["schema_version"], 2)
+            self.assertEqual(metadata["schema_version"], 3)
             self.assertEqual(metadata["management"], "managed")
             self.assertEqual(metadata["owner"], "Kat")
             self.assertEqual(metadata["device"], "iPhone")
             self.assertEqual(metadata["expires"], "2027-08-31")
+            self.assertEqual(metadata["profile_revision"], 1)
+            self.assertEqual(metadata["profile_change_reason"], "created")
+            self.assertEqual(metadata["distribution_status"], "pending")
+            self.assertIsNone(metadata["distributed_at"])
             self.assertEqual(state["owner"], "Kat")
+
+    def test_profile_regeneration_increments_revision_and_resets_delivery(self):
+        metadata = normalize_client_metadata({
+            **self.legacy_metadata(),
+            "schema_version": 3,
+            "management": "managed",
+            "owner": "Kat",
+            "device": "iPhone",
+            "expires": None,
+            "profile_revision": 2,
+            "profile_generated_at": "2026-09-01T08:00:00Z",
+            "profile_change_reason": "created",
+            "distribution_status": "distributed",
+            "distributed_at": "2026-09-01T09:00:00Z",
+        })
+        regenerated = mark_profile_regenerated(
+            metadata,
+            reason="config:dns",
+            timestamp="2026-09-01T10:00:00Z",
+        )
+        self.assertEqual(regenerated["profile_revision"], 3)
+        self.assertEqual(regenerated["profile_generated_at"], "2026-09-01T10:00:00Z")
+        self.assertEqual(regenerated["profile_change_reason"], "config:dns")
+        self.assertEqual(regenerated["distribution_status"], "pending")
+        self.assertIsNone(regenerated["distributed_at"])
 
 
 if __name__ == "__main__":

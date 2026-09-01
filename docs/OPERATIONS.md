@@ -48,19 +48,31 @@ sudo awgctl client list
 sudo awgctl client show kat-iphone
 sudo awgctl client edit kat-iphone --device 'iPhone 18'
 sudo awgctl client edit kat-iphone --expires none
+sudo awgctl client edit kat-iphone --mark-distributed
 ```
+
+Metadata tracks a monotonically increasing profile revision and one of
+`unknown`, `pending`, or `distributed`. Creating, rotating, or regenerating a
+profile makes that revision `pending`. Mark it distributed only after the
+intended owner confirms secure receipt/import; this does not claim a connection.
+Only a nonzero handshake proves the device has connected.
 
 Never reuse a profile across devices. Retrieve a profile through a protected
 file path:
 
 ```bash
-sudo awgctl client export kat-iphone --output /secure/path/kat-iphone.conf
-sudo awgctl client qr kat-iphone
+sudo awgctl client export kat-iphone --output /home/OPERATOR/kat-iphone.conf
+sudo awgctl client qr kat-iphone --output /home/OPERATOR/kat-iphone.png
 ```
 
 The default export reports the existing path. `--stdout` is explicit and warns
 because terminal scrollback and logs can retain credentials. QR images are
 never rendered in the terminal.
+
+An output directory must be absolute, owned by the sudo invoker, and not
+group/world-writable. The manager atomically creates the delivery copy as that
+operator with mode `0600`; it never overwrites a path. Delete the delivery copy
+after secure import. Canonical copies under `/opt` remain root-only.
 
 Import a profile only when its mode denies group/other access and its key,
 server identity, PSK, address, endpoint, MTU, DNS, keepalive, and classic
@@ -90,7 +102,7 @@ longer authenticates.
 ```bash
 sudo awgctl config show
 sudo awgctl config set endpoint vpn.example.com --dry-run
-sudo awgctl config set dns 1.1.1.1,1.0.0.1
+sudo awgctl config set dns cloudflare-malware
 sudo awgctl config set mtu 1280
 sudo awgctl config set listen-port 55323
 ```
@@ -98,6 +110,28 @@ sudo awgctl config set listen-port 55323
 A listen-port change prominently reports both old and new Lightsail rules. Add
 the new AWS rule before relying on the new port and remove the old one only
 after client connectivity is verified.
+
+Named policies are `cloudflare`, `cloudflare-malware`, and
+`cloudflare-family`; comma-separated IPv4 resolvers remain supported. The
+default malware policy stores `1.1.1.2,1.0.0.2`. Changing DNS regenerates
+profiles but does not change keys, PSKs, tunnel addresses, or peer identities.
+
+## First-use handoff for Kat
+
+Kat has a prepared profile, not a deployed device. Test it before delivery,
+then:
+
+1. Export either `kat.conf` or `kat.png` to a validated operator-owned directory.
+2. Transfer it over an end-to-end encrypted channel or in person; do not email
+   it, paste it into chat, or leave it in cloud photo or terminal history.
+3. Have Kat install the AmneziaWG client, import the profile on exactly one
+   device, connect, and confirm expected Internet access.
+4. Verify `sudo awgctl status` shows a recent handshake for `kat`.
+5. Record the handoff with `sudo awgctl client edit kat --mark-distributed`.
+6. Remove the temporary exported file or QR from the delivery location.
+
+Create a different client such as `kat-iphone` or `kat-macbook` for every
+additional device; never reuse `kat`.
 
 ## Diagnostics and self-test
 

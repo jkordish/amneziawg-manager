@@ -1,6 +1,6 @@
 [project]
 name = "amneziawg-manager"
-version = "0.1.0b2"
+version = "0.1.0b3"
 description = "Production-oriented AmneziaWG management for Ubuntu 24.04 AWS Lightsail"
 readme = "README.md"
 requires-python = ">=3.12"

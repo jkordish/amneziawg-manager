@@ -18,6 +18,10 @@ the supported platform is Ubuntu 24.04 LTS amd64 on AWS Lightsail.
 ## Security design
 
 - Root is required for mutations; operations serialize on a filesystem lock.
+- Source builds run as a locked nologin staging user in a capability-free,
+  no-network transient systemd worker; root validates the single output.
+- The operator group receives scoped sudo for the public CLI only. Internal
+  initialization, migration, and lifecycle commands use a separate path.
 - Secrets are written with restrictive umask, root ownership, and mode `0600`.
 - No command uses `eval` or `shell=True`; secrets are passed through stdin or
   protected files when an upstream tool requires them.

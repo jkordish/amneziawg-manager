@@ -7,6 +7,7 @@ import datetime as dt
 import json
 import os
 import pathlib
+import pwd
 import shutil
 import subprocess
 import sys
@@ -16,8 +17,12 @@ from typing import TextIO
 
 from awgctl.version import VERSION
 
+from .host import HostConfigurationError, HostPaths, configure_host
+from .identity import UserRecord
 from .installer import InstallerError, upgrade_product
 from .platform import PlatformError, read_os_release, validate_platform
+from .settings import InstallationSettings, SettingsError, resolve_installation_settings
+from .worker import WorkerError, build_in_confined_worker
 
 
 DEFAULT_ROOT = pathlib.Path("/opt/amneziawg")
@@ -29,19 +34,41 @@ def build_parser() -> argparse.ArgumentParser:
         description="Install, adopt, or upgrade the AmneziaWG manager on Ubuntu 24.04 Lightsail",
     )
     commands = parser.add_subparsers(dest="command", required=True)
+    def security_options(command: argparse.ArgumentParser, *, mutating: bool = True) -> None:
+        command.add_argument("--settings", type=pathlib.Path, help="installation settings JSON")
+        command.add_argument("--staging-user")
+        command.add_argument("--staging-group")
+        command.add_argument("--staging-uid", type=int)
+        command.add_argument("--staging-gid", type=int)
+        command.add_argument("--staging-root", type=pathlib.Path)
+        command.add_argument("--operator-group")
+        command.add_argument("--operator", action="append")
+        command.add_argument(
+            "--enroll-sudo-invoker", action=argparse.BooleanOptionalAction, default=None
+        )
+        command.add_argument("--sudo-policy", choices=("scoped-nopasswd", "existing-sudo", "none"))
+        command.add_argument("--systemd-hardening", choices=("conservative", "off"))
+        command.add_argument("--default-dns")
+        if mutating:
+            command.add_argument("--adopt-existing-identities", action="store_true")
+            command.add_argument("--apply-default-dns", action="store_true")
+            command.add_argument("--apply-live", action="store_true")
+
     check = commands.add_parser("check", help="perform read-only host preflight")
     check.add_argument("--json", action="store_true")
-    for name in ("install", "adopt", "upgrade"):
+    security_options(check, mutating=False)
+    for name in ("install", "adopt", "upgrade", "configure"):
         command = commands.add_parser(name)
         command.add_argument("--dry-run", action="store_true")
         command.add_argument("--yes", action="store_true")
         command.add_argument("--json", action="store_true")
+        security_options(command)
         if name == "install":
             command.add_argument("--endpoint")
             command.add_argument("--subnet", default="10.77.42.0/24")
             command.add_argument("--listen-port", type=int, default=55323)
             command.add_argument("--external-interface")
-            command.add_argument("--dns", default="1.1.1.1,1.0.0.1")
+            command.add_argument("--dns")
             command.add_argument("--mtu", type=int, default=1280)
             command.add_argument("--keepalive", type=int, default=25)
             command.add_argument("--first-client", default="admin-phone")
@@ -53,6 +80,29 @@ def build_parser() -> argparse.ArgumentParser:
             command.add_argument("--client-name", default="imported-device")
             command.add_argument("--external-interface")
     return parser
+
+
+def _resolved_settings(args: argparse.Namespace) -> InstallationSettings:
+    names = (
+        "staging_user", "staging_group", "staging_uid", "staging_gid", "staging_root",
+        "operator_group", "sudo_policy", "systemd_hardening",
+    )
+    overrides = {
+        name: getattr(args, name)
+        for name in names
+        if getattr(args, name, None) is not None
+    }
+    if getattr(args, "operator", None):
+        overrides["operators"] = args.operator
+    if getattr(args, "enroll_sudo_invoker", None) is not None:
+        overrides["enroll_sudo_invoker"] = args.enroll_sudo_invoker
+    if getattr(args, "default_dns", None) is not None:
+        overrides["default_dns"] = args.default_dns
+    return resolve_installation_settings(
+        settings_path=getattr(args, "settings", None),
+        sudo_user=os.environ.get("SUDO_USER"),
+        overrides=overrides,
+    )
 
 
 def package_install_plan(kernel: str) -> list[list[str]]:
@@ -140,6 +190,14 @@ def _install_entrypoints(root: pathlib.Path, repo_root: pathlib.Path) -> None:
     readme = repo_root / "README.md"
     if readme.is_file():
         atomic_public_file(root / "README.md", readme.read_bytes(), 0o644)
+    libexec = root / "libexec"
+    libexec.mkdir(parents=True, exist_ok=True)
+    os.chmod(libexec, 0o755)
+    internal = libexec / "awgctl-internal"
+    temporary_internal = libexec / f".awgctl-internal.{os.getpid()}"
+    temporary_internal.unlink(missing_ok=True)
+    os.symlink("../bin/awgctl", temporary_internal)
+    os.replace(temporary_internal, internal)
     if root == DEFAULT_ROOT:
         public = pathlib.Path("/usr/local/sbin/awgctl")
         public.parent.mkdir(parents=True, exist_ok=True)
@@ -152,10 +210,19 @@ def _install_entrypoints(root: pathlib.Path, repo_root: pathlib.Path) -> None:
             atomic_public_file(pathlib.Path("/etc/bash_completion.d/awgctl"), completion_source.read_bytes(), 0o644)
 
 
-def _deploy_source_release(root: pathlib.Path, repo_root: pathlib.Path, *, health: bool) -> None:
+def _deploy_source_release(
+    root: pathlib.Path,
+    repo_root: pathlib.Path,
+    *,
+    health: bool,
+    settings: InstallationSettings,
+) -> None:
+    # Health validates both selectors, so establish the stable selector layout
+    # before activating and checking a new immutable release.
+    _install_entrypoints(root, repo_root)
     with tempfile.TemporaryDirectory(prefix="awgctl-release-") as directory:
         artifact = pathlib.Path(directory) / "awgctl"
-        _build_artifact(repo_root, artifact)
+        _build_artifact(repo_root, artifact, settings=settings, confined=root == DEFAULT_ROOT)
         upgrade_product(
             root=root,
             artifact=artifact,
@@ -194,7 +261,32 @@ def _share_files(repo_root: pathlib.Path) -> dict[str, bytes]:
     return result
 
 
-def _build_artifact(repo_root: pathlib.Path, output: pathlib.Path) -> None:
+def _build_artifact(
+    repo_root: pathlib.Path,
+    output: pathlib.Path,
+    *,
+    settings: InstallationSettings,
+    confined: bool,
+) -> None:
+    if confined:
+        try:
+            record = pwd.getpwnam(settings.staging_user)
+        except KeyError as exc:
+            raise InstallerError("staging account is unavailable for the source build") from exc
+        build_in_confined_worker(
+            settings,
+            repo_root=repo_root,
+            output=output,
+            runner=_run,
+            user=UserRecord(
+                settings.staging_user,
+                record.pw_uid,
+                record.pw_gid,
+                record.pw_dir,
+                record.pw_shell,
+            ),
+        )
+        return
     result = subprocess.run(
         [sys.executable, str(repo_root / "tools/build_release.py"), "--output", str(output)],
         cwd=repo_root,
@@ -206,6 +298,42 @@ def _build_artifact(repo_root: pathlib.Path, output: pathlib.Path) -> None:
     if result.returncode != 0:
         detail = result.stderr.decode("utf-8", "replace").strip()
         raise InstallerError(f"release build failed: {detail or 'unknown error'}")
+
+
+def _configure_host_for_command(
+    args: argparse.Namespace,
+    *,
+    root: pathlib.Path,
+    settings: InstallationSettings,
+) -> object:
+    installed_settings = root / "config/installation.json"
+    managed_identity_exists = False
+    if not args.dry_run:
+        try:
+            managed_identity_exists = installed_settings.is_file()
+        except PermissionError:
+            managed_identity_exists = False
+    allow_existing = bool(args.adopt_existing_identities or managed_identity_exists)
+    return configure_host(
+        settings,
+        product_root=root,
+        paths=HostPaths(),
+        allow_existing=allow_existing,
+        dry_run=bool(args.dry_run),
+    )
+
+
+def _apply_requested_runtime_settings(
+    args: argparse.Namespace,
+    *,
+    root: pathlib.Path,
+    settings: InstallationSettings,
+) -> None:
+    executable = root / "bin/awgctl"
+    if getattr(args, "apply_default_dns", False):
+        _run([str(executable), "config", "set", "dns", ",".join(settings.default_dns)], timeout=120)
+    if getattr(args, "apply_live", False):
+        _run([str(executable), "restart"], timeout=120)
 
 
 def _health_check(executable: pathlib.Path) -> int:
@@ -237,6 +365,7 @@ def main(
     args = parser.parse_args(argv)
     repo_root = (repo_root or pathlib.Path(__file__).parents[2]).resolve()
     try:
+        settings = _resolved_settings(args)
         if args.command == "check":
             platform_info = validate_platform(read_os_release())
             _emit(
@@ -245,16 +374,54 @@ def main(
                     "schema_version": 1,
                     "ok": True,
                     "platform": platform_info,
+                    "settings": settings.to_dict(),
                     "message": "Host platform is supported: Ubuntu 24.04 amd64",
                 },
                 as_json=args.json,
             )
             return 0
         platform_info = validate_platform(read_os_release())
+        if args.command == "configure":
+            if root == DEFAULT_ROOT and not args.dry_run and os.geteuid() != 0:
+                raise InstallerError("run host configuration with sudo")
+            if not args.dry_run and not args.yes:
+                raise InstallerError("host configuration is mutating; rerun with --yes after reviewing --dry-run")
+            report = _configure_host_for_command(args, root=root, settings=settings)
+            if args.dry_run:
+                payload = {
+                    "schema_version": 1,
+                    "ok": True,
+                    "dry_run": True,
+                    "settings": settings.to_dict(),
+                    "identity_commands": [list(command) for command in report.identity.commands],
+                    "sudoers": "would install scoped policy" if report.sudoers else "disabled",
+                    "systemd_hardening": "would install" if report.service_hardening else "disabled",
+                    "message": (
+                        "Dry run: would configure the staging identity, operator policy, "
+                        "confined workers, and native service hardening"
+                    ),
+                }
+                _emit(output, payload, as_json=args.json)
+                return 0
+            if not (root / "bin/awgctl").exists() and (args.apply_default_dns or args.apply_live):
+                raise InstallerError("runtime settings require an installed manager")
+            _apply_requested_runtime_settings(args, root=root, settings=settings)
+            _emit(
+                output,
+                {
+                    "schema_version": 1,
+                    "ok": True,
+                    "settings": settings.to_dict(),
+                    "message": "Configured AmneziaWG Manager host identities and service policy",
+                },
+                as_json=args.json,
+            )
+            return 0
         if args.command == "install":
             if not args.endpoint:
                 raise InstallerError("fresh install requires --endpoint HOSTNAME")
             external = args.external_interface
+            dns = args.dns or ",".join(settings.default_dns)
             if args.dry_run:
                 external = external or "auto-detect-default-route"
                 _emit(
@@ -267,7 +434,7 @@ def main(
                         "message": (
                             f"Dry run: would install kernel headers and AmneziaWG from the official Amnezia PPA, "
                             f"deploy awgctl {VERSION}, initialize awg0 on {args.endpoint}:{args.listen_port}, "
-                            f"and create {args.first_client}; external interface: {external}"
+                            f"and create {args.first_client}; external interface: {external}; DNS: {dns}"
                         ),
                     },
                     as_json=args.json,
@@ -281,14 +448,15 @@ def main(
                 raise InstallerError("existing awg0 state detected; use adopt or upgrade, not fresh install")
             _install_amneziawg_packages()
             external = external or _detect_external_interface()
-            _deploy_source_release(root, repo_root, health=False)
+            _configure_host_for_command(args, root=root, settings=settings)
+            _deploy_source_release(root, repo_root, health=False, settings=settings)
             command = [
-                str(root / "bin/awgctl"), "_initialize-fresh",
+                str(root / "libexec/awgctl-internal"), "_initialize-fresh",
                 "--endpoint", args.endpoint,
                 "--subnet", args.subnet,
                 "--listen-port", str(args.listen_port),
                 "--external-interface", external,
-                "--dns", args.dns,
+                "--dns", dns,
                 "--mtu", str(args.mtu),
                 "--keepalive", str(args.keepalive),
                 "--first-client", args.first_client,
@@ -349,10 +517,11 @@ def main(
                     raise InstallerError(f"working-host adoption requires command: {command_name}")
             external = external or _detect_external_interface()
             backup = _adoption_backup(root, server, client)
-            _deploy_source_release(root, repo_root, health=False)
+            _configure_host_for_command(args, root=root, settings=settings)
+            _deploy_source_release(root, repo_root, health=False, settings=settings)
             adopted = _run(
                 [
-                    str(root / "bin/awgctl"), "_migrate-existing",
+                    str(root / "libexec/awgctl-internal"), "_migrate-existing",
                     "--server-config", str(server),
                     "--client-config", str(client),
                     "--client-name", args.client_name,
@@ -363,6 +532,7 @@ def main(
             )
             if _health_check(root / "bin/awgctl") != 0:
                 raise InstallerError("adoption completed but awgctl health failed")
+            _apply_requested_runtime_settings(args, root=root, settings=settings)
             message = adopted.stdout.decode("utf-8", "replace").strip()
             _emit(
                 output,
@@ -392,7 +562,11 @@ def main(
                 return 0
             if root == DEFAULT_ROOT and os.geteuid() != 0:
                 raise InstallerError("run installation with sudo")
-            _deploy_source_release(root, repo_root, health=True)
+            if not args.yes:
+                raise InstallerError("upgrade is mutating; rerun with --yes after reviewing --dry-run")
+            _configure_host_for_command(args, root=root, settings=settings)
+            _deploy_source_release(root, repo_root, health=True, settings=settings)
+            _apply_requested_runtime_settings(args, root=root, settings=settings)
             _emit(
                 output,
                 {
@@ -405,6 +579,8 @@ def main(
             )
             return 0
         raise InstallerError(f"{args.command} workflow is not implemented yet")
-    except (InstallerError, PlatformError) as exc:
+    except (
+        HostConfigurationError, InstallerError, PlatformError, SettingsError, WorkerError,
+    ) as exc:
         print(f"install.py: {exc}", file=sys.stderr)
         return 1

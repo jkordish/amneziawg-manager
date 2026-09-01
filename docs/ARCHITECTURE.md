@@ -66,3 +66,27 @@ Non-secret events are logged with syslog/journald tag `awgctl`.
 
 No private key, PSK, complete profile, or QR content is printed or logged by a
 normal command.
+
+## Privilege separation
+
+Root remains the only identity that can read VPN secrets, write `/opt`, mutate
+network state, or run the native `awg-quick` service. The public entrypoint is
+`/usr/local/sbin/awgctl`; internal initialization, migration, and lifecycle
+helpers are accepted through `/opt/amneziawg/libexec/awgctl-internal`.
+
+The locked `awgctl` account has a `nologin` shell, no password, no supplemental
+groups, and a `0700` home under `/var/lib`. It is only a staging worker. Source
+builds receive a minimal `src/` and `tools/` copy, run in a transient systemd
+unit with no capabilities or network, and cannot access VPN secret paths. Root
+accepts only a regular single-link output with the expected UID, mode, and
+bounded size.
+
+Operators belong to the separate `awgctl-admin` group. The default sudoers file
+allows only `/usr/local/sbin/awgctl` as root with `NOSETENV`; it does not grant a
+shell, the internal entrypoint, package tools, or generic systemctl/nft access.
+Custom policy is recorded in `config/installation.json` and checked by health.
+
+The native service remains root-run. Its conservative drop-in preloads the
+module before sandboxing, protects host filesystems/home/devices/kernel
+interfaces, and retains the address families needed by awg-quick. The installer
+validates and rolls back manager-owned host files on failure.

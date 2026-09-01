@@ -31,6 +31,7 @@ def main() -> int:
         "tag": f"v{args.version}",
         "channel": "beta" if "-" in args.version else "stable",
         "platform": "ubuntu-24.04-amd64",
+        "installation_schema_version": 1,
         "artifact": {
             "name": "awgctl.pyz",
             "sha256": hashlib.sha256(data).hexdigest(),

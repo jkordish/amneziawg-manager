@@ -26,6 +26,11 @@ server.json
 *.conf
 *.png
 *.qr
+local-install-settings.json
+install-settings.local.json
+.env
+.env.*
+!.env.example
 
 # Dedicated release private keys must never be committed.
 release-signing-key

@@ -24,6 +24,7 @@ class ReleaseVerificationTests(unittest.TestCase):
             "tag": "v0.1.0-beta.1",
             "channel": "beta",
             "platform": "ubuntu-24.04-amd64",
+            "installation_schema_version": 1,
             "artifact": {
                 "name": "awgctl.pyz",
                 "sha256": hashlib.sha256(artifact).hexdigest(),
@@ -35,6 +36,7 @@ class ReleaseVerificationTests(unittest.TestCase):
     def test_manifest_and_artifact_must_match_platform_version_size_and_hash(self):
         artifact = b"zipapp"
         manifest = parse_manifest(self.manifest(artifact), expected_platform="ubuntu-24.04-amd64")
+        self.assertEqual(manifest["installation_schema_version"], 1)
         verify_artifact(manifest, artifact)
         with self.assertRaisesRegex(ReleaseError, "hash"):
             verify_artifact(manifest, b"zippap")

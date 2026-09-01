@@ -8,12 +8,14 @@ import base64
 import contextlib
 import datetime as dt
 import fcntl
+import grp
 import hashlib
 import ipaddress
 import io
 import json
 import os
 import pathlib
+import pwd
 import re
 import secrets
 import shutil
@@ -27,17 +29,32 @@ import urllib.request
 from typing import Any, Iterable, Iterator, Sequence
 
 from .backups import BackupError, create_manifest as create_backup_manifest, verify_backup
-from .contracts import ContractError, health_envelope, json_envelope, normalize_client_metadata
+from .contracts import (
+    ContractError,
+    health_envelope,
+    json_envelope,
+    mark_profile_regenerated,
+    normalize_client_metadata,
+)
 from .diagnostics import DiagnosticsError, create_bundle as create_diagnostic_bundle, redact_awg_config
 from .releases import ReleaseError, discover_release_tag, fetch_verified_release, version_key
 from .selftest import SelfTestError, run_namespace_selftest
 from .version import VERSION
 from awginstall.installer import InstallerError, upgrade_product
 from awginstall.platform import PlatformError, read_os_release, validate_platform
+from awginstall.identity import render_sudoers
+from awginstall.sandbox import render_module_load, render_service_hardening
+from awginstall.settings import (
+    SettingsError,
+    dns_policy_name,
+    resolve_installation_settings,
+    validate_dns_setting,
+)
 
 
 ROOT = pathlib.Path("/opt/amneziawg")
 CONFIG_FILE = ROOT / "config/server.json"
+INSTALLATION_CONFIG = ROOT / "config/installation.json"
 SERVER_PRIVATE = ROOT / "keys/server/private"
 SERVER_PUBLIC = ROOT / "keys/server/public"
 CLIENT_KEYS = ROOT / "keys/clients"
@@ -50,6 +67,13 @@ BACKUPS = ROOT / "backups"
 DIAGNOSTICS = ROOT / "diagnostics"
 RUNTIME_CONFIG = pathlib.Path("/etc/amnezia/amneziawg/awg0.conf")
 LOCK_FILE = pathlib.Path("/run/lock/awgctl.lock")
+PUBLIC_ENTRYPOINT = pathlib.Path("/usr/local/sbin/awgctl")
+INTERNAL_ENTRYPOINT = ROOT / "libexec/awgctl-internal"
+SUDOERS_CONFIG = pathlib.Path("/etc/sudoers.d/amneziawg-manager")
+SERVICE_HARDENING = pathlib.Path(
+    "/etc/systemd/system/awg-quick@awg0.service.d/20-awgctl-hardening.conf"
+)
+MODULE_LOAD_CONFIG = pathlib.Path("/etc/modules-load.d/amneziawg-manager.conf")
 SYSCTL_CONFIG = pathlib.Path("/etc/sysctl.d/90-amneziawg-forward.conf")
 SERVICE_TEMPLATE = "awg-quick@{interface}.service"
 OBFUSCATION_FIELDS = ("Jc", "Jmin", "Jmax", "S1", "S2", "H1", "H2", "H3", "H4")
@@ -269,6 +293,14 @@ def validate_dns(values: Sequence[str]) -> list[str]:
     return result
 
 
+def parse_dns_value(value: str) -> list[str]:
+    """Resolve a named DNS policy or validate a comma-separated IPv4 list."""
+    try:
+        return list(validate_dns_setting(value))
+    except SettingsError as exc:
+        raise AwgctlError(str(exc)) from exc
+
+
 def validate_server_config(config: dict[str, Any]) -> dict[str, Any]:
     required = {
         "schema_version",
@@ -392,7 +424,7 @@ def build_fresh_server_config(
         "endpoint": validate_endpoint(endpoint),
         "listen_port": listen_port,
         "external_interface": external_interface,
-        "dns": validate_dns(dns.split(",")),
+        "dns": parse_dns_value(dns),
         "mtu": mtu,
         "keepalive": keepalive,
         "use_psk": True,
@@ -493,8 +525,8 @@ def render_server_config(
     ]
     lines.extend(f"{field} = {config['obfuscation'][field]}" for field in OBFUSCATION_FIELDS)
     lines.extend([
-        "PostUp = /opt/amneziawg/bin/awgctl _firewall up",
-        "PostDown = /opt/amneziawg/bin/awgctl _firewall down",
+        "PostUp = /opt/amneziawg/libexec/awgctl-internal _firewall up",
+        "PostDown = /opt/amneziawg/libexec/awgctl-internal _firewall down",
     ])
     for client in clients:
         validate_client_name(client["name"])
@@ -652,6 +684,15 @@ def semantic_signature(text: str) -> dict[str, Any]:
     return {"interface": tuple(sorted(interface.items())), "peers": peers}
 
 
+def legacy_lifecycle_hook_drift(expected: bytes, actual: bytes) -> bool:
+    """Recognize only the beta.2 public-hook to internal-hook migration."""
+    legacy = expected.replace(
+        b"/opt/amneziawg/libexec/awgctl-internal _firewall",
+        b"/opt/amneziawg/bin/awgctl _firewall",
+    )
+    return legacy != expected and actual == legacy
+
+
 def ensure_no_drift() -> None:
     expected = render_current_server().encode("utf-8")
     try:
@@ -659,7 +700,7 @@ def ensure_no_drift() -> None:
         runtime = RUNTIME_CONFIG.read_bytes()
     except OSError as exc:
         raise AwgctlError("cannot read generated/runtime server configuration") from exc
-    if generated != expected:
+    if generated != expected and not legacy_lifecycle_hook_drift(expected, generated):
         raise AwgctlError(
             f"managed-state drift: generated config is {sha256_bytes(generated)[:12]}, expected {sha256_bytes(expected)[:12]}"
         )
@@ -906,7 +947,7 @@ def write_client_state(
     key_dir.mkdir(mode=0o700)
     now = iso_now()
     metadata = normalize_client_metadata({
-        "schema_version": 2,
+        "schema_version": 3,
         "name": name,
         "status": "active",
         "management": "managed",
@@ -919,6 +960,11 @@ def write_client_state(
         "owner": owner,
         "device": device,
         "expires": expires,
+        "profile_revision": 1,
+        "profile_generated_at": now,
+        "profile_change_reason": "imported" if imported_from else "created",
+        "distribution_status": "pending",
+        "distributed_at": None,
     })
     if imported_from:
         metadata["imported_from"] = imported_from
@@ -1438,6 +1484,118 @@ def permission_problem(path: pathlib.Path, expected_mode: int, *, secret: bool =
     return None
 
 
+def management_security_checks() -> list[tuple[str, str, str]]:
+    """Validate the installed privilege boundary without exposing identity secrets."""
+    if not INSTALLATION_CONFIG.is_file():
+        return [("FAIL", "manager privilege policy", f"missing {INSTALLATION_CONFIG}")]
+    checks: list[tuple[str, str, str]] = []
+
+    def add(level: str, name: str, detail: str) -> None:
+        checks.append((level, name, detail))
+
+    problem = permission_problem(INSTALLATION_CONFIG, 0o600)
+    add("FAIL" if problem else "PASS", "installation settings permissions", problem or "root:root 0600")
+    try:
+        settings = resolve_installation_settings(
+            settings_path=INSTALLATION_CONFIG,
+            sudo_user=None,
+        )
+    except SettingsError as exc:
+        add("FAIL", "manager privilege policy", str(exc))
+        return checks
+
+    try:
+        user = pwd.getpwnam(settings.staging_user)
+        staging_group = grp.getgrnam(settings.staging_group)
+    except KeyError as exc:
+        add("FAIL", "staging identity", f"missing account or group: {exc}")
+    else:
+        supplemental = sorted(
+            record.gr_name
+            for record in grp.getgrall()
+            if settings.staging_user in record.gr_mem and record.gr_gid != user.pw_gid
+        )
+        identity_ok = (
+            user.pw_gid == staging_group.gr_gid
+            and user.pw_dir == str(settings.staging_root)
+            and user.pw_shell == "/usr/sbin/nologin"
+            and not supplemental
+        )
+        password = run(["passwd", "--status", settings.staging_user], check=False)
+        fields = password.stdout.decode("utf-8", "replace").split()
+        locked = password.returncode == 0 and len(fields) >= 2 and fields[1] in {"L", "LK"}
+        identity_ok = identity_ok and locked
+        add(
+            "PASS" if identity_ok else "FAIL",
+            "staging identity",
+            "locked nologin account with no supplemental groups"
+            if identity_ok else "identity differs from installed policy",
+        )
+        try:
+            root_metadata = settings.staging_root.stat()
+        except OSError:
+            root_ok = False
+        else:
+            root_ok = (
+                stat.S_ISDIR(root_metadata.st_mode)
+                and root_metadata.st_uid == user.pw_uid
+                and root_metadata.st_gid == user.pw_gid
+                and stat.S_IMODE(root_metadata.st_mode) == 0o700
+            )
+        add("PASS" if root_ok else "FAIL", "staging root", f"{settings.staging_root} owner/mode policy")
+
+    try:
+        operator_group = grp.getgrnam(settings.operator_group)
+    except KeyError:
+        add("FAIL", "operator group", f"missing {settings.operator_group}")
+    else:
+        missing_operators = sorted(set(settings.operators) - set(operator_group.gr_mem))
+        add(
+            "FAIL" if missing_operators else "PASS",
+            "operator group",
+            f"missing members: {', '.join(missing_operators)}" if missing_operators else settings.operator_group,
+        )
+
+    expected_sudoers = render_sudoers(settings.operator_group, settings.sudo_policy)
+    actual_sudoers = SUDOERS_CONFIG.read_text(encoding="utf-8") if SUDOERS_CONFIG.is_file() else ""
+    sudo_problem = permission_problem(SUDOERS_CONFIG, 0o440) if expected_sudoers else None
+    sudo_ok = actual_sudoers == expected_sudoers and not sudo_problem
+    add("PASS" if sudo_ok else "FAIL", "scoped sudo policy", "matches installed policy" if sudo_ok else (sudo_problem or "content drift"))
+
+    entrypoint_problems: list[str] = []
+    for path, expected_link in (
+        (PUBLIC_ENTRYPOINT, str(ROOT / "bin/awgctl")),
+        (INTERNAL_ENTRYPOINT, "../bin/awgctl"),
+    ):
+        if not path.is_symlink() or os.readlink(path) != expected_link:
+            entrypoint_problems.append(str(path))
+            continue
+        target = path.resolve()
+        metadata = target.stat() if target.is_file() else None
+        if metadata is None or metadata.st_uid != 0 or metadata.st_gid != 0 or stat.S_IMODE(metadata.st_mode) != 0o755:
+            entrypoint_problems.append(str(path))
+    add(
+        "FAIL" if entrypoint_problems else "PASS",
+        "manager entrypoints",
+        ", ".join(entrypoint_problems) if entrypoint_problems else "public and internal boundaries installed",
+    )
+
+    expected_hardening = render_service_hardening(settings.systemd_hardening)
+    actual_hardening = SERVICE_HARDENING.read_text(encoding="utf-8") if SERVICE_HARDENING.is_file() else ""
+    add(
+        "PASS" if actual_hardening == expected_hardening else "FAIL",
+        "systemd hardening policy",
+        "matches installed policy" if actual_hardening == expected_hardening else "content drift",
+    )
+    actual_module_load = MODULE_LOAD_CONFIG.read_text(encoding="utf-8") if MODULE_LOAD_CONFIG.is_file() else ""
+    add(
+        "PASS" if actual_module_load == render_module_load() else "FAIL",
+        "module preload policy",
+        "amneziawg" if actual_module_load == render_module_load() else "content drift",
+    )
+    return checks
+
+
 def cmd_health(args: argparse.Namespace) -> int:
     config = load_config()
     checks: list[tuple[str, str, str]] = []
@@ -1468,6 +1626,7 @@ def cmd_health(args: argparse.Namespace) -> int:
     add("PASS" if forwarding else "FAIL", "IPv4 forwarding", "enabled" if forwarding else "disabled")
     add("PASS" if nft_table_active("amneziawg_nat") else "FAIL", "VPN NAT", "table ip amneziawg_nat")
     add("PASS" if nft_table_active("amneziawg_forward") else "FAIL", "VPN isolation", "table ip amneziawg_forward")
+    checks.extend(management_security_checks())
     if docker_user_chain_exists():
         docker_markers = tagged_docker_handles()
         add("PASS" if len(docker_markers) == 3 else "FAIL", "Docker forwarding bridge", f"{len(docker_markers)} tagged rules")
@@ -1487,7 +1646,12 @@ def cmd_health(args: argparse.Namespace) -> int:
         expected = render_current_server().encode()
         generated = GENERATED_CONFIG.read_bytes()
         runtime = RUNTIME_CONFIG.read_bytes()
-        add("PASS" if generated == expected else "FAIL", "managed state", "generated config matches state" if generated == expected else "generated config drift")
+        if generated == expected:
+            add("PASS", "managed state", "generated config matches state")
+        elif legacy_lifecycle_hook_drift(expected, generated):
+            add("WARN", "managed state", "legacy lifecycle hooks will be reconciled by the next managed commit")
+        else:
+            add("FAIL", "managed state", "generated config drift")
         add("PASS" if runtime == generated else "FAIL", "runtime drift", "runtime config matches generated" if runtime == generated else "manual runtime drift detected")
     except (AwgctlError, OSError) as exc:
         add("FAIL", "configuration consistency", str(exc))
@@ -1513,6 +1677,17 @@ def cmd_health(args: argparse.Namespace) -> int:
         if external_count:
             detail += f"; {external_count} external peer(s) have no locally managed profile"
         add("FAIL" if profile_drift else "PASS", "client profile consistency", detail)
+        pending_profiles = [
+            client["name"]
+            for client in clients
+            if client.get("management", "managed") == "managed"
+            and client.get("distribution_status") in {"pending", "unknown"}
+        ]
+        add(
+            "WARN" if pending_profiles else "PASS",
+            "client profile delivery",
+            f"pending or unknown: {', '.join(pending_profiles)}" if pending_profiles else "all active profile revisions marked distributed",
+        )
     except (AwgctlError, OSError) as exc:
         add("FAIL", "client state", str(exc))
 
@@ -1527,6 +1702,12 @@ def cmd_health(args: argparse.Namespace) -> int:
         "WARN",
         "Lightsail static IP",
         "No stable Lightsail public IP was verified. A stop/start can change the instance public IPv4 and break the VPN endpoint DNS record.",
+    )
+    configured_dns_policy = dns_policy_name(config["dns"])
+    add(
+        "PASS" if configured_dns_policy != "custom" else "WARN",
+        "client DNS policy",
+        f"{configured_dns_policy}: {','.join(config['dns'])}",
     )
 
     disk = os.statvfs("/")
@@ -1596,6 +1777,8 @@ def cmd_client_list(args: argparse.Namespace) -> int:
                 "owner": client.get("owner"),
                 "device": client.get("device"),
                 "expires": client.get("expires"),
+                "profile_revision": client.get("profile_revision"),
+                "distribution_status": client.get("distribution_status", "unknown"),
                 "last_handshake": format_age(handshakes.get(client["public_key"], 0)),
             }
         )
@@ -1633,6 +1816,11 @@ def cmd_client_show(args: argparse.Namespace) -> int:
         "owner": client.get("owner"),
         "device": client.get("device"),
         "expires": client.get("expires"),
+        "profile_revision": client.get("profile_revision"),
+        "profile_generated_at": client.get("profile_generated_at"),
+        "profile_change_reason": client.get("profile_change_reason"),
+        "distribution_status": client.get("distribution_status", "unknown"),
+        "distributed_at": client.get("distributed_at"),
         "last_handshake": format_age(handshake),
         "config": str(CLIENTS / name / (name + ".conf")) if client.get("management", "managed") == "managed" else None,
         "qr": str(CLIENTS / name / (name + ".png")) if client.get("management", "managed") == "managed" else None,
@@ -1646,6 +1834,8 @@ def cmd_client_show(args: argparse.Namespace) -> int:
     print(f"  public key fingerprint: {client['public_key_fingerprint']}")
     print(f"  created:                {client['created_at']}")
     print(f"  last handshake:         {format_age(handshake)}")
+    print(f"  profile revision:       {client.get('profile_revision', 'unknown')}")
+    print(f"  distribution:           {client.get('distribution_status', 'unknown')}")
     if client.get("management", "managed") == "managed":
         print(f"  config:                 {CLIENTS / name / (name + '.conf')}")
         print(f"  QR:                     {CLIENTS / name / (name + '.png')}")
@@ -1668,13 +1858,19 @@ def cmd_client_add(args: argparse.Namespace) -> int:
             ipaddress.ip_network(config["subnet"]), ipaddress.ip_interface(config["server_address"]), allocated
         )
         try:
+            proposed_at = iso_now()
             proposed_metadata = normalize_client_metadata(
                 {
-                    "schema_version": 2,
+                    "schema_version": 3,
                     "management": "managed",
                     "owner": getattr(args, "owner", None),
                     "device": getattr(args, "device", None),
                     "expires": getattr(args, "expires", None),
+                    "profile_revision": 1,
+                    "profile_generated_at": proposed_at,
+                    "profile_change_reason": "created",
+                    "distribution_status": "pending",
+                    "distributed_at": None,
                 }
             )
         except ContractError as exc:
@@ -1807,13 +2003,25 @@ def cmd_client_import(args: argparse.Namespace) -> int:
         if same_public and same_public["name"] != name:
             raise AwgctlError(f"matching external peer is named {same_public['name']}; import using that name")
         try:
+            proposed_at = iso_now()
             proposed = normalize_client_metadata(
                 {
-                    "schema_version": 2,
+                    "schema_version": 3,
                     "management": "managed",
                     "owner": getattr(args, "owner", None) if not same_name else same_name.get("owner"),
                     "device": getattr(args, "device", None) if not same_name else same_name.get("device"),
                     "expires": getattr(args, "expires", None) if not same_name else same_name.get("expires"),
+                    "profile_revision": same_name.get("profile_revision", 1) if same_name else 1,
+                    "profile_generated_at": (
+                        same_name.get("profile_generated_at", proposed_at) if same_name else proposed_at
+                    ),
+                    "profile_change_reason": (
+                        same_name.get("profile_change_reason", "imported") if same_name else "imported"
+                    ),
+                    "distribution_status": (
+                        same_name.get("distribution_status", "pending") if same_name else "pending"
+                    ),
+                    "distributed_at": same_name.get("distributed_at") if same_name else None,
                 }
             )
         except ContractError as exc:
@@ -1895,8 +2103,11 @@ def cmd_client_import(args: argparse.Namespace) -> int:
 def cmd_client_edit(args: argparse.Namespace) -> int:
     name = validate_client_name(args.client_name)
     supplied = {field for field in ("owner", "device", "expires") if hasattr(args, field)}
+    mark_distributed = bool(getattr(args, "mark_distributed", False))
+    if mark_distributed:
+        supplied.update({"distribution_status", "distributed_at"})
     if not supplied:
-        raise AwgctlError("client edit requires --owner, --device, or --expires")
+        raise AwgctlError("client edit requires --owner, --device, --expires, or --mark-distributed")
     with mutation_lock():
         ensure_no_drift()
         clients = {client["name"]: client for client in load_clients()}
@@ -1904,11 +2115,15 @@ def cmd_client_edit(args: argparse.Namespace) -> int:
             raise AwgctlError(f"unknown active client: {name}")
         old = clients[name]
         proposed = dict(old)
-        for field in supplied:
+        for field in supplied - {"distribution_status", "distributed_at"}:
             value = getattr(args, field)
             if field == "expires" and isinstance(value, str) and value.lower() == "none":
                 value = None
             proposed[field] = value
+        if mark_distributed:
+            distributed_at = iso_now()
+            proposed["distribution_status"] = "distributed"
+            proposed["distributed_at"] = distributed_at
         try:
             proposed = normalize_client_metadata(proposed)
         except ContractError as exc:
@@ -2150,14 +2365,7 @@ def cmd_client_export(args: argparse.Namespace) -> int:
             print(f"Protected profile: {profile}")
             print("Use --output PATH to copy it, or explicit --stdout only when secret output is intended.")
         return 0
-    output = args.output.expanduser()
-    if output.exists():
-        raise AwgctlError(f"refusing to overwrite existing output: {output}")
-    if not output.parent.exists():
-        raise AwgctlError(f"output directory does not exist: {output.parent}")
-    atomic_write(output, profile.read_bytes(), 0o600)
-    if os.geteuid() == 0:
-        os.chown(output, 0, 0)
+    output = write_operator_secret(args.output, profile.read_bytes())
     audit(f"client profile exported: {name}")
     data = {"name": name, "profile": str(output), "copied": True, "mode": "0600"}
     if getattr(args, "json", False):
@@ -2166,6 +2374,73 @@ def cmd_client_export(args: argparse.Namespace) -> int:
         print(f"Exported client profile: {output}")
         print("The file contains credentials and is mode 0600.")
     return 0
+
+
+def write_operator_secret(output: pathlib.Path, data: bytes) -> pathlib.Path:
+    """Atomically create a 0600 delivery copy owned by the sudo invoker."""
+    requested = output.expanduser()
+    if not requested.is_absolute() or requested.name in {"", ".", ".."}:
+        raise AwgctlError("secret output path must be an absolute file path")
+    try:
+        parent = requested.parent.resolve(strict=True)
+        parent_metadata = parent.stat()
+    except OSError as exc:
+        raise AwgctlError(f"output directory does not exist: {requested.parent}") from exc
+    if not stat.S_ISDIR(parent_metadata.st_mode):
+        raise AwgctlError("secret output parent must be a directory")
+    invoker = os.environ.get("SUDO_USER")
+    try:
+        recipient = pwd.getpwnam(invoker) if invoker else pwd.getpwuid(os.geteuid())
+    except KeyError as exc:
+        raise AwgctlError("could not resolve the output file owner") from exc
+    if parent_metadata.st_uid != recipient.pw_uid:
+        raise AwgctlError("secret output directory must be owned by the invoking operator")
+    if stat.S_IMODE(parent_metadata.st_mode) & 0o022:
+        raise AwgctlError("secret output directory must not be group/world writable")
+
+    directory_fd = os.open(parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    temporary_name = f".{requested.name}.{secrets.token_hex(8)}"
+    descriptor = -1
+    try:
+        try:
+            os.stat(requested.name, dir_fd=directory_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            pass
+        else:
+            raise AwgctlError(f"refusing to overwrite existing output: {parent / requested.name}")
+        descriptor = os.open(
+            temporary_name,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+            0o600,
+            dir_fd=directory_fd,
+        )
+        os.fchmod(descriptor, 0o600)
+        os.fchown(descriptor, recipient.pw_uid, recipient.pw_gid)
+        with os.fdopen(descriptor, "wb") as handle:
+            descriptor = -1
+            handle.write(data)
+            handle.flush()
+            os.fsync(handle.fileno())
+        current_parent = os.fstat(directory_fd)
+        if (
+            current_parent.st_uid != recipient.pw_uid
+            or stat.S_IMODE(current_parent.st_mode) & 0o022
+        ):
+            raise AwgctlError("secret output directory changed during export")
+        os.replace(
+            temporary_name,
+            requested.name,
+            src_dir_fd=directory_fd,
+            dst_dir_fd=directory_fd,
+        )
+        os.fsync(directory_fd)
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(temporary_name, dir_fd=directory_fd)
+        os.close(directory_fd)
+    return parent / requested.name
 
 
 def cmd_client_qr(args: argparse.Namespace) -> int:
@@ -2177,16 +2452,27 @@ def cmd_client_qr(args: argparse.Namespace) -> int:
             raise AwgctlError("external client has no local profile; use client import first")
         raise AwgctlError(f"unknown active client: {name}")
     with mutation_lock():
-        output = CLIENTS / name / f"{name}.png"
+        protected_output = CLIENTS / name / f"{name}.png"
+        requested_output = getattr(args, "output", None)
         if getattr(args, "dry_run", False):
-            data = {"dry_run": True, "name": name, "output": str(output)}
+            data = {
+                "dry_run": True,
+                "name": name,
+                "output": str(requested_output or protected_output),
+                "protected_qr": str(protected_output),
+            }
             if getattr(args, "json", False):
                 print(json.dumps(json_envelope("client qr", data=data), indent=2, sort_keys=True))
             else:
                 print(f"Dry run: regenerate protected QR image at {output}")
                 print("No state was changed.")
             return 0
-        generate_qr(profile_path.read_text(encoding="utf-8"), output)
+        generate_qr(profile_path.read_text(encoding="utf-8"), protected_output)
+        output = (
+            write_operator_secret(requested_output, protected_output.read_bytes())
+            if requested_output is not None
+            else protected_output
+        )
         audit(f"client QR regenerated: {name}")
         data = {"name": name, "qr": str(output), "displayed": False}
         if getattr(args, "json", False):
@@ -2212,8 +2498,11 @@ def snapshot_client_artifacts(clients: Sequence[dict[str, Any]]) -> dict[pathlib
         if client.get("management", "managed") != "managed":
             continue
         directory = CLIENTS / client["name"]
-        for suffix in (".conf", ".png"):
-            path = directory / f"{client['name']}{suffix}"
+        for path in (
+            directory / f"{client['name']}.conf",
+            directory / f"{client['name']}.png",
+            directory / "metadata.json",
+        ):
             snapshot[path] = path.read_bytes()
     return snapshot
 
@@ -2237,7 +2526,7 @@ def cmd_config_set(args: argparse.Namespace) -> int:
             runtime_action = None
         elif args.key == "dns":
             old_display = ",".join(config["dns"])
-            new_config["dns"] = validate_dns(args.value.split(","))
+            new_config["dns"] = parse_dns_value(args.value)
             new_display = ",".join(new_config["dns"])
             runtime_action = None
         elif args.key == "mtu":
@@ -2302,6 +2591,16 @@ def cmd_config_set(args: argparse.Namespace) -> int:
             for client in clients
             if client.get("management", "managed") == "managed"
         }
+        profile_timestamp = iso_now()
+        new_metadata = {
+            client["name"]: mark_profile_regenerated(
+                client,
+                reason=f"config:{args.key}",
+                timestamp=profile_timestamp,
+            )
+            for client in clients
+            if client.get("management", "managed") == "managed"
+        }
         new_server = render_server_config(new_config, server_private_key(), clients)
         new_nft = render_nftables_config(new_config)
         validate_nftables_text(new_nft)
@@ -2314,6 +2613,7 @@ def cmd_config_set(args: argparse.Namespace) -> int:
                 profile = new_profiles[client["name"]]
                 atomic_write(directory / f"{client['name']}.conf", profile, 0o600)
                 generate_qr(profile, directory / f"{client['name']}.png")
+                atomic_json(directory / "metadata.json", new_metadata[client["name"]], 0o600)
             atomic_write(GENERATED_NFT, new_nft, 0o600)
             active = commit_server_config(new_server, runtime_action=runtime_action)
         except Exception:
@@ -2684,6 +2984,8 @@ def cmd_self_test(args: argparse.Namespace) -> int:
 
 def cmd_firewall(args: argparse.Namespace) -> int:
     require_root()
+    if os.environ.get("SUDO_USER"):
+        raise AwgctlError("internal firewall lifecycle commands cannot be invoked through sudo")
     if args.firewall_action == "up":
         apply_firewall()
     else:
@@ -2884,11 +3186,35 @@ def cmd_migrate_existing(args: argparse.Namespace) -> int:
     return 0
 
 
-def build_parser() -> argparse.ArgumentParser:
+def build_parser(*, entrypoint: str = "public") -> argparse.ArgumentParser:
+    if entrypoint not in {"public", "internal"}:
+        raise ValueError("entrypoint must be public or internal")
     parser = argparse.ArgumentParser(prog="awgctl", description="Manage the host's AmneziaWG installation")
     parser.add_argument("--version", action="version", version=f"awgctl {VERSION}")
     parser.add_argument("--json", action="store_true", help="emit a stable machine-readable response")
     subcommands = parser.add_subparsers(dest="command", required=True)
+
+    if entrypoint == "internal":
+        firewall = subcommands.add_parser("_firewall", help=argparse.SUPPRESS)
+        firewall.add_argument("firewall_action", choices=("up", "down"))
+        migrate = subcommands.add_parser("_migrate-existing", help=argparse.SUPPRESS)
+        migrate.add_argument("--server-config", type=pathlib.Path, required=True)
+        migrate.add_argument("--client-config", type=pathlib.Path, required=True)
+        migrate.add_argument("--interface", default="awg0")
+        migrate.add_argument("--external-interface", default="ens5")
+        migrate.add_argument("--client-name", default="kat")
+        fresh = subcommands.add_parser("_initialize-fresh", help=argparse.SUPPRESS)
+        fresh.add_argument("--endpoint", required=True)
+        fresh.add_argument("--subnet", default="10.77.42.0/24")
+        fresh.add_argument("--listen-port", type=int, default=55323)
+        fresh.add_argument("--external-interface", required=True)
+        fresh.add_argument("--dns", default="1.1.1.2,1.0.0.2")
+        fresh.add_argument("--mtu", type=int, default=1280)
+        fresh.add_argument("--keepalive", type=int, default=25)
+        fresh.add_argument("--first-client", default="admin-phone")
+        fresh.add_argument("--owner")
+        fresh.add_argument("--device")
+        return parser
 
     def output_flag(command: argparse.ArgumentParser) -> None:
         command.add_argument("--json", action="store_true", default=argparse.SUPPRESS)
@@ -2947,6 +3273,8 @@ def build_parser() -> argparse.ArgumentParser:
             command.add_argument("--owner")
             command.add_argument("--device")
             command.add_argument("--expires")
+        if name == "qr":
+            command.add_argument("--output", type=pathlib.Path)
     export = client_commands.add_parser("export")
     export.add_argument("client_name", metavar="NAME")
     output_flag(export)
@@ -2966,28 +3294,12 @@ def build_parser() -> argparse.ArgumentParser:
     client_edit.add_argument("--owner", default=argparse.SUPPRESS)
     client_edit.add_argument("--device", default=argparse.SUPPRESS)
     client_edit.add_argument("--expires", default=argparse.SUPPRESS)
+    client_edit.add_argument("--mark-distributed", action="store_true", default=argparse.SUPPRESS)
     output_flag(client_edit)
     dry_run_flag(client_edit)
 
     firewall = subcommands.add_parser("_firewall", help=argparse.SUPPRESS)
     firewall.add_argument("firewall_action", choices=("up", "down"))
-    migrate = subcommands.add_parser("_migrate-existing", help=argparse.SUPPRESS)
-    migrate.add_argument("--server-config", type=pathlib.Path, required=True)
-    migrate.add_argument("--client-config", type=pathlib.Path, required=True)
-    migrate.add_argument("--interface", default="awg0")
-    migrate.add_argument("--external-interface", default="ens5")
-    migrate.add_argument("--client-name", default="kat")
-    fresh = subcommands.add_parser("_initialize-fresh", help=argparse.SUPPRESS)
-    fresh.add_argument("--endpoint", required=True)
-    fresh.add_argument("--subnet", default="10.77.42.0/24")
-    fresh.add_argument("--listen-port", type=int, default=55323)
-    fresh.add_argument("--external-interface", required=True)
-    fresh.add_argument("--dns", default="1.1.1.1,1.0.0.1")
-    fresh.add_argument("--mtu", type=int, default=1280)
-    fresh.add_argument("--keepalive", type=int, default=25)
-    fresh.add_argument("--first-client", default="admin-phone")
-    fresh.add_argument("--owner")
-    fresh.add_argument("--device")
     return parser
 
 
@@ -3043,8 +3355,8 @@ def dispatch(args: argparse.Namespace) -> int:
     raise AwgctlError("unknown command")
 
 
-def main(argv: Sequence[str] | None = None) -> int:
-    parser = build_parser()
+def main(argv: Sequence[str] | None = None, *, entrypoint: str = "public") -> int:
+    parser = build_parser(entrypoint=entrypoint)
     args = parser.parse_args(argv)
     try:
         return dispatch(args)

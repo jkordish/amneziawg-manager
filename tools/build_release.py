@@ -32,7 +32,11 @@ def build(output: pathlib.Path) -> None:
             ignore=shutil.ignore_patterns("__pycache__", "*.pyc"),
         )
         (staging / "__main__.py").write_text(
-            "from awgctl.core import main\nraise SystemExit(main())\n",
+            "import pathlib\n"
+            "import sys\n"
+            "from awgctl.core import main\n"
+            "entrypoint = 'internal' if pathlib.Path(sys.argv[0]).name == 'awgctl-internal' else 'public'\n"
+            "raise SystemExit(main(entrypoint=entrypoint))\n",
             encoding="utf-8",
         )
         temporary = output.with_name(f".{output.name}.{os.getpid()}")
@@ -40,7 +44,7 @@ def build(output: pathlib.Path) -> None:
         zipapp.create_archive(
             staging,
             target=temporary,
-            interpreter="/usr/bin/env python3",
+            interpreter="/usr/bin/python3",
             compressed=True,
         )
         os.chmod(temporary, 0o755)
