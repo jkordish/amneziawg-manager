@@ -358,7 +358,13 @@ class _StatefulTimerRunner:
                 argv, code, (self.unit_file_state + "\n").encode(), b""
             )
         if command[:2] == ("systemctl", "is-active"):
-            code = {"active": 0, "inactive": 3}[self.active_state]
+            code = (
+                0
+                if self.active_state == "active"
+                else 4
+                if self.unit_file_state == "not-found"
+                else 3
+            )
             return subprocess.CompletedProcess(
                 argv, code, (self.active_state + "\n").encode(), b""
             )
@@ -673,7 +679,13 @@ class HostConfigurationTests(unittest.TestCase):
                             argv, code, (unit_file_state + "\n").encode(), b""
                         )
                     if command[:2] == ("systemctl", "is-active"):
-                        code = 0 if active_state == "active" else 3
+                        code = (
+                            0
+                            if active_state == "active"
+                            else 4
+                            if unit_file_state == "not-found"
+                            else 3
+                        )
                         return subprocess.CompletedProcess(
                             argv, code, (active_state + "\n").encode(), b""
                         )
@@ -781,6 +793,64 @@ class HostConfigurationTests(unittest.TestCase):
 
             with self.subTest(label=label), self.assertRaisesRegex(
                 HostConfigurationError, expected
+            ):
+                _snapshot_expiry_timer_state(runner)
+
+    def test_expiry_timer_probe_accepts_exact_systemd_255_state_pairs(self):
+        from awginstall.host import ExpiryTimerState, _snapshot_expiry_timer_state
+
+        accepted = (
+            (
+                (0, b"enabled\n"),
+                (0, b"active\n"),
+                ExpiryTimerState("enabled", "active"),
+            ),
+            (
+                (0, b"enabled\n"),
+                (3, b"inactive\n"),
+                ExpiryTimerState("enabled", "inactive"),
+            ),
+            (
+                (0, b"enabled-runtime\n"),
+                (3, b"inactive\n"),
+                ExpiryTimerState("enabled-runtime", "inactive"),
+            ),
+            (
+                (1, b"disabled\n"),
+                (3, b"inactive\n"),
+                ExpiryTimerState("disabled", "inactive"),
+            ),
+            (
+                (4, b"not-found\n"),
+                (4, b"inactive\n"),
+                ExpiryTimerState("not-found", "inactive"),
+            ),
+        )
+        for enabled, active, expected in accepted:
+            def runner(argv):
+                code, stdout = enabled if argv[1] == "is-enabled" else active
+                return subprocess.CompletedProcess(argv, code, stdout, b"")
+
+            with self.subTest(enabled=enabled, active=active):
+                self.assertEqual(_snapshot_expiry_timer_state(runner), expected)
+
+    def test_expiry_timer_probe_rejects_cross_paired_or_malformed_states(self):
+        from awginstall.host import HostConfigurationError, _snapshot_expiry_timer_state
+
+        rejected = (
+            ((4, b"not-found\n"), (3, b"inactive\n")),
+            ((0, b"enabled\n"), (4, b"inactive\n")),
+            ((1, b"disabled\n"), (4, b"inactive\n")),
+            ((4, b"not-found\n"), (4, b"inactive \n")),
+            ((0, b"enabled\n"), (3, b"inactive\nextra\n")),
+        )
+        for enabled, active in rejected:
+            def runner(argv):
+                code, stdout = enabled if argv[1] == "is-enabled" else active
+                return subprocess.CompletedProcess(argv, code, stdout, b"")
+
+            with self.subTest(enabled=enabled, active=active), self.assertRaises(
+                HostConfigurationError
             ):
                 _snapshot_expiry_timer_state(runner)
 
