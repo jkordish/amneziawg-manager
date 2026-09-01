@@ -17,17 +17,20 @@ from awginstall.deploy import DeploymentError, active_release, install_release
 
 class VersionedDeploymentTests(unittest.TestCase):
     def test_install_release_rejects_invalid_semver_directory(self):
-        with tempfile.TemporaryDirectory() as directory:
-            root = pathlib.Path(directory) / "opt/amneziawg"
-            artifact = pathlib.Path(directory) / "awgctl"
-            artifact.write_bytes(b"artifact")
-            with self.assertRaisesRegex(DeploymentError, "version"):
-                install_release(
-                    root=root,
-                    artifact=artifact,
-                    version="0.1.0-beta.01",
-                )
-            self.assertFalse((root / "releases").exists())
+        invalid = {
+            "leading zero": "0.1.0-beta.01",
+            "unicode core digit": "1٢.0.0",
+            "oversized core": f"{'9' * 5000}.0.0",
+            "oversized prerelease": f"1.0.0-{'9' * 5000}",
+        }
+        for label, value in invalid.items():
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as directory:
+                root = pathlib.Path(directory) / "opt/amneziawg"
+                artifact = pathlib.Path(directory) / "awgctl"
+                artifact.write_bytes(b"artifact")
+                with self.assertRaisesRegex(DeploymentError, "version"):
+                    install_release(root=root, artifact=artifact, version=value)
+                self.assertFalse((root / "releases").exists())
 
     def test_install_release_uses_versioned_directory_and_atomic_selector(self):
         with tempfile.TemporaryDirectory() as directory:

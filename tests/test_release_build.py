@@ -38,27 +38,35 @@ class ReleaseBuildTests(unittest.TestCase):
             self.assertEqual(manifest["artifact"]["name"], "awgctl.pyz")
 
     def test_manifest_builder_rejects_invalid_semver(self):
-        with tempfile.TemporaryDirectory() as directory:
-            root = pathlib.Path(directory)
-            artifact = root / "awgctl.pyz"
-            artifact.write_bytes(b"artifact")
-            output = root / "release.json"
-            result = subprocess.run(
-                [
-                    sys.executable,
-                    str(REPO_ROOT / "tools/build_manifest.py"),
-                    "--artifact", str(artifact),
-                    "--output", str(output),
-                    "--version", "0.1.0-beta.01",
-                ],
-                cwd=REPO_ROOT,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                check=False,
-            )
-            self.assertNotEqual(result.returncode, 0)
-            self.assertFalse(output.exists())
+        invalid = {
+            "leading zero": "0.1.0-beta.01",
+            "unicode core digit": "1٢.0.0",
+            "oversized core": f"{'9' * 5000}.0.0",
+            "oversized prerelease": f"1.0.0-{'9' * 5000}",
+        }
+        for label, value in invalid.items():
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as directory:
+                root = pathlib.Path(directory)
+                artifact = root / "awgctl.pyz"
+                artifact.write_bytes(b"artifact")
+                output = root / "release.json"
+                result = subprocess.run(
+                    [
+                        sys.executable,
+                        str(REPO_ROOT / "tools/build_manifest.py"),
+                        "--artifact", str(artifact),
+                        "--output", str(output),
+                        "--version", value,
+                    ],
+                    cwd=REPO_ROOT,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    check=False,
+                )
+                self.assertNotEqual(result.returncode, 0)
+                self.assertNotIn("Traceback", result.stderr)
+                self.assertFalse(output.exists())
 
 
 if __name__ == "__main__":

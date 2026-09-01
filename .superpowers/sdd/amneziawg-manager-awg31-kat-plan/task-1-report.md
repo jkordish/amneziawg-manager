@@ -181,3 +181,65 @@ All commands exited 0 and `git diff --check` was clean.
 - A custom diagnostics parent must already exist so it can be opened and authorized before creation beneath it. The normal default remains unchanged because `ensure_layout()` creates the protected default parent.
 - No live root-owned `/opt` diagnostic run, live client import, QR invocation, or release publication was performed. Root ownership is enforced by the effective-UID check and descriptor operations and was unit-tested unprivileged.
 - The repository-wide suite was not run; verification was kept to the focused serial 71-test set plus compile/build/smoke checks as directed.
+
+## Fix Round 1
+
+### Findings addressed
+
+1. Reworked the workflow policy test so it enumerates both `*.yml` and `*.yaml`, detects every ordinary `uses:` mapping before parsing its value, and fails closed on empty, structured, quoted, whitespace-bearing, or otherwise unparseable values. Local `./...` actions are validated separately. Every nonlocal action is independently checked for a full 40-character commit SHA and a human-readable `v...` version comment. External reusable-workflow paths are supported. A missing `uses:` mapping set also fails closed.
+2. Replaced every SemVer `\d` with ASCII `[0-9]`, added an explicit 128-digit numeric-identifier ceiling before conversion, and wrapped conversion failures as `InvalidVersion`. Runtime release validation converts that to `ReleaseError`; manifest construction and deployment continue to convert it to their existing public boundary errors.
+
+### RED evidence
+
+Command:
+
+```text
+python3 -m unittest -v tests.test_workflows tests.test_releases tests.test_release_build tests.test_packaging
+```
+
+Observed before validator fixes:
+
+```text
+Ran 14 tests in 0.905s
+FAILED (failures=8, errors=6)
+```
+
+The multiword-comment mutable action and `.yaml` fixture returned no violations. `1٢.0.0` was accepted by runtime, builder, and deployment. The 5,000-digit core and numeric prerelease cases raised raw `ValueError`; builder stderr contained a traceback.
+
+An additional fail-closed fixture was then added for a structured/unparseable `uses` value:
+
+```text
+python3 -m unittest -v tests.test_workflows.WorkflowSecurityTests.test_unparseable_uses_value_fails_closed
+Ran 1 test in 0.002s
+FAILED (failures=1)
+```
+
+The old scanner misclassified the value as a normal mutable reference instead of explicitly rejecting it as unparseable.
+
+### GREEN evidence
+
+Command:
+
+```text
+python3 -m unittest -v tests.test_workflows tests.test_releases tests.test_release_build tests.test_packaging
+```
+
+Observed after validator fixes:
+
+```text
+Ran 15 tests in 0.678s
+OK
+```
+
+### Amended-validator self-review
+
+- Workflow enumeration includes only regular `.yml`/`.yaml` files and counts detected mappings so an empty scan cannot silently pass.
+- Comment-only lines are ignored, while step actions and job-level reusable-workflow `uses:` mappings share the same fail-closed parser.
+- Local action syntax, nonlocal immutable identity, and the human version comment are separate validations. A multiword inline comment can no longer make a mutable reference disappear from coverage.
+- The immutable reference grammar accepts `owner/repository@SHA` and `owner/repository/path/to/workflow.yaml@SHA`, but rejects tags, branch names, abbreviated SHAs, expressions, Docker references, and malformed structured values.
+- SemVer core and prerelease numeric recognition is ASCII-only. Identifier length is checked before `int()`, and a defensive conversion wrapper prevents raw exceptions even if conversion behavior changes.
+- Reviewed all shared SemVer consumers: runtime comparison/manifest/tag validation, manifest builder, and immutable deployment directory selection. Each now exposes only its documented boundary error for Unicode or oversized numeric input.
+
+### Fix Round 1 concerns
+
+- No new blocker. The workflow policy intentionally rejects quoted/structured `uses` scalar forms rather than attempting a dependency-free general YAML parser; repository workflows use ordinary scalar mappings.

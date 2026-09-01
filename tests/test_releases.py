@@ -18,6 +18,7 @@ from awgctl.releases import (
     verify_ssh_signature,
     version_key,
 )
+from awgctl.semver import InvalidVersion, precedence_key
 
 
 class ReleaseVerificationTests(unittest.TestCase):
@@ -44,6 +45,18 @@ class ReleaseVerificationTests(unittest.TestCase):
             "1.2.3+build",
         ):
             with self.subTest(value=value), self.assertRaises(ReleaseError):
+                version_key(value)
+
+    def test_unicode_and_oversized_numeric_versions_raise_boundary_errors(self):
+        invalid = {
+            "unicode core digit": "1٢.0.0",
+            "oversized core": f"{'9' * 5000}.0.0",
+            "oversized numeric prerelease": f"1.0.0-{'9' * 5000}",
+        }
+        for label, value in invalid.items():
+            with self.subTest(parser=label), self.assertRaises(InvalidVersion):
+                precedence_key(value)
+            with self.subTest(release=label), self.assertRaises(ReleaseError):
                 version_key(value)
 
     def test_committed_and_embedded_release_public_keys_match(self):
