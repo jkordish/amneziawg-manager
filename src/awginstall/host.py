@@ -122,7 +122,8 @@ def _restore_file(path: pathlib.Path, snapshot: _FileSnapshot) -> None:
         path.unlink(missing_ok=True)
 
 
-def _render_expiry_service(product_root: pathlib.Path) -> str:
+def render_expiry_service(product_root: pathlib.Path) -> str:
+    """Return the canonical manager-owned expiry service unit."""
     return (
         "# Managed by AmneziaWG Manager\n"
         "[Unit]\n"
@@ -137,7 +138,8 @@ def _render_expiry_service(product_root: pathlib.Path) -> str:
     )
 
 
-def _render_expiry_timer() -> str:
+def render_expiry_timer() -> str:
+    """Return the canonical manager-owned expiry timer unit."""
     return (
         "# Managed by AmneziaWG Manager\n"
         "[Unit]\n"
@@ -428,8 +430,8 @@ def configure_host(
         else:
             paths.service_dropin.unlink(missing_ok=True)
         _atomic_write(paths.module_load, module_load.encode("utf-8"), 0o644)
-        _atomic_write(paths.expiry_service, _render_expiry_service(product_root).encode("utf-8"), 0o644)
-        _atomic_write(paths.expiry_timer, _render_expiry_timer().encode("utf-8"), 0o644)
+        _atomic_write(paths.expiry_service, render_expiry_service(product_root).encode("utf-8"), 0o644)
+        _atomic_write(paths.expiry_timer, render_expiry_timer().encode("utf-8"), 0o644)
         _atomic_write(
             installation_path,
             (json.dumps(settings_document, indent=2, sort_keys=True) + "\n").encode("utf-8"),
@@ -446,7 +448,8 @@ def configure_host(
             post_plan = build_identity_plan(settings, verified, allow_existing=True)
             if post_plan.commands:
                 raise HostConfigurationError("host identities did not converge to the requested policy")
-        runner(("systemctl", "enable", "--now", "amneziawg-client-expiry.timer"))
+        runner(("systemctl", "enable", "amneziawg-client-expiry.timer"))
+        runner(("systemctl", "start", "amneziawg-client-expiry.timer"))
         return report
     except Exception as exc:
         for path, previous in file_snapshots.items():

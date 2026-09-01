@@ -492,6 +492,123 @@ class HostConfigurationTests(unittest.TestCase):
         self.assertTrue(report.sudoers)
         self.assertTrue(report.service_hardening)
 
+    def test_configuration_failures_restore_exact_units_settings_and_timer_state(self):
+        from awginstall import host
+        from awginstall.host import HostConfigurationError, HostPaths, configure_host
+        from awginstall.identity import IdentitySnapshot, UserRecord
+        from awginstall.settings import resolve_installation_settings
+
+        stages = (
+            "expiry-service-write",
+            "expiry-timer-write",
+            "installation-write",
+            "unit-verify",
+            "daemon-reload",
+            "enable",
+            "start",
+        )
+        snapshot = IdentitySnapshot(
+            users={}, groups={}, locked_users=set(), supplementary_groups={}
+        )
+        original_atomic_write = host._atomic_write
+
+        for stage in stages:
+            with self.subTest(stage=stage), tempfile.TemporaryDirectory() as directory:
+                root = pathlib.Path(directory)
+                product_root = root / "opt/amneziawg"
+                paths = HostPaths.under(root)
+                installation = product_root / "config/installation.json"
+                prior = {
+                    paths.sudoers: (b"prior sudoers\n", 0o440),
+                    paths.service_dropin: (b"prior hardening\n", 0o644),
+                    paths.module_load: (b"prior module\n", 0o644),
+                    paths.expiry_service: (b"prior expiry service\n", 0o644),
+                    paths.expiry_timer: (b"prior expiry timer\n", 0o644),
+                    installation: (b'{"prior": true}\n', 0o600),
+                }
+                for path, (data, mode) in prior.items():
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    path.write_bytes(data)
+                    path.chmod(mode)
+
+                state = {"enabled": False, "active": True}
+                injected = {"value": False}
+
+                def atomic_write(path, data, mode):
+                    target_stage = {
+                        paths.expiry_service: "expiry-service-write",
+                        paths.expiry_timer: "expiry-timer-write",
+                        installation: "installation-write",
+                    }.get(path)
+                    if target_stage == stage and not injected["value"]:
+                        injected["value"] = True
+                        raise HostConfigurationError(f"injected {stage}")
+                    original_atomic_write(path, data, mode)
+
+                def runner(argv):
+                    command = tuple(argv)
+                    if command[:3] == ("systemctl", "is-enabled", "--quiet"):
+                        code = 0 if state["enabled"] else 1
+                        return subprocess.CompletedProcess(argv, code, b"", b"")
+                    if command[:3] == ("systemctl", "is-active", "--quiet"):
+                        code = 0 if state["active"] else 3
+                        return subprocess.CompletedProcess(argv, code, b"", b"")
+
+                    fault = None
+                    if command[:2] == ("systemd-analyze", "verify"):
+                        fault = "unit-verify"
+                    elif command == ("systemctl", "daemon-reload"):
+                        fault = "daemon-reload"
+                    elif command[:2] == ("systemctl", "enable"):
+                        state["enabled"] = True
+                        if "--now" in command:
+                            state["active"] = True
+                        fault = "enable"
+                    elif command[:2] == ("systemctl", "disable"):
+                        state["enabled"] = False
+                    elif command[:2] == ("systemctl", "start"):
+                        state["active"] = True
+                        fault = "start"
+                    elif command[:2] == ("systemctl", "stop"):
+                        state["active"] = False
+                    if fault == stage and not injected["value"]:
+                        injected["value"] = True
+                        raise HostConfigurationError(f"injected {stage}")
+                    return subprocess.CompletedProcess(argv, 0, b"", b"")
+
+                settings = resolve_installation_settings(sudo_user=None)
+                with (
+                    mock.patch.object(host, "_atomic_write", side_effect=atomic_write),
+                    mock.patch.object(
+                        host,
+                        "_resolve_created_user",
+                        return_value=UserRecord(
+                            "awgctl",
+                            os.getuid(),
+                            os.getgid(),
+                            str(settings.staging_root),
+                            "/usr/sbin/nologin",
+                        ),
+                    ),
+                    mock.patch.object(host, "_prepare_staging_root"),
+                    self.assertRaisesRegex(HostConfigurationError, f"injected {stage}"),
+                ):
+                    configure_host(
+                        settings,
+                        product_root=product_root,
+                        paths=paths,
+                        allow_existing=False,
+                        dry_run=False,
+                        snapshot=snapshot,
+                        runner=runner,
+                    )
+
+                self.assertTrue(injected["value"])
+                for path, (data, mode) in prior.items():
+                    self.assertEqual(path.read_bytes(), data)
+                    self.assertEqual(path.stat().st_mode & 0o777, mode)
+                self.assertEqual(state, {"enabled": False, "active": True})
+
     def test_apply_writes_validated_policy_and_installed_settings(self):
         from awginstall.host import HostPaths, configure_host
         from awginstall.identity import IdentitySnapshot, UserRecord
@@ -540,7 +657,8 @@ class HostConfigurationTests(unittest.TestCase):
         self.assertTrue(any(command[0] == "visudo" for command in commands))
         self.assertTrue(any(command[:2] == ("systemd-analyze", "verify") for command in commands))
         self.assertIn(("systemctl", "daemon-reload"), commands)
-        self.assertIn(("systemctl", "enable", "--now", "amneziawg-client-expiry.timer"), commands)
+        self.assertIn(("systemctl", "enable", "amneziawg-client-expiry.timer"), commands)
+        self.assertIn(("systemctl", "start", "amneziawg-client-expiry.timer"), commands)
 
     def test_apply_failure_compensates_new_identity_commands(self):
         from awginstall.host import HostConfigurationError, HostPaths, configure_host
