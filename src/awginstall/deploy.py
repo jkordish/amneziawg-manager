@@ -17,6 +17,17 @@ class DeploymentError(RuntimeError):
     """A safe deployment error suitable for operator output."""
 
 
+def _fsync_directory(path: pathlib.Path) -> None:
+    descriptor = os.open(
+        path,
+        os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0),
+    )
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
 def _normalize_release_permissions(release: pathlib.Path) -> None:
     for directory, directories, files in os.walk(release):
         directory_path = pathlib.Path(directory)
@@ -38,6 +49,7 @@ def _atomic_write(path: pathlib.Path, data: bytes, mode: int) -> None:
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(temporary_path, path)
+        _fsync_directory(path.parent)
     except Exception:
         temporary_path.unlink(missing_ok=True)
         raise
@@ -72,6 +84,7 @@ def activate_release(root: pathlib.Path, version: str) -> None:
     temporary.unlink(missing_ok=True)
     os.symlink(f"../releases/{version}/awgctl", temporary)
     os.replace(temporary, selector)
+    _fsync_directory(selector.parent)
 
 
 def install_release(
@@ -130,6 +143,7 @@ def install_release(
         )
         _normalize_release_permissions(staging)
         os.replace(staging, final)
+        _fsync_directory(releases)
     except Exception:
         shutil.rmtree(staging, ignore_errors=True)
         raise
@@ -168,6 +182,7 @@ def preserve_legacy_release(root: pathlib.Path) -> str | None:
         )
         _normalize_release_permissions(staging)
         os.replace(staging, final)
+        _fsync_directory(final.parent)
     except Exception:
         shutil.rmtree(staging, ignore_errors=True)
         raise
