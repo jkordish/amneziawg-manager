@@ -55,7 +55,14 @@ def patched_layout(root):
         "RUNTIME_DIR": root / "run/awgctl",
         "LOCK_FILE": root / "run/awgctl/mutation.lock",
     }
-    with mock.patch.multiple(core, **values):
+    with (
+        mock.patch.multiple(core, **values),
+        mock.patch.object(
+            core.socket,
+            "if_nametoindex",
+            side_effect=OSError(core.errno.ENODEV, "synthetic interface is absent"),
+        ),
+    ):
         yield values
 
 
@@ -460,7 +467,21 @@ def managed_nft_json(config, *, docker_chain):
         ]),
         rule("amneziawg_forward", "forward", 15, "awgctl-block-private-reserved-destinations", [
             nft_match(meta("iifname"), config["interface"]),
-            nft_match(payload("daddr"), {"set": [nft_prefix(value) for value in config["blocked_forward_ipv4"]]}, "in"),
+            nft_match(payload("daddr"), {"set": [
+                nft_prefix("0.0.0.0/8"),
+                nft_prefix("10.0.0.0/8"),
+                nft_prefix("100.64.0.0/10"),
+                nft_prefix("127.0.0.0/8"),
+                nft_prefix("169.254.0.0/16"),
+                nft_prefix("172.16.0.0/12"),
+                nft_prefix("192.0.0.0/24"),
+                nft_prefix("192.0.2.0/24"),
+                nft_prefix("192.168.0.0/16"),
+                nft_prefix("198.18.0.0/15"),
+                nft_prefix("198.51.100.0/24"),
+                nft_prefix("203.0.113.0/24"),
+                nft_prefix("224.0.0.0/3"),
+            ]}, "=="),
             counter,
             {"drop": None},
         ]),
@@ -856,6 +877,49 @@ class FirewallSemanticPostconditionTests(unittest.TestCase):
                         )
                     )
 
+    def test_expected_anonymous_set_collapses_and_orders_custom_networks(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            with patched_layout(root):
+                config, _ = classic_state()
+                config["blocked_forward_ipv4"] = [
+                    "240.0.0.0/4",
+                    "198.51.100.0/24",
+                    "10.0.0.0/8",
+                    "224.0.0.0/4",
+                    "192.0.2.0/24",
+                ]
+                with mock.patch.object(
+                    core,
+                    "normalize_server_config",
+                    side_effect=lambda value: value,
+                ):
+                    managed, _ = core._expected_managed_firewall_entities(
+                        config,
+                        docker_chain=False,
+                    )
+                blocked_rule = next(
+                    value["rule"]
+                    for value in managed
+                    if value.get("rule", {}).get("comment")
+                    == "awgctl-block-private-reserved-destinations"
+                )
+                self.assertEqual(
+                    blocked_rule["expr"][1],
+                    nft_match(
+                        {"payload": {"protocol": "ip", "field": "daddr"}},
+                        {
+                            "set": [
+                                nft_prefix("10.0.0.0/8"),
+                                nft_prefix("192.0.2.0/24"),
+                                nft_prefix("198.51.100.0/24"),
+                                nft_prefix("224.0.0.0/3"),
+                            ]
+                        },
+                        "==",
+                    ),
+                )
+
     def test_named_tables_and_fake_markers_are_not_semantic_proof(self):
         with tempfile.TemporaryDirectory() as directory:
             root = pathlib.Path(directory)
@@ -1069,6 +1133,124 @@ class TransitionInterlockTests(unittest.TestCase):
                             core.load_service_operation_intent()["next_action"],
                             0,
                         )
+
+    def test_down_waits_for_kernel_link_absence_before_mutation_or_progress(self):
+        for with_intent in (False, True):
+            with self.subTest(with_intent=with_intent), tempfile.TemporaryDirectory() as directory:
+                with patched_layout(pathlib.Path(directory)), mock.patch.object(core, "require_root"):
+                    classic_state()
+                    cleanup = mock.Mock()
+                    if with_intent:
+                        document = service_intent_document(phase="invoking")
+                        document["generation_sha256"] = core.managed_transition_prestate_digest()
+                        with core.mutation_lock(service_lifecycle=True):
+                            core.compare_and_swap_service_operation_intent(
+                                document,
+                                expected_operation_id=None,
+                                expected_phase=None,
+                            )
+                    with (
+                        core.mutation_lock(service_lifecycle=True),
+                        mock.patch.object(core, "service_is_active_exact", return_value=False),
+                        mock.patch.object(core.socket, "if_nametoindex", return_value=17),
+                        mock.patch.object(core, "firewall_cleanup", cleanup),
+                        mock.patch.object(core, "firewall_action_postcondition", return_value=True),
+                        self.assertRaisesRegex(core.AwgctlError, "kernel interface is still present"),
+                    ):
+                        core.run_firewall_action_locked("down")
+                    cleanup.assert_not_called()
+                    if with_intent:
+                        self.assertEqual(core.load_service_operation_intent()["next_action"], 0)
+
+                    with (
+                        core.mutation_lock(service_lifecycle=True),
+                        mock.patch.object(core, "service_is_active_exact", return_value=False),
+                        mock.patch.object(
+                            core.socket,
+                            "if_nametoindex",
+                            side_effect=OSError(core.errno.ENODEV, "missing"),
+                        ),
+                        mock.patch.object(core, "firewall_cleanup", cleanup),
+                        mock.patch.object(core, "firewall_action_postcondition", return_value=True),
+                    ):
+                        core.run_firewall_action_locked("down")
+                    cleanup.assert_called_once_with()
+                    if with_intent:
+                        self.assertEqual(core.load_service_operation_intent()["next_action"], 1)
+
+    def test_kernel_link_query_errors_fail_closed_before_down(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with patched_layout(pathlib.Path(directory)), mock.patch.object(core, "require_root"):
+                classic_state()
+                cleanup = mock.Mock()
+                with (
+                    core.mutation_lock(service_lifecycle=True),
+                    mock.patch.object(core, "service_is_active_exact", return_value=False),
+                    mock.patch.object(
+                        core.socket,
+                        "if_nametoindex",
+                        side_effect=OSError(core.errno.EIO, "injected query failure"),
+                    ),
+                    mock.patch.object(core, "firewall_cleanup", cleanup),
+                    self.assertRaisesRegex(core.AwgctlError, "cannot verify service lifecycle state"),
+                ):
+                    core.run_firewall_action_locked("down")
+                cleanup.assert_not_called()
+
+    def test_compensation_retries_only_after_stopped_link_is_absent(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with patched_layout(pathlib.Path(directory)), mock.patch.object(core, "require_root"):
+                classic_state()
+                runtime = FakeServiceRuntime(active=True, firewall_up=True)
+                link_exists = {"value": True}
+                document = service_intent_document(phase="invoking")
+                document["generation_sha256"] = core.managed_transition_prestate_digest()
+                with core.mutation_lock(service_lifecycle=True):
+                    core.compare_and_swap_service_operation_intent(
+                        document,
+                        expected_operation_id=None,
+                        expected_phase=None,
+                    )
+
+                def if_nametoindex(unused_interface):
+                    if link_exists["value"]:
+                        return 19
+                    raise OSError(core.errno.ENODEV, "missing")
+
+                def systemd_runner(argv, **kwargs):
+                    runtime.active = False
+                    return subprocess.CompletedProcess(argv, 0, b"", b"")
+
+                cleanup = mock.Mock(side_effect=runtime.cleanup)
+                patches = (
+                    mock.patch.object(core, "process_identity_is_alive", return_value=False),
+                    mock.patch.object(core, "service_is_active_exact", side_effect=runtime.service_active),
+                    mock.patch.object(core.socket, "if_nametoindex", side_effect=if_nametoindex),
+                    mock.patch.object(core, "firewall_action_postcondition", side_effect=runtime.firewall_postcondition),
+                    mock.patch.object(core, "firewall_cleanup", cleanup),
+                    mock.patch.object(core, "run", side_effect=systemd_runner),
+                )
+                with patches[0], patches[1], patches[2], patches[3], patches[4], patches[5]:
+                    with self.assertRaisesRegex(core.AwgctlError, "fail-safe service compensation failed"):
+                        with core.mutation_lock():
+                            pass
+                cleanup.assert_not_called()
+                retained = core.load_service_operation_intent()
+                self.assertEqual((retained["phase"], retained["next_action"]), ("compensating", 0))
+
+                link_exists["value"] = False
+                retry_patches = (
+                    mock.patch.object(core, "process_identity_is_alive", return_value=False),
+                    mock.patch.object(core, "service_is_active_exact", side_effect=runtime.service_active),
+                    mock.patch.object(core.socket, "if_nametoindex", side_effect=if_nametoindex),
+                    mock.patch.object(core, "firewall_action_postcondition", side_effect=runtime.firewall_postcondition),
+                    mock.patch.object(core, "firewall_cleanup", cleanup),
+                )
+                with retry_patches[0], retry_patches[1], retry_patches[2], retry_patches[3], retry_patches[4]:
+                    with core.mutation_lock():
+                        pass
+                cleanup.assert_called_once_with()
+                self.assertFalse(core.SERVICE_OPERATION_FILE.exists())
 
     def test_compensation_stops_before_down_and_missing_or_duplicate_hook_converges(self):
         for hook_count in (0, 1, 2):
