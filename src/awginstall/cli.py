@@ -824,8 +824,13 @@ def main(
                     )
                 )
                 _deploy_source_release(root, repo_root, health=True, settings=settings)
-            except Exception:
-                _rollback_host_reports(host_reports)
+            except Exception as exc:
+                try:
+                    _rollback_host_reports(host_reports)
+                except Exception as rollback_exc:
+                    raise HostConfigurationError(
+                        f"{exc}; outer host rollback failed: {rollback_exc}"
+                    ) from exc
                 raise
             _emit(
                 output,

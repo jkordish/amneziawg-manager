@@ -45,7 +45,16 @@ def _valid_tag(value: object) -> bool:
     return True
 
 
-def parse_manifest(data: bytes, *, expected_platform: str) -> dict[str, Any]:
+def _version_channel(value: str) -> str:
+    return "stable" if version_key(value)[3] == 1 else "beta"
+
+
+def parse_manifest(
+    data: bytes,
+    *,
+    expected_platform: str,
+    expected_channel: str | None = None,
+) -> dict[str, Any]:
     try:
         manifest = json.loads(data)
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
@@ -66,6 +75,13 @@ def parse_manifest(data: bytes, *, expected_platform: str) -> dict[str, Any]:
         raise ReleaseError("release tag and version do not match")
     if manifest["channel"] not in {"beta", "stable"}:
         raise ReleaseError("unsupported release channel")
+    if manifest["channel"] != _version_channel(version):
+        raise ReleaseError("release channel does not match tag prerelease semantics")
+    if expected_channel is not None:
+        if expected_channel not in {"beta", "stable"}:
+            raise ReleaseError("unsupported update channel")
+        if manifest["channel"] != expected_channel:
+            raise ReleaseError("signed release channel does not match requested channel")
     if manifest["platform"] != expected_platform:
         raise ReleaseError(f"release platform mismatch: expected {expected_platform}")
     if manifest["installation_schema_version"] != 1:
@@ -157,7 +173,7 @@ def discover_release_tag(*, channel: str = "beta") -> str:
         if channel == "stable" and release.get("prerelease"):
             continue
         tag = release.get("tag_name")
-        if _valid_tag(tag):
+        if _valid_tag(tag) and _version_channel(tag[1:]) == channel:
             return tag
     raise ReleaseError(f"no published {channel} release was found")
 
@@ -166,6 +182,7 @@ def fetch_verified_release(
     tag: str,
     *,
     expected_platform: str,
+    expected_channel: str,
     include_artifact: bool,
 ) -> tuple[dict[str, Any], bytes | None]:
     if not _valid_tag(tag):
@@ -174,7 +191,11 @@ def fetch_verified_release(
     manifest_bytes = fetch_bytes(f"{base}/release.json", maximum=64 * 1024)
     signature = fetch_bytes(f"{base}/release.json.sig", maximum=16 * 1024)
     verify_ssh_signature(manifest_bytes, signature)
-    manifest = parse_manifest(manifest_bytes, expected_platform=expected_platform)
+    manifest = parse_manifest(
+        manifest_bytes,
+        expected_platform=expected_platform,
+        expected_channel=expected_channel,
+    )
     if manifest["tag"] != tag:
         raise ReleaseError("signed manifest does not match the discovered release tag")
     if not include_artifact:

@@ -45,7 +45,6 @@ from .diagnostics import (
     DiagnosticsError,
     create_bundle as create_diagnostic_bundle,
     redact_awg_config,
-    sanitize_cps_text,
 )
 from .releases import ReleaseError, discover_release_tag, fetch_verified_release, version_key
 from .selftest import SelfTestError, run_namespace_selftest
@@ -100,6 +99,7 @@ EXPIRY_SERVICE_CONFIG = pathlib.Path(
 EXPIRY_TIMER_CONFIG = pathlib.Path(
     "/etc/systemd/system/amneziawg-client-expiry.timer"
 )
+SYSTEMD_UNIT_DIR = pathlib.Path("/etc/systemd/system")
 SYSCTL_CONFIG = pathlib.Path("/etc/sysctl.d/90-amneziawg-forward.conf")
 SERVICE_TEMPLATE = "awg-quick@{interface}.service"
 OBFUSCATION_FIELDS = ("Jc", "Jmin", "Jmax", "S1", "S2", "H1", "H2", "H3", "H4")
@@ -350,8 +350,11 @@ def mutation_lock(
     timeout_seconds: float | None = None,
     transition_lifecycle: bool = False,
     service_lifecycle: bool = False,
+    skip_transition_recovery: bool = False,
 ) -> Iterator[None]:
     require_root()
+    if skip_transition_recovery and (not transition_lifecycle or service_lifecycle):
+        raise AwgctlError("transition recovery may be deferred only by a lifecycle command")
     if timeout_seconds is not None and (
         isinstance(timeout_seconds, bool)
         or not isinstance(timeout_seconds, (int, float))
@@ -426,7 +429,8 @@ def mutation_lock(
                 ):
                     raise AwgctlError("service operation is pending")
                 reconcile_service_operation_locked()
-            reconcile_transition_recovery_locked()
+            if not skip_transition_recovery:
+                reconcile_transition_recovery_locked()
             if not transition_lifecycle and load_transition_document(required=False) is not None:
                 raise AwgctlError(
                     "obfuscation transition is pending; complete its lifecycle first"
@@ -5485,97 +5489,6 @@ def delete_activation_journal(transaction_id: str) -> None:
     fsync_directory(ACTIVATION_JOURNAL_FILE.parent)
 
 
-def schedule_transition_recovery(transaction_id: str) -> None:
-    transaction_id = validate_transaction_id(transaction_id)
-    run(
-        [
-            "systemd-run",
-            "--quiet",
-            "--collect",
-            "--unit",
-            f"awgctl-obfuscation-recovery-{transaction_id}",
-            "--on-active=10m",
-            str(INTERNAL_ENTRYPOINT),
-            "_obfuscation-timeout",
-            transaction_id,
-        ],
-        timeout=15,
-    )
-
-
-def schedule_transition_timeout(
-    transaction_id: str, timeout: str, *, deadline_at: str | None = None
-) -> None:
-    transaction_id = validate_transaction_id(transaction_id)
-    if timeout != "10m":
-        raise AwgctlError("obfuscation activation timeout must be exactly 10m")
-    if deadline_at is None:
-        raise AwgctlError("obfuscation rollback deadline is required")
-    deadline = _transition_time(deadline_at, "deadline_at")
-    unit = f"awgctl-obfuscation-rollback-{transaction_id}"
-    run(
-        [
-            "systemd-run",
-            "--quiet",
-            "--collect",
-            "--unit",
-            unit,
-            "--timer-property=AccuracySec=1s",
-            f"--on-calendar={_utc_z(deadline)}",
-            str(INTERNAL_ENTRYPOINT),
-            "_obfuscation-timeout",
-            transaction_id,
-        ],
-        timeout=15,
-    )
-
-
-def verify_transition_timeout(transaction_id: str, *, deadline_at: str) -> None:
-    deadline = _transition_time(deadline_at, "deadline_at")
-    timer, _ = transition_unit_names(transaction_id)
-    argv = [
-        "systemctl",
-        "show",
-        "--no-pager",
-        "--property=ActiveState",
-        "--property=NextElapseUSecRealtime",
-        "--timestamp=unix",
-        timer,
-    ]
-    try:
-        result = run(argv, check=False, timeout=15)
-        if result.returncode != 0:
-            raise AwgctlError("automatic rollback timer could not be verified")
-        lines = result.stdout.decode("ascii").splitlines()
-        properties: dict[str, str] = {}
-        for line in lines:
-            if line.count("=") != 1:
-                raise AwgctlError("automatic rollback timer could not be verified")
-            name, value = line.split("=", 1)
-            if name in properties:
-                raise AwgctlError("automatic rollback timer could not be verified")
-            properties[name] = value
-        if set(properties) != {"ActiveState", "NextElapseUSecRealtime"}:
-            raise AwgctlError("automatic rollback timer could not be verified")
-        timestamp = re.fullmatch(
-            r"@(?P<seconds>[0-9]{1,20})(?:\.(?P<fraction>[0-9]{1,6}))?",
-            properties["NextElapseUSecRealtime"],
-        )
-        if (
-            properties["ActiveState"] != "active"
-            or timestamp is None
-            or (timestamp.group("fraction") or "").strip("0")
-            or int(timestamp.group("seconds")) != int(deadline.timestamp())
-        ):
-            raise AwgctlError("automatic rollback timer could not be verified")
-    except AwgctlError as exc:
-        if str(exc) == "automatic rollback timer could not be verified":
-            raise
-        raise AwgctlError("automatic rollback timer could not be verified") from exc
-    except (OSError, UnicodeError, ValueError) as exc:
-        raise AwgctlError("automatic rollback timer could not be verified") from exc
-
-
 def transition_unit_names(transaction_id: str) -> tuple[str, str]:
     transaction_id = validate_transaction_id(transaction_id)
     base = f"awgctl-obfuscation-rollback-{transaction_id}"
@@ -5588,30 +5501,359 @@ def transition_recovery_unit_names(transaction_id: str) -> tuple[str, str]:
     return f"{base}.timer", f"{base}.service"
 
 
-def _cancel_transition_units(units: tuple[str, str], *, label: str) -> None:
-    run(["systemctl", "stop", *units], check=False, timeout=45)
-    states = {
-        unit: run(
-            ["systemctl", "is-active", "--quiet", unit], check=False
+def _transition_unit_text(
+    transaction_id: str,
+    *,
+    deadline_at: str,
+    recovery: bool,
+) -> tuple[tuple[str, str], tuple[str, str]]:
+    transaction_id = validate_transaction_id(transaction_id)
+    deadline = _transition_time(deadline_at, "deadline_at")
+    names = (
+        transition_recovery_unit_names(transaction_id)
+        if recovery
+        else transition_unit_names(transaction_id)
+    )
+    timer_name, service_name = names
+    purpose = "activation recovery" if recovery else "unconfirmed activation rollback"
+    service = (
+        "[Unit]\n"
+        f"Description=AmneziaWG {purpose} for {transaction_id}\n\n"
+        "[Service]\n"
+        "Type=oneshot\n"
+        f"ExecStart={INTERNAL_ENTRYPOINT} _obfuscation-timeout {transaction_id} "
+        f"--origin {'recovery' if recovery else 'final'}\n"
+    )
+    timer = (
+        "[Unit]\n"
+        f"Description=AmneziaWG {purpose} deadline for {transaction_id}\n\n"
+        "[Timer]\n"
+        f"OnCalendar={_utc_z(deadline)}\n"
+        "AccuracySec=1s\n"
+        "Persistent=true\n"
+        f"Unit={service_name}\n\n"
+        "[Install]\n"
+        "WantedBy=timers.target\n"
+    )
+    return names, (timer, service)
+
+
+def _systemd_unit_is_root_owned(metadata: os.stat_result) -> bool:
+    return (metadata.st_uid, metadata.st_gid) == (0, 0)
+
+
+def _verify_transition_unit_file(path: pathlib.Path, expected: str) -> None:
+    descriptor = -1
+    try:
+        descriptor = os.open(
+            path,
+            os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0),
+        )
+        metadata = os.fstat(descriptor)
+        named = os.stat(path, follow_symlinks=False)
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_nlink != 1
+            or not _systemd_unit_is_root_owned(metadata)
+            or stat.S_IMODE(metadata.st_mode) != 0o644
+            or (metadata.st_dev, metadata.st_ino) != (named.st_dev, named.st_ino)
+            or metadata.st_size != len(expected.encode("utf-8"))
+        ):
+            raise AwgctlError("automatic rollback unit file is unsafe")
+        chunks: list[bytes] = []
+        while chunk := os.read(descriptor, 16 * 1024):
+            chunks.append(chunk)
+        if b"".join(chunks) != expected.encode("utf-8"):
+            raise AwgctlError("automatic rollback unit content changed")
+    except AwgctlError:
+        raise
+    except OSError as exc:
+        raise AwgctlError("automatic rollback unit file is unsafe") from exc
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+
+
+def _verify_transition_timer(
+    transaction_id: str,
+    *,
+    deadline_at: str,
+    recovery: bool,
+) -> None:
+    deadline = _transition_time(deadline_at, "deadline_at")
+    (timer, service), (timer_text, service_text) = _transition_unit_text(
+        transaction_id,
+        deadline_at=deadline_at,
+        recovery=recovery,
+    )
+    label = "activation recovery timer" if recovery else "automatic rollback timer"
+    try:
+        _verify_transition_unit_file(SYSTEMD_UNIT_DIR / timer, timer_text)
+        _verify_transition_unit_file(SYSTEMD_UNIT_DIR / service, service_text)
+        argv = [
+            "systemctl",
+            "show",
+            "--no-pager",
+            "--property=ActiveState",
+            "--property=UnitFileState",
+            "--property=NextElapseUSecRealtime",
+            "--timestamp=unix",
+            timer,
+        ]
+        result = run(argv, check=False, timeout=15)
+        if result.returncode != 0:
+            raise AwgctlError(f"{label} could not be verified")
+        lines = result.stdout.decode("ascii").splitlines()
+        properties: dict[str, str] = {}
+        for line in lines:
+            if line.count("=") != 1:
+                raise AwgctlError(f"{label} could not be verified")
+            name, value = line.split("=", 1)
+            if name in properties:
+                raise AwgctlError(f"{label} could not be verified")
+            properties[name] = value
+        if set(properties) != {
+            "ActiveState",
+            "UnitFileState",
+            "NextElapseUSecRealtime",
+        }:
+            raise AwgctlError(f"{label} could not be verified")
+        timestamp = re.fullmatch(
+            r"@(?P<seconds>[0-9]{1,20})(?:\.(?P<fraction>[0-9]{1,6}))?",
+            properties["NextElapseUSecRealtime"],
+        )
+        if (
+            properties["ActiveState"] != "active"
+            or properties["UnitFileState"] != "enabled"
+            or timestamp is None
+            or (timestamp.group("fraction") or "").strip("0")
+            or int(timestamp.group("seconds")) != int(deadline.timestamp())
+        ):
+            raise AwgctlError(f"{label} could not be verified")
+    except AwgctlError as exc:
+        if str(exc) == f"{label} could not be verified":
+            raise
+        raise AwgctlError(f"{label} could not be verified") from exc
+    except (OSError, UnicodeError, ValueError) as exc:
+        raise AwgctlError(f"{label} could not be verified") from exc
+
+
+def _remove_transition_units(
+    transaction_id: str,
+    *,
+    recovery: bool,
+) -> None:
+    transaction_id = validate_transaction_id(transaction_id)
+    units = (
+        transition_recovery_unit_names(transaction_id)
+        if recovery
+        else transition_unit_names(transaction_id)
+    )
+    timer, service = units
+    label = "activation recovery timer" if recovery else "automatic rollback timer"
+    errors: list[str] = []
+    for argv in (
+        ["systemctl", "disable", "--now", timer],
+        ["systemctl", "stop", timer, service],
+    ):
+        try:
+            run(argv, check=False, timeout=45)
+        except Exception as exc:
+            errors.append(str(exc))
+    for unit in units:
+        try:
+            (SYSTEMD_UNIT_DIR / unit).unlink()
+        except FileNotFoundError:
+            pass
+        except OSError as exc:
+            errors.append(str(exc))
+    if SYSTEMD_UNIT_DIR.is_dir():
+        try:
+            fsync_directory(SYSTEMD_UNIT_DIR)
+        except OSError as exc:
+            errors.append(str(exc))
+    try:
+        run(["systemctl", "daemon-reload"], check=False, timeout=45)
+    except Exception as exc:
+        errors.append(str(exc))
+    for unit in units:
+        try:
+            state = run(
+                ["systemctl", "is-active", "--quiet", unit],
+                check=False,
+                timeout=15,
+            ).returncode
+            if state not in {3, 4}:
+                errors.append(f"{unit} remains active")
+        except Exception as exc:
+            errors.append(str(exc))
+    try:
+        enabled = run(
+            ["systemctl", "is-enabled", "--quiet", timer],
+            check=False,
+            timeout=15,
         ).returncode
-        for unit in units
-    }
-    if any(returncode not in {3, 4} for returncode in states.values()):
-        raise AwgctlError(f"{label} cancellation could not be verified")
+        if enabled == 0:
+            errors.append(f"{timer} remains enabled")
+    except Exception as exc:
+        errors.append(str(exc))
+    if any((SYSTEMD_UNIT_DIR / unit).exists() for unit in units):
+        errors.append("transaction unit files remain")
+    if errors:
+        raise AwgctlError(f"{label} cancellation could not be verified: " + "; ".join(errors))
+
+
+def _remove_originating_transition_units(
+    transaction_id: str,
+    *,
+    recovery: bool,
+) -> None:
+    """Remove a timer's own durable pair without stopping its running oneshot."""
+    transaction_id = validate_transaction_id(transaction_id)
+    units = (
+        transition_recovery_unit_names(transaction_id)
+        if recovery
+        else transition_unit_names(transaction_id)
+    )
+    timer, _service = units
+    label = "activation recovery timer" if recovery else "automatic rollback timer"
+    errors: list[str] = []
+    for argv in (
+        ["systemctl", "disable", timer],
+        ["systemctl", "stop", timer],
+    ):
+        try:
+            run(argv, check=False, timeout=45)
+        except Exception as exc:
+            errors.append(str(exc))
+    for unit in units:
+        try:
+            (SYSTEMD_UNIT_DIR / unit).unlink()
+        except FileNotFoundError:
+            pass
+        except OSError as exc:
+            errors.append(str(exc))
+    if SYSTEMD_UNIT_DIR.is_dir():
+        try:
+            fsync_directory(SYSTEMD_UNIT_DIR)
+        except OSError as exc:
+            errors.append(str(exc))
+    try:
+        run(["systemctl", "daemon-reload"], check=False, timeout=45)
+    except Exception as exc:
+        errors.append(str(exc))
+    try:
+        state = run(
+            ["systemctl", "is-active", "--quiet", timer],
+            check=False,
+            timeout=15,
+        ).returncode
+        if state not in {3, 4}:
+            errors.append(f"{timer} remains active")
+    except Exception as exc:
+        errors.append(str(exc))
+    try:
+        enabled = run(
+            ["systemctl", "is-enabled", "--quiet", timer],
+            check=False,
+            timeout=15,
+        ).returncode
+        if enabled == 0:
+            errors.append(f"{timer} remains enabled")
+    except Exception as exc:
+        errors.append(str(exc))
+    if any((SYSTEMD_UNIT_DIR / unit).exists() for unit in units):
+        errors.append("originating transaction unit files remain")
+    if errors:
+        raise AwgctlError(
+            f"{label} self-cleanup could not be verified: " + "; ".join(errors)
+        )
+
+
+def _arm_transition_timer(
+    transaction_id: str,
+    *,
+    deadline_at: str,
+    recovery: bool,
+) -> None:
+    transaction_id = validate_transaction_id(transaction_id)
+    (timer, service), (timer_text, service_text) = _transition_unit_text(
+        transaction_id,
+        deadline_at=deadline_at,
+        recovery=recovery,
+    )
+    label = "activation recovery timer" if recovery else "automatic rollback timer"
+    try:
+        atomic_write(SYSTEMD_UNIT_DIR / service, service_text, 0o644)
+        atomic_write(SYSTEMD_UNIT_DIR / timer, timer_text, 0o644)
+        _verify_transition_unit_file(SYSTEMD_UNIT_DIR / service, service_text)
+        _verify_transition_unit_file(SYSTEMD_UNIT_DIR / timer, timer_text)
+        run(["systemctl", "daemon-reload"], timeout=45)
+        run(["systemctl", "enable", timer], timeout=45)
+        run(["systemctl", "restart", timer], timeout=45)
+        _verify_transition_timer(
+            transaction_id,
+            deadline_at=deadline_at,
+            recovery=recovery,
+        )
+    except Exception as original:
+        try:
+            _remove_transition_units(transaction_id, recovery=recovery)
+        except Exception as cleanup:
+            raise AwgctlError(
+                f"{label} could not be armed; compensation failed: {cleanup}"
+            ) from original
+        raise AwgctlError(f"{label} could not be armed") from original
+
+
+def schedule_transition_recovery(
+    transaction_id: str,
+    *,
+    deadline_at: str | None = None,
+) -> str:
+    transaction_id = validate_transaction_id(transaction_id)
+    if deadline_at is None:
+        now = dt.datetime.now(dt.timezone.utc).replace(microsecond=0)
+        deadline_at = _utc_z(now + dt.timedelta(minutes=10))
+    _transition_time(deadline_at, "deadline_at")
+    _arm_transition_timer(
+        transaction_id,
+        deadline_at=deadline_at,
+        recovery=True,
+    )
+    return deadline_at
+
+
+def schedule_transition_timeout(
+    transaction_id: str, timeout: str, *, deadline_at: str | None = None
+) -> None:
+    transaction_id = validate_transaction_id(transaction_id)
+    if timeout != "10m":
+        raise AwgctlError("obfuscation activation timeout must be exactly 10m")
+    if deadline_at is None:
+        raise AwgctlError("obfuscation rollback deadline is required")
+    _transition_time(deadline_at, "deadline_at")
+    _arm_transition_timer(
+        transaction_id,
+        deadline_at=deadline_at,
+        recovery=False,
+    )
+
+
+def verify_transition_timeout(transaction_id: str, *, deadline_at: str) -> None:
+    _verify_transition_timer(
+        transaction_id,
+        deadline_at=deadline_at,
+        recovery=False,
+    )
 
 
 def cancel_transition_timeout(transaction_id: str) -> None:
-    _cancel_transition_units(
-        transition_unit_names(transaction_id),
-        label="automatic rollback timer",
-    )
+    _remove_transition_units(transaction_id, recovery=False)
 
 
 def cancel_transition_recovery(transaction_id: str) -> None:
-    _cancel_transition_units(
-        transition_recovery_unit_names(transaction_id),
-        label="activation recovery timer",
-    )
+    _remove_transition_units(transaction_id, recovery=True)
 
 
 def normalize_transition_outcome(value: Any) -> dict[str, Any]:
@@ -5641,7 +5883,7 @@ def normalize_transition_outcome(value: Any) -> dict[str, Any]:
         "rolled_back",
     }:
         raise AwgctlError("invalid obfuscation transition outcome")
-    reasons = {"confirmed", "operator", "timeout", "activation-failed"}
+    reasons = {"confirmed", "operator", "timeout", "activation-failed", "expiry"}
     if not isinstance(value["reason"], str) or value["reason"] not in reasons:
         raise AwgctlError("invalid obfuscation transition outcome reason")
     if (value["outcome"] == "confirmed") != (value["reason"] == "confirmed"):
@@ -5825,6 +6067,8 @@ def remove_current_transition(document: dict[str, Any]) -> None:
 def resume_transition_cleanup(
     document: dict[str, Any] | None,
     outcome: dict[str, Any],
+    *,
+    skip_recovery_cancel: bool = False,
 ) -> dict[str, Any]:
     outcome = normalize_transition_outcome(outcome)
     current = load_transition_document(required=False)
@@ -5845,7 +6089,8 @@ def resume_transition_cleanup(
         # transaction, and only then remove the contradictory current state.
         apply_confirmed_profile_updates(outcome)
         remove_transition_pending(current)
-        cancel_transition_recovery(outcome["transaction_id"])
+        if not skip_recovery_cancel:
+            cancel_transition_recovery(outcome["transaction_id"])
         remove_current_transition(current)
         return outcome
     if phase == "checkpoint":
@@ -5876,7 +6121,8 @@ def resume_transition_cleanup(
         )
         phase = "current"
     if phase == "current":
-        cancel_transition_recovery(outcome["transaction_id"])
+        if not skip_recovery_cancel:
+            cancel_transition_recovery(outcome["transaction_id"])
         outcome = update_transition_outcome_phase(
             outcome,
             expected="current",
@@ -5886,7 +6132,12 @@ def resume_transition_cleanup(
 
 
 def complete_transition_document(
-    document: dict[str, Any], *, outcome: str, reason: str, completed_at: str
+    document: dict[str, Any],
+    *,
+    outcome: str,
+    reason: str,
+    completed_at: str,
+    skip_recovery_cancel: bool = False,
 ) -> dict[str, Any]:
     checkpoint = begin_transition_outcome(
         document,
@@ -5894,7 +6145,11 @@ def complete_transition_document(
         reason=reason,
         completed_at=completed_at,
     )
-    return resume_transition_cleanup(document, checkpoint)
+    return resume_transition_cleanup(
+        document,
+        checkpoint,
+        skip_recovery_cancel=skip_recovery_cancel,
+    )
 
 
 def restore_obfuscation_backup(
@@ -6001,7 +6256,6 @@ def reconcile_transition_recovery_locked() -> None:
         resume_transition_cleanup(matching, outcome)
         outcome = load_transition_outcome()
         current = load_transition_document(required=False)
-
     journal = load_activation_journal()
     if journal is None:
         return
@@ -6062,14 +6316,18 @@ def _install_active_transition(
 ) -> dict[str, Any]:
     transaction_id = document["transaction_id"]
     created_at = document["prepared_at"]
-    write_activation_journal(transaction_id, phase="intent", created_at=created_at)
-    schedule_transition_recovery(transaction_id)
-    write_activation_journal(
-        transaction_id,
-        phase="recovery-armed",
-        created_at=created_at,
-    )
     try:
+        recovery_now = dt.datetime.now(dt.timezone.utc).replace(microsecond=0)
+        schedule_transition_recovery(
+            transaction_id,
+            deadline_at=_utc_z(recovery_now + dt.timedelta(minutes=10)),
+        )
+        write_activation_journal(transaction_id, phase="intent", created_at=created_at)
+        write_activation_journal(
+            transaction_id,
+            phase="recovery-armed",
+            created_at=created_at,
+        )
         install_pending_transition_snapshot(document, snapshot)
         verify_installed_transition_snapshot(document, snapshot)
         write_activation_journal(
@@ -6694,7 +6952,10 @@ def cmd_obfuscation_confirm(args: argparse.Namespace) -> int:
                     "to_revision": entry["current_revision"] + 1,
                 }
             )
-        schedule_transition_recovery(transaction_id)
+        schedule_transition_recovery(
+            transaction_id,
+            deadline_at=_utc_z(confirm_now + dt.timedelta(minutes=10)),
+        )
         cancel_transition_timeout(transaction_id)
         try:
             outcome = begin_transition_outcome(
@@ -6740,12 +7001,79 @@ def _emit_obfuscation_rollback(
 
 
 def _rollback_obfuscation_transition(
-    args: argparse.Namespace, *, reason: str, cancel_timer: bool
+    args: argparse.Namespace, *, reason: str
 ) -> int:
     transaction_id = validate_transaction_id(args.transaction_id)
+    origin: str | None = None
+    if reason == "timeout":
+        origin = getattr(args, "origin", None)
+        if origin not in {"recovery", "final"}:
+            raise AwgctlError("automatic rollback origin is invalid")
+
+    def ensure_cleanup_journal(*, created_at: str) -> None:
+        if origin is None:
+            return
+        journal = load_activation_journal()
+        if journal is None:
+            write_activation_journal(
+                transaction_id,
+                phase="recovery-armed" if origin == "recovery" else "final-armed",
+                created_at=created_at,
+            )
+            return
+        if journal["transaction_id"] != transaction_id:
+            raise AwgctlError(
+                "automatic rollback activation journal transaction changed"
+            )
+
+    def cleanup_units() -> None:
+        operations: list[tuple[Any, tuple[Any, ...], dict[str, Any]]]
+        if origin == "recovery":
+            operations = [
+                (cancel_transition_timeout, (transaction_id,), {}),
+                (
+                    _remove_originating_transition_units,
+                    (transaction_id,),
+                    {"recovery": True},
+                ),
+            ]
+        elif origin == "final":
+            operations = [
+                (cancel_transition_recovery, (transaction_id,), {}),
+                (
+                    _remove_originating_transition_units,
+                    (transaction_id,),
+                    {"recovery": False},
+                ),
+            ]
+        else:
+            operations = [
+                (cancel_transition_timeout, (transaction_id,), {}),
+                (cancel_transition_recovery, (transaction_id,), {}),
+            ]
+        errors: list[str] = []
+        for operation, positional, keywords in operations:
+            try:
+                operation(*positional, **keywords)
+            except Exception as exc:
+                errors.append(str(exc))
+        if errors:
+            raise AwgctlError(
+                "obfuscation rollback unit cleanup was incomplete: " + "; ".join(errors)
+            )
+        if origin is not None:
+            journal = load_activation_journal()
+            if journal is not None:
+                if journal["transaction_id"] != transaction_id:
+                    raise AwgctlError(
+                        "automatic rollback activation journal transaction changed"
+                    )
+                delete_activation_journal(transaction_id)
+
     with mutation_lock(
         timeout_seconds=5 if reason == "timeout" else None,
         transition_lifecycle=True,
+        skip_transition_recovery=reason == "timeout",
     ):
         current = load_transition_document(required=False)
         outcome = load_transition_outcome()
@@ -6755,7 +7083,19 @@ def _rollback_obfuscation_transition(
                 if current is not None and current["transaction_id"] == transaction_id
                 else None
             )
-            outcome = resume_transition_cleanup(matching, outcome)
+            ensure_cleanup_journal(
+                created_at=(
+                    matching["prepared_at"]
+                    if matching is not None
+                    else outcome["completed_at"]
+                )
+            )
+            outcome = resume_transition_cleanup(
+                matching,
+                outcome,
+                skip_recovery_cancel=origin == "recovery",
+            )
+            cleanup_units()
             return _emit_obfuscation_rollback(
                 args,
                 transaction_id=transaction_id,
@@ -6767,12 +7107,24 @@ def _rollback_obfuscation_transition(
             raise AwgctlError("unknown or stale obfuscation transaction ID")
         if current["transaction_id"] != transaction_id:
             raise AwgctlError("rollback transaction ID does not match the current transition")
-        rollback_now = dt.datetime.now(dt.timezone.utc)
-        if cancel_timer and current["state"] == "active":
+        if origin == "final" and current["state"] != "active":
+            raise AwgctlError("final rollback timer requires an active transition")
+        try:
+            ensure_cleanup_journal(created_at=current["prepared_at"])
+        except Exception as original:
+            interface = "awg0"
             with contextlib.suppress(AwgctlError):
-                cancel_transition_timeout(transaction_id)
-        with contextlib.suppress(AwgctlError):
-            cancel_transition_recovery(transaction_id)
+                interface = load_config()["interface"]
+            with contextlib.suppress(Exception):
+                service_action("stop", interface)
+            audit(
+                "automatic rollback checkpoint failed; interface stopped: "
+                f"id={transaction_id}"
+            )
+            raise AwgctlError(
+                "automatic rollback checkpoint could not be proven; interface stopped"
+            ) from original
+        rollback_now = dt.datetime.now(dt.timezone.utc)
         try:
             restore_obfuscation_backup(
                 current["backup_name"], current, now=rollback_now
@@ -6796,7 +7148,9 @@ def _rollback_obfuscation_transition(
                 outcome="rolled_back",
                 reason=reason,
                 completed_at=completed_at,
+                skip_recovery_cancel=origin == "recovery",
             )
+            cleanup_units()
         except Exception as original:
             interface = "awg0"
             with contextlib.suppress(AwgctlError):
@@ -6820,11 +7174,11 @@ def _rollback_obfuscation_transition(
 
 
 def cmd_obfuscation_rollback(args: argparse.Namespace) -> int:
-    return _rollback_obfuscation_transition(args, reason="operator", cancel_timer=True)
+    return _rollback_obfuscation_transition(args, reason="operator")
 
 
 def cmd_obfuscation_timeout(args: argparse.Namespace) -> int:
-    return _rollback_obfuscation_transition(args, reason="timeout", cancel_timer=False)
+    return _rollback_obfuscation_transition(args, reason="timeout")
 
 
 def server_client_consistency(
@@ -6966,11 +7320,21 @@ def cmd_expire_clients(args: argparse.Namespace) -> int:
             print("Due clients: " + (", ".join(data["due_clients"]) or "none"))
             print("No state was changed.")
         return 0
-    with mutation_lock():
+    with mutation_lock(transition_lifecycle=True):
+        transition = load_transition_document(required=False)
+        if transition is not None and transition["state"] == "active":
+            raise AwgctlError("client expiry is rejected during an active obfuscation transition")
         transaction_now = dt.datetime.now(dt.timezone.utc)
         clients = load_clients()
         selected = clients_requiring_expiry_reconciliation(clients, now=transaction_now)
         due = [client for client in selected if client.get("status", "active") == "active"]
+        if not selected:
+            data = {"expired_clients": [], "runtime_action": "none", "changed": False}
+            if getattr(args, "json", False):
+                print(json.dumps(json_envelope("client expire", data=data), indent=2, sort_keys=True))
+            else:
+                print("No clients are due for expiry.")
+            return 0
         try:
             generated = GENERATED_CONFIG.read_bytes()
             runtime = RUNTIME_CONFIG.read_bytes()
@@ -6979,13 +7343,6 @@ def cmd_expire_clients(args: argparse.Namespace) -> int:
         if runtime != generated:
             raise AwgctlError("manual runtime drift detected before client expiry")
         config = load_config()
-        if not selected:
-            data = {"expired_clients": [], "runtime_action": "none", "changed": False}
-            if getattr(args, "json", False):
-                print(json.dumps(json_envelope("client expire", data=data), indent=2, sort_keys=True))
-            else:
-                print("No clients are due for expiry.")
-            return 0
         clients = load_clients(include_secrets=True)
         selected = bind_expiry_records(selected, clients)
         due = [client for client in selected if client.get("status", "active") == "active"]
@@ -6998,6 +7355,13 @@ def cmd_expire_clients(args: argparse.Namespace) -> int:
             (CLIENTS / client["name"] / "metadata.json").read_bytes()
             for client in due
         }
+        if transition is not None:
+            complete_transition_document(
+                transition,
+                outcome="rolled_back",
+                reason="expiry",
+                completed_at=_utc_z(transaction_now),
+            )
         timestamp = transaction_now.isoformat()
         committed = False
         try:
@@ -8303,6 +8667,7 @@ def cmd_update(args: argparse.Namespace) -> int:
     manifest, artifact = fetch_verified_release(
         tag,
         expected_platform=platform_name,
+        expected_channel=args.channel,
         include_artifact=include_artifact,
     )
     latest = manifest["version"]
@@ -8658,6 +9023,11 @@ def build_parser(*, entrypoint: str = "public") -> argparse.ArgumentParser:
         expire.add_argument("--json", action="store_true")
         timeout = subcommands.add_parser("_obfuscation-timeout", help=argparse.SUPPRESS)
         timeout.add_argument("transaction_id", type=transaction_id_argument)
+        timeout.add_argument(
+            "--origin",
+            choices=("recovery", "final"),
+            required=True,
+        )
         return parser
 
     def output_flag(command: argparse.ArgumentParser) -> None:
@@ -8792,13 +9162,12 @@ def _requires_transition_interlock(args: argparse.Namespace) -> bool:
         return args.client_command in {
             "add",
             "edit",
-            "expire",
             "import",
             "qr",
             "revoke",
             "rotate",
         }
-    return args.command in {"_expire-clients", "_initialize-fresh", "_migrate-existing"}
+    return args.command in {"_initialize-fresh", "_migrate-existing"}
 
 
 def dispatch(args: argparse.Namespace) -> int:
@@ -8887,7 +9256,7 @@ def main(argv: Sequence[str] | None = None, *, entrypoint: str = "public") -> in
         PlatformError, ReleaseError, SelfTestError,
     ) as exc:
         audit(f"command failed: {args.command}")
-        public_error = sanitize_cps_text(str(exc))
+        public_error = redact_awg_config(str(exc))
         if getattr(args, "json", False):
             command = args.command
             for attribute in (

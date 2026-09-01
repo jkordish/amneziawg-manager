@@ -43,8 +43,10 @@ The zipapp copies the complete `awgctl` and `awginstall` packages, including
 AWG 3.1 contracts, redaction, self-test rendering, host timer rendering, and
 the internal dispatcher. The stable public selector and internal symlink both
 point at the signed artifact. Persistent client expiry uses installed static
-service/timer files; transaction-specific obfuscation rollback uses transient
-`systemd-run` units and therefore has no static unit file to package.
+service/timer files; transaction-specific obfuscation recovery and rollback
+render exact root-owned persistent units at runtime. They bind one transaction
+ID and origin, are not reusable packaged templates, and are removed after the
+terminal outcome.
 
 ## Serialized contracts
 

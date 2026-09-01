@@ -10,7 +10,7 @@ import subprocess
 import tempfile
 from collections.abc import Mapping, Sequence
 
-from .diagnostics import sanitize_cps_text
+from .diagnostics import redact_awg_config
 
 
 class SelfTestError(RuntimeError):
@@ -60,7 +60,7 @@ def _run(argv: Sequence[str], *, input_data: bytes | None = None, check: bool = 
         raise SelfTestError(f"could not run self-test command: {argv[0]}") from exc
     if check and result.returncode != 0:
         detail = result.stderr.decode("utf-8", "replace").strip().splitlines()
-        suffix = ": " + sanitize_cps_text(detail[-1]) if detail else ""
+        suffix = ": " + redact_awg_config(detail[-1]) if detail else ""
         raise SelfTestError(f"self-test command failed: {argv[0]}{suffix}")
     return result
 

@@ -29,6 +29,31 @@ def key(byte):
     return base64.b64encode(bytes([byte]) * 32).decode("ascii")
 
 
+def durable_systemd_runner(argv, **kwargs):
+    if argv[:3] == ["systemctl", "show", "--no-pager"]:
+        timer_text = (core.SYSTEMD_UNIT_DIR / argv[-1]).read_text()
+        deadline = next(
+            line.removeprefix("OnCalendar=")
+            for line in timer_text.splitlines()
+            if line.startswith("OnCalendar=")
+        )
+        epoch = int(core._transition_time(deadline, "deadline_at").timestamp())
+        return subprocess.CompletedProcess(
+            argv,
+            0,
+            (
+                "ActiveState=active\nUnitFileState=enabled\n"
+                f"NextElapseUSecRealtime=@{epoch}\n"
+            ).encode(),
+            b"",
+        )
+    if argv[:3] == ["systemctl", "is-active", "--quiet"]:
+        return subprocess.CompletedProcess(argv, 3, b"", b"")
+    if argv[:3] == ["systemctl", "is-enabled", "--quiet"]:
+        return subprocess.CompletedProcess(argv, 1, b"disabled\n", b"")
+    return subprocess.CompletedProcess(argv, 0, b"", b"")
+
+
 @contextlib.contextmanager
 def patched_layout(root):
     values = {
@@ -51,12 +76,14 @@ def patched_layout(root):
         "TRANSITION_OUTCOME_FILE": root / "transitions/obfuscation-outcome.json",
         "ACTIVATION_JOURNAL_FILE": root / "transitions/obfuscation-activation.json",
         "SERVICE_OPERATION_FILE": root / "run/awgctl/service-operation.json",
+        "SYSTEMD_UNIT_DIR": root / "systemd/system",
         "RUNTIME_CONFIG": root / "runtime/awg0.conf",
         "RUNTIME_DIR": root / "run/awgctl",
         "LOCK_FILE": root / "run/awgctl/mutation.lock",
     }
     with (
         mock.patch.multiple(core, **values),
+        mock.patch.object(core, "_systemd_unit_is_root_owned", return_value=True),
         mock.patch.object(
             core.socket,
             "if_nametoindex",
@@ -592,10 +619,18 @@ class ObfuscationGrammarTests(unittest.TestCase):
 
         internal = core.build_parser(entrypoint="internal")
         timeout = internal.parse_args(
-            ["_obfuscation-timeout", "0123456789abcdef0123456789abcdef"]
+            [
+                "_obfuscation-timeout",
+                "0123456789abcdef0123456789abcdef",
+                "--origin",
+                "final",
+            ]
         )
         self.assertEqual(timeout.command, "_obfuscation-timeout")
         self.assertEqual(timeout.transaction_id, "0123456789abcdef0123456789abcdef")
+        self.assertEqual(timeout.origin, "final")
+        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            internal.parse_args(["_obfuscation-timeout", TRANSACTION_ID])
         with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
             internal.parse_args(["obfuscation", "show"])
 
@@ -610,7 +645,9 @@ class ObfuscationGrammarTests(unittest.TestCase):
                     internal.parse_args(["_obfuscation-timeout", invalid])
 
         public_args = parser.parse_args(["obfuscation", "show"])
-        internal_args = internal.parse_args(["_obfuscation-timeout", TRANSACTION_ID])
+        internal_args = internal.parse_args(
+            ["_obfuscation-timeout", TRANSACTION_ID, "--origin", "recovery"]
+        )
         with (
             mock.patch.object(core, "require_root"),
             mock.patch.object(core, "cmd_obfuscation_show", return_value=27) as show,
@@ -627,6 +664,23 @@ class ObfuscationGrammarTests(unittest.TestCase):
 
 
 class MutationLockTests(unittest.TestCase):
+    def test_internal_timeout_can_defer_pre_yield_reconciliation_to_origin_aware_handler(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with (
+                patched_layout(pathlib.Path(directory)),
+                mock.patch.object(core, "require_root"),
+                mock.patch.object(
+                    core,
+                    "reconcile_transition_recovery_locked",
+                    side_effect=AssertionError("timeout origin must reconcile in its handler"),
+                ),
+            ):
+                with core.mutation_lock(
+                    transition_lifecycle=True,
+                    skip_transition_recovery=True,
+                ):
+                    self.assertTrue(core.mutation_lock_is_held())
+
     def test_mutation_lock_creates_one_protected_runtime_inode(self):
         with tempfile.TemporaryDirectory() as directory:
             with patched_layout(pathlib.Path(directory)), mock.patch.object(core, "require_root"):
@@ -1993,11 +2047,9 @@ class TransitionInterlockTests(unittest.TestCase):
             (["client", "revoke", "kat-iphone", "--dry-run"], "cmd_client_revoke"),
             (["client", "rotate", "kat-iphone", "--dry-run"], "cmd_client_rotate"),
             (["client", "qr", "kat-iphone", "--dry-run"], "cmd_client_qr"),
-            (["client", "expire", "--dry-run"], "cmd_client_expire"),
         )
         internal_cases = (
             (["_firewall", "up"], "cmd_firewall"),
-            (["_expire-clients", "--dry-run"], "cmd_expire_clients"),
             (
                 [
                     "_initialize-fresh",
@@ -2823,6 +2875,8 @@ class ObfuscationActivateTests(unittest.TestCase):
                 self.assertLess(events.index("reservation-released"), events.index("reloaded"))
                 self.assertLess(events.index("postcondition"), events.index("handshake-floor"))
                 self.assertLess(events.index("postcondition"), events.index("counter-floor"))
+                self.assertLess(events.index("recovery-armed"), events.index("journal:intent"))
+                self.assertLess(events.index("recovery-armed"), events.index("commit-entered"))
                 self.assertLess(events.index("final-scheduled"), events.index("final-verified"))
                 self.assertLess(events.index("final-verified"), events.index("recovery-cancelled"))
                 self.assertEqual(active["pre_handshake"], 1_777_891_200)
@@ -2939,6 +2993,7 @@ class ObfuscationActivateTests(unittest.TestCase):
             "show",
             "--no-pager",
             "--property=ActiveState",
+            "--property=UnitFileState",
             "--property=NextElapseUSecRealtime",
             "--timestamp=unix",
             f"awgctl-obfuscation-rollback-{TRANSACTION_ID}.timer",
@@ -2946,58 +3001,248 @@ class ObfuscationActivateTests(unittest.TestCase):
         valid = subprocess.CompletedProcess(
             expected_argv,
             0,
-            b"ActiveState=active\nNextElapseUSecRealtime=@1788257460\n",
+            b"ActiveState=active\nUnitFileState=enabled\nNextElapseUSecRealtime=@1788257460\n",
             b"",
         )
-        with mock.patch.object(core, "run", return_value=valid) as runner:
-            core.verify_transition_timeout(
+        deadline = "2026-09-01T10:11:00Z"
+        with tempfile.TemporaryDirectory() as directory:
+            unit_dir = pathlib.Path(directory) / "systemd"
+            (timer_name, service_name), (timer_text, service_text) = core._transition_unit_text(
                 TRANSACTION_ID,
-                deadline_at="2026-09-01T10:11:00Z",
+                deadline_at=deadline,
+                recovery=False,
             )
-        runner.assert_called_once_with(expected_argv, check=False, timeout=15)
+            core.atomic_write(unit_dir / timer_name, timer_text, 0o644)
+            core.atomic_write(unit_dir / service_name, service_text, 0o644)
+            with (
+                mock.patch.object(core, "SYSTEMD_UNIT_DIR", unit_dir),
+                mock.patch.object(core, "_systemd_unit_is_root_owned", return_value=True),
+                mock.patch.object(core, "run", return_value=valid) as runner,
+            ):
+                core.verify_transition_timeout(
+                    TRANSACTION_ID,
+                    deadline_at=deadline,
+                )
+            runner.assert_called_once_with(expected_argv, check=False, timeout=15)
 
-        invalid_outputs = (
-            b"ActiveState=inactive\nNextElapseUSecRealtime=@1788257460\n",
-            b"ActiveState=active\nNextElapseUSecRealtime=@1788257461\n",
-            b"ActiveState=active\nNextElapseUSecRealtime=n/a\n",
-            b"ActiveState=active\nUnexpected=value\n",
-        )
-        for output in invalid_outputs:
-            with self.subTest(output=output), mock.patch.object(
-                core,
-                "run",
-                return_value=subprocess.CompletedProcess(expected_argv, 0, output, b""),
+            invalid_outputs = (
+                b"ActiveState=inactive\nUnitFileState=enabled\nNextElapseUSecRealtime=@1788257460\n",
+                b"ActiveState=active\nUnitFileState=disabled\nNextElapseUSecRealtime=@1788257460\n",
+                b"ActiveState=active\nUnitFileState=enabled\nNextElapseUSecRealtime=@1788257461\n",
+                b"ActiveState=active\nUnitFileState=enabled\nNextElapseUSecRealtime=n/a\n",
+                b"ActiveState=active\nUnitFileState=enabled\nUnexpected=value\n",
+            )
+            for output in invalid_outputs:
+                with (
+                    self.subTest(output=output),
+                    mock.patch.object(core, "SYSTEMD_UNIT_DIR", unit_dir),
+                    mock.patch.object(core, "_systemd_unit_is_root_owned", return_value=True),
+                    mock.patch.object(
+                        core,
+                        "run",
+                        return_value=subprocess.CompletedProcess(
+                            expected_argv, 0, output, b""
+                        ),
+                    ),
+                ):
+                    with self.assertRaisesRegex(core.AwgctlError, "rollback timer.*verified"):
+                        core.verify_transition_timeout(
+                            TRANSACTION_ID,
+                            deadline_at=deadline,
+                        )
+
+            with (
+                mock.patch.object(core, "SYSTEMD_UNIT_DIR", unit_dir),
+                mock.patch.object(core, "_systemd_unit_is_root_owned", return_value=True),
+                mock.patch.object(
+                    core,
+                    "run",
+                    side_effect=core.AwgctlError(
+                        "systemctl query disclosed an internal detail"
+                    ),
+                ),
             ):
                 with self.assertRaisesRegex(core.AwgctlError, "rollback timer.*verified"):
                     core.verify_transition_timeout(
                         TRANSACTION_ID,
-                        deadline_at="2026-09-01T10:11:00Z",
+                        deadline_at=deadline,
                     )
 
-        with mock.patch.object(
-            core,
-            "run",
-            return_value=subprocess.CompletedProcess(expected_argv, 1, b"", b"query failed"),
-        ):
-            with self.assertRaisesRegex(core.AwgctlError, "rollback timer.*verified"):
-                core.verify_transition_timeout(
-                    TRANSACTION_ID,
-                    deadline_at="2026-09-01T10:11:00Z",
+    def test_recovery_and_final_timers_are_reboot_durable_and_exactly_bound(self):
+        deadline = "2026-09-01T10:11:00Z"
+        deadline_epoch = int(
+            dt.datetime(2026, 9, 1, 10, 11, tzinfo=dt.timezone.utc).timestamp()
+        )
+
+        def runner(argv, **kwargs):
+            if argv[:3] == ["systemctl", "show", "--no-pager"]:
+                return subprocess.CompletedProcess(
+                    argv,
+                    0,
+                    (
+                        "ActiveState=active\n"
+                        "UnitFileState=enabled\n"
+                        f"NextElapseUSecRealtime=@{deadline_epoch}\n"
+                    ).encode(),
+                    b"",
                 )
-        with mock.patch.object(
-            core,
-            "run",
-            side_effect=core.AwgctlError("systemctl query disclosed an internal detail"),
-        ):
-            with self.assertRaisesRegex(
-                core.AwgctlError,
-                "^automatic rollback timer could not be verified$",
+            return subprocess.CompletedProcess(argv, 0, b"", b"")
+
+        with tempfile.TemporaryDirectory() as directory:
+            unit_dir = pathlib.Path(directory) / "systemd"
+            with (
+                mock.patch.object(core, "SYSTEMD_UNIT_DIR", unit_dir, create=True),
+                mock.patch.object(
+                    core,
+                    "INTERNAL_ENTRYPOINT",
+                    pathlib.Path("/opt/amneziawg/libexec/awgctl-internal"),
+                ),
+                mock.patch.object(core, "run", side_effect=runner) as command,
+                mock.patch.object(core, "_systemd_unit_is_root_owned", return_value=True),
             ):
-                core.verify_transition_timeout(
+                core.schedule_transition_recovery(
                     TRANSACTION_ID,
-                    deadline_at="2026-09-01T10:11:00Z",
+                    deadline_at=deadline,
+                )
+                core.schedule_transition_timeout(
+                    TRANSACTION_ID,
+                    "10m",
+                    deadline_at=deadline,
                 )
 
+            for kind in ("recovery", "rollback"):
+                base = f"awgctl-obfuscation-{kind}-{TRANSACTION_ID}"
+                service = unit_dir / f"{base}.service"
+                timer = unit_dir / f"{base}.timer"
+                self.assertEqual(service.stat().st_mode & 0o777, 0o644)
+                self.assertEqual(timer.stat().st_mode & 0o777, 0o644)
+                service_text = service.read_text()
+                timer_text = timer.read_text()
+                self.assertIn(
+                    "ExecStart=/opt/amneziawg/libexec/awgctl-internal "
+                    f"_obfuscation-timeout {TRANSACTION_ID} --origin "
+                    f"{'recovery' if kind == 'recovery' else 'final'}",
+                    service_text,
+                )
+                self.assertNotIn("%i", service_text)
+                self.assertIn(f"OnCalendar={deadline}", timer_text)
+                self.assertIn("Persistent=true", timer_text)
+                self.assertIn("AccuracySec=1s", timer_text)
+                self.assertIn(f"Unit={base}.service", timer_text)
+
+            commands = [call.args[0] for call in command.call_args_list]
+            self.assertFalse(any(argv[0] == "systemd-run" for argv in commands))
+            for kind in ("recovery", "rollback"):
+                timer = f"awgctl-obfuscation-{kind}-{TRANSACTION_ID}.timer"
+                self.assertIn(["systemctl", "enable", timer], commands)
+                self.assertIn(["systemctl", "restart", timer], commands)
+
+    def test_durable_unit_proof_requires_literal_root_ownership(self):
+        self.assertTrue(
+            core._systemd_unit_is_root_owned(mock.Mock(st_uid=0, st_gid=0))
+        )
+        for uid, gid in ((1000, 0), (0, 1000), (1000, 1000)):
+            with self.subTest(uid=uid, gid=gid):
+                self.assertFalse(
+                    core._systemd_unit_is_root_owned(
+                        mock.Mock(st_uid=uid, st_gid=gid)
+                    )
+                )
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = pathlib.Path(directory) / "unit.service"
+            path.write_text("exact\n")
+            path.chmod(0o644)
+            with (
+                mock.patch.object(
+                    core,
+                    "_systemd_unit_is_root_owned",
+                    return_value=False,
+                ),
+                self.assertRaisesRegex(core.AwgctlError, "unit file is unsafe"),
+            ):
+                core._verify_transition_unit_file(path, "exact\n")
+
+    def test_durable_timer_arming_failure_compensates_unit_files(self):
+        deadline = "2026-09-01T10:11:00Z"
+        calls = []
+
+        def runner(argv, **kwargs):
+            calls.append(list(argv))
+            if argv[:2] == ["systemctl", "restart"]:
+                raise core.AwgctlError("injected timer activation failure")
+            if argv[:3] == ["systemctl", "is-active", "--quiet"]:
+                return subprocess.CompletedProcess(argv, 3, b"", b"")
+            if argv[:3] == ["systemctl", "is-enabled", "--quiet"]:
+                return subprocess.CompletedProcess(argv, 1, b"disabled\n", b"")
+            return subprocess.CompletedProcess(argv, 0, b"", b"")
+
+        with tempfile.TemporaryDirectory() as directory:
+            unit_dir = pathlib.Path(directory) / "systemd"
+            with (
+                mock.patch.object(core, "SYSTEMD_UNIT_DIR", unit_dir, create=True),
+                mock.patch.object(core, "run", side_effect=runner),
+                mock.patch.object(core, "_systemd_unit_is_root_owned", return_value=True),
+                self.assertRaisesRegex(core.AwgctlError, "could not be armed"),
+            ):
+                core.schedule_transition_timeout(
+                    TRANSACTION_ID,
+                    "10m",
+                    deadline_at=deadline,
+                )
+
+            self.assertEqual(list(unit_dir.glob("*")), [])
+            timer = f"awgctl-obfuscation-rollback-{TRANSACTION_ID}.timer"
+            self.assertIn(["systemctl", "disable", "--now", timer], calls)
+            self.assertGreaterEqual(calls.count(["systemctl", "daemon-reload"]), 2)
+
+    def test_timer_proof_rejects_tampered_transaction_service_content(self):
+        deadline = "2026-09-01T10:11:00Z"
+        deadline_epoch = int(
+            dt.datetime(2026, 9, 1, 10, 11, tzinfo=dt.timezone.utc).timestamp()
+        )
+
+        def runner(argv, **kwargs):
+            if argv[:3] == ["systemctl", "show", "--no-pager"]:
+                return subprocess.CompletedProcess(
+                    argv,
+                    0,
+                    (
+                        "ActiveState=active\nUnitFileState=enabled\n"
+                        f"NextElapseUSecRealtime=@{deadline_epoch}\n"
+                    ).encode(),
+                    b"",
+                )
+            return subprocess.CompletedProcess(argv, 0, b"", b"")
+
+        with tempfile.TemporaryDirectory() as directory:
+            unit_dir = pathlib.Path(directory) / "systemd"
+            with (
+                mock.patch.object(core, "SYSTEMD_UNIT_DIR", unit_dir, create=True),
+                mock.patch.object(core, "run", side_effect=runner),
+                mock.patch.object(core, "_systemd_unit_is_root_owned", return_value=True),
+            ):
+                core.schedule_transition_timeout(
+                    TRANSACTION_ID,
+                    "10m",
+                    deadline_at=deadline,
+                )
+                service = unit_dir / (
+                    f"awgctl-obfuscation-rollback-{TRANSACTION_ID}.service"
+                )
+                service.write_text(
+                    "[Service]\nExecStart=/opt/amneziawg/libexec/awgctl-internal "
+                    f"_obfuscation-timeout {'f' * 32}\n"
+                )
+                service.chmod(0o644)
+                with self.assertRaisesRegex(
+                    core.AwgctlError,
+                    "rollback timer.*verified",
+                ):
+                    core.verify_transition_timeout(
+                        TRANSACTION_ID,
+                        deadline_at=deadline,
+                    )
     def test_final_timer_scheduling_at_deadline_keeps_recovery_armed(self):
         scheduled = False
 
@@ -3302,19 +3547,7 @@ class ObfuscationActivateTests(unittest.TestCase):
 
                 def runner(argv, **kwargs):
                     run_calls.append((list(argv), kwargs))
-                    if argv[:2] == ["systemctl", "show"]:
-                        return subprocess.CompletedProcess(
-                            argv,
-                            0,
-                            b"ActiveState=active\nNextElapseUSecRealtime=@1788257460\n",
-                            b"",
-                        )
-                    return subprocess.CompletedProcess(
-                        argv,
-                        3 if argv[:3] == ["systemctl", "is-active", "--quiet"] else 0,
-                        b"",
-                        b"",
-                    )
+                    return durable_systemd_runner(argv, **kwargs)
 
                 patches = [
                     mock.patch.object(core.dt, "datetime", ActivationClock),
@@ -3365,7 +3598,7 @@ class ObfuscationActivateTests(unittest.TestCase):
                         self.fail(f"activation is incomplete: {exc}")
 
                 self.assertEqual(result, 0)
-                self.assertEqual(ActivationClock.calls, 7)
+                self.assertEqual(ActivationClock.calls, 8)
                 self.assertEqual(reloads, ["reload"])
                 active = core.load_transition_document()
                 self.assertEqual(active["state"], "active")
@@ -3378,35 +3611,16 @@ class ObfuscationActivateTests(unittest.TestCase):
                     (core.CLIENTS / "kat-iphone/kat-iphone.conf").read_text(), profile
                 )
                 self.assertEqual(metadata_path.read_bytes(), metadata_before)
-                self.assertEqual(
-                    run_calls[0][0],
-                    [
-                        "systemd-run",
-                        "--quiet",
-                        "--collect",
-                        "--unit",
-                        f"awgctl-obfuscation-recovery-{TRANSACTION_ID}",
-                        "--on-active=10m",
-                        str(core.INTERNAL_ENTRYPOINT),
-                        "_obfuscation-timeout",
-                        TRANSACTION_ID,
-                    ],
+                systemd_commands = [call[0] for call in run_calls]
+                self.assertFalse(any(call[0] == "systemd-run" for call in systemd_commands))
+                for kind in ("recovery", "rollback"):
+                    timer = f"awgctl-obfuscation-{kind}-{TRANSACTION_ID}.timer"
+                    self.assertIn(["systemctl", "enable", timer], systemd_commands)
+                    self.assertIn(["systemctl", "restart", timer], systemd_commands)
+                final_service = core.SYSTEMD_UNIT_DIR / (
+                    f"awgctl-obfuscation-rollback-{TRANSACTION_ID}.service"
                 )
-                self.assertEqual(
-                    run_calls[1][0],
-                    [
-                        "systemd-run",
-                        "--quiet",
-                        "--collect",
-                        "--unit",
-                        f"awgctl-obfuscation-rollback-{TRANSACTION_ID}",
-                        "--timer-property=AccuracySec=1s",
-                        "--on-calendar=2026-09-01T10:11:00Z",
-                        str(core.INTERNAL_ENTRYPOINT),
-                        "_obfuscation-timeout",
-                        TRANSACTION_ID,
-                    ],
-                )
+                self.assertIn("--origin final", final_service.read_text())
                 payload = json.loads(output.getvalue())
                 self.assertEqual(payload["data"]["deadline_at"], "2026-09-01T10:11:00Z")
                 self.assertNotIn(key(3), json.dumps(payload))
@@ -3440,27 +3654,16 @@ class ObfuscationActivateTests(unittest.TestCase):
 
                 def runner(argv, **kwargs):
                     systemd_calls.append(list(argv))
-                    if argv[0] == "systemd-run":
-                        if any(
-                            item == f"awgctl-obfuscation-recovery-{TRANSACTION_ID}"
-                            for item in argv
-                        ):
+                    if argv[:2] == ["systemctl", "restart"]:
+                        if "obfuscation-recovery" in argv[-1]:
                             recovery_events.append("recovery-armed")
-                            return subprocess.CompletedProcess(argv, 0, b"", b"")
-                        if any(
-                            item == f"awgctl-obfuscation-rollback-{TRANSACTION_ID}"
-                            for item in argv
-                        ):
+                        elif "obfuscation-rollback" in argv[-1]:
                             recovery_events.append("final-timer-failed")
                             raise core.AwgctlError("timer creation failed")
-                        raise AssertionError(f"unexpected transient unit: {argv}")
-                    if argv[:2] == ["systemctl", "stop"]:
-                        if any("obfuscation-recovery" in item for item in argv):
+                    if argv[:3] == ["systemctl", "disable", "--now"]:
+                        if "obfuscation-recovery" in argv[-1]:
                             recovery_events.append("recovery-cancelled")
-                        return subprocess.CompletedProcess(argv, 0, b"", b"")
-                    if argv[:3] == ["systemctl", "is-active", "--quiet"]:
-                        return subprocess.CompletedProcess(argv, 3, b"", b"")
-                    raise AssertionError(f"unexpected command: {argv}")
+                    return durable_systemd_runner(argv, **kwargs)
 
                 def restore(backup_name, expected_document, *, now):
                     recovery_events.append("classic-restored")
@@ -3679,6 +3882,34 @@ class ObfuscationConfirmTests(unittest.TestCase):
             core.reconcile_transition_recovery_locked()
         resume.assert_not_called()
 
+    def test_complete_outcome_without_cleanup_journal_does_not_probe_old_units(self):
+        outcome = core.normalize_transition_outcome(
+            {
+                "schema_version": 1,
+                "transaction_id": TRANSACTION_ID,
+                "outcome": "rolled_back",
+                "reason": "timeout",
+                "completed_at": "2026-09-01T10:02:00Z",
+                "client_name": "kat-iphone",
+                "profile_name": "russia-ios-v1",
+                "old_port": 55323,
+                "new_port": 4242,
+                "cleanup_phase": "complete",
+                "profile_updates": [],
+            }
+        )
+        with (
+            mock.patch.object(core, "load_transition_outcome", return_value=outcome),
+            mock.patch.object(core, "load_transition_document", return_value=None),
+            mock.patch.object(core, "load_activation_journal", return_value=None),
+            mock.patch.object(core, "cancel_transition_timeout") as cancel_final,
+            mock.patch.object(core, "cancel_transition_recovery") as cancel_recovery,
+        ):
+            core.reconcile_transition_recovery_locked()
+
+        cancel_final.assert_not_called()
+        cancel_recovery.assert_not_called()
+
     def test_terminal_cleanup_resumes_after_each_authoritative_checkpoint_boundary(self):
         boundaries = (
             "after-outcome",
@@ -3819,13 +4050,7 @@ class ObfuscationConfirmTests(unittest.TestCase):
 
                 def runner(argv, **kwargs):
                     systemd_calls.append(list(argv))
-                    if argv[0] == "systemd-run":
-                        return subprocess.CompletedProcess(argv, 0, b"", b"")
-                    if argv[:2] == ["systemctl", "stop"]:
-                        return subprocess.CompletedProcess(argv, 0, b"", b"")
-                    if argv[:3] == ["systemctl", "is-active", "--quiet"]:
-                        return subprocess.CompletedProcess(argv, 3, b"", b"")
-                    raise AssertionError(f"unexpected command: {argv}")
+                    return durable_systemd_runner(argv, **kwargs)
 
                 with (
                     mock.patch.object(core.dt, "datetime", ConfirmClock),
@@ -3967,12 +4192,233 @@ class ObfuscationRollbackTests(unittest.TestCase):
         ):
             with self.assertRaisesRegex(core.AwgctlError, "lock.*timeout"):
                 core.cmd_obfuscation_timeout(
-                    argparse.Namespace(transaction_id=TRANSACTION_ID, json=False)
+                    argparse.Namespace(
+                        transaction_id=TRANSACTION_ID,
+                        origin="recovery",
+                        json=False,
+                    )
                 )
         self.assertEqual(
             seen,
-            [{"timeout_seconds": 5, "transition_lifecycle": True}],
+            [
+                {
+                    "timeout_seconds": 5,
+                    "transition_lifecycle": True,
+                    "skip_transition_recovery": True,
+                }
+            ],
         )
+
+    def test_timer_fired_cleanup_never_stops_its_own_service_and_removes_both_pairs(self):
+        cases = (
+            ("recovery", "prepared", True),
+            ("final", "active", False),
+        )
+        for origin, state, skip_recovery in cases:
+            events = []
+            current = {
+                "transaction_id": TRANSACTION_ID,
+                "state": state,
+                "backup_name": "backup",
+                "prepared_at": "2026-09-01T10:00:00Z",
+            }
+            args = argparse.Namespace(
+                transaction_id=TRANSACTION_ID,
+                origin=origin,
+                json=True,
+            )
+
+            def complete(*args, **kwargs):
+                events.append(("complete", kwargs["skip_recovery_cancel"]))
+
+            with (
+                self.subTest(origin=origin),
+                mock.patch.object(core, "mutation_lock", return_value=contextlib.nullcontext()),
+                mock.patch.object(core, "load_transition_document", return_value=current),
+                mock.patch.object(core, "load_transition_outcome", return_value=None),
+                mock.patch.object(
+                    core,
+                    "load_activation_journal",
+                    return_value={
+                        "transaction_id": TRANSACTION_ID,
+                        "phase": "recovery-armed" if origin == "recovery" else "final-armed",
+                        "created_at": current["prepared_at"],
+                    },
+                ),
+                mock.patch.object(
+                    core,
+                    "delete_activation_journal",
+                    side_effect=lambda *a: events.append(("journal", "deleted")),
+                ),
+                mock.patch.object(
+                    core,
+                    "restore_obfuscation_backup",
+                    side_effect=lambda *a, **k: events.append(("restore", origin)),
+                ),
+                mock.patch.object(core, "complete_transition_document", side_effect=complete),
+                mock.patch.object(
+                    core,
+                    "cancel_transition_timeout",
+                    side_effect=lambda *a: events.append(("external", "final")),
+                ),
+                mock.patch.object(
+                    core,
+                    "cancel_transition_recovery",
+                    side_effect=lambda *a: events.append(("external", "recovery")),
+                ),
+                mock.patch.object(
+                    core,
+                    "_remove_originating_transition_units",
+                    side_effect=lambda *a, **k: events.append(
+                        ("origin-safe", "recovery" if k["recovery"] else "final")
+                    ),
+                    create=True,
+                ),
+                mock.patch.object(core, "audit"),
+                contextlib.redirect_stdout(io.StringIO()),
+            ):
+                self.assertEqual(core.cmd_obfuscation_timeout(args), 0)
+
+            self.assertEqual(events[0], ("restore", origin))
+            self.assertIn(("complete", skip_recovery), events)
+            other = "final" if origin == "recovery" else "recovery"
+            self.assertIn(("external", other), events)
+            self.assertIn(("origin-safe", origin), events)
+            self.assertNotIn(("external", origin), events)
+            self.assertIn(("journal", "deleted"), events)
+
+    def test_final_timer_recreates_cleanup_journal_before_restoring(self):
+        events = []
+        current = {
+            "transaction_id": TRANSACTION_ID,
+            "state": "active",
+            "backup_name": "backup",
+            "prepared_at": "2026-09-01T10:00:00Z",
+        }
+        marker = {
+            "transaction_id": TRANSACTION_ID,
+            "phase": "final-armed",
+            "created_at": current["prepared_at"],
+        }
+        args = argparse.Namespace(
+            transaction_id=TRANSACTION_ID,
+            origin="final",
+            json=True,
+        )
+
+        with (
+            mock.patch.object(core, "mutation_lock", return_value=contextlib.nullcontext()),
+            mock.patch.object(core, "load_transition_document", return_value=current),
+            mock.patch.object(core, "load_transition_outcome", return_value=None),
+            mock.patch.object(
+                core,
+                "load_activation_journal",
+                side_effect=[None, marker],
+            ),
+            mock.patch.object(
+                core,
+                "write_activation_journal",
+                side_effect=lambda *a, **k: events.append(("journal", k["phase"])),
+            ) as write_journal,
+            mock.patch.object(
+                core,
+                "delete_activation_journal",
+                side_effect=lambda *a: events.append(("journal", "deleted")),
+            ),
+            mock.patch.object(
+                core,
+                "restore_obfuscation_backup",
+                side_effect=lambda *a, **k: events.append(("restore", "final")),
+            ),
+            mock.patch.object(core, "complete_transition_document"),
+            mock.patch.object(core, "cancel_transition_recovery"),
+            mock.patch.object(core, "_remove_originating_transition_units"),
+            mock.patch.object(core, "audit"),
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+            self.assertEqual(core.cmd_obfuscation_timeout(args), 0)
+
+        write_journal.assert_called_once_with(
+            TRANSACTION_ID,
+            phase="final-armed",
+            created_at=current["prepared_at"],
+        )
+        self.assertLess(
+            events.index(("journal", "final-armed")),
+            events.index(("restore", "final")),
+        )
+        self.assertIn(("journal", "deleted"), events)
+
+    def test_timer_checkpoint_failure_stops_interface_before_restore(self):
+        current = {
+            "transaction_id": TRANSACTION_ID,
+            "state": "active",
+            "backup_name": "backup",
+            "prepared_at": "2026-09-01T10:00:00Z",
+        }
+        args = argparse.Namespace(
+            transaction_id=TRANSACTION_ID,
+            origin="final",
+            json=True,
+        )
+        with (
+            mock.patch.object(core, "mutation_lock", return_value=contextlib.nullcontext()),
+            mock.patch.object(core, "load_transition_document", return_value=current),
+            mock.patch.object(core, "load_transition_outcome", return_value=None),
+            mock.patch.object(core, "load_activation_journal", return_value=None),
+            mock.patch.object(
+                core,
+                "write_activation_journal",
+                side_effect=core.AwgctlError("injected checkpoint failure"),
+            ),
+            mock.patch.object(core, "load_config", return_value={"interface": "awg0"}),
+            mock.patch.object(core, "service_action") as service_action,
+            mock.patch.object(
+                core,
+                "restore_obfuscation_backup",
+                side_effect=AssertionError("restore must not run without its checkpoint"),
+            ),
+            mock.patch.object(core, "audit"),
+            self.assertRaisesRegex(core.AwgctlError, "checkpoint.*interface stopped"),
+        ):
+            core.cmd_obfuscation_timeout(args)
+
+        service_action.assert_called_once_with("stop", "awg0")
+
+    def test_originating_unit_removal_never_stops_or_probes_running_service(self):
+        for recovery in (True, False):
+            commands = []
+
+            def runner(argv, **kwargs):
+                commands.append(list(argv))
+                return durable_systemd_runner(argv, **kwargs)
+
+            with self.subTest(recovery=recovery), tempfile.TemporaryDirectory() as directory:
+                unit_dir = pathlib.Path(directory) / "systemd"
+                units = (
+                    core.transition_recovery_unit_names(TRANSACTION_ID)
+                    if recovery
+                    else core.transition_unit_names(TRANSACTION_ID)
+                )
+                for unit in units:
+                    core.atomic_write(unit_dir / unit, "placeholder\n", 0o644)
+                with (
+                    mock.patch.object(core, "SYSTEMD_UNIT_DIR", unit_dir),
+                    mock.patch.object(core, "run", side_effect=runner),
+                ):
+                    core._remove_originating_transition_units(
+                        TRANSACTION_ID,
+                        recovery=recovery,
+                    )
+
+                timer, service = units
+                self.assertIn(["systemctl", "disable", timer], commands)
+                self.assertIn(["systemctl", "stop", timer], commands)
+                self.assertFalse(
+                    any(service in command for command in commands),
+                    "the currently running service must never be stopped or probed",
+                )
+                self.assertEqual(list(unit_dir.glob("*")), [])
 
     def test_real_transaction_backup_restore_uses_captured_snapshot_and_proves_classic_state(self):
         now = dt.datetime(2026, 9, 1, 10, 3, tzinfo=dt.timezone.utc)
@@ -4026,11 +4472,7 @@ class ObfuscationRollbackTests(unittest.TestCase):
                     restore_times.append(now)
 
                 def runner(argv, **kwargs):
-                    if argv[:2] == ["systemctl", "stop"]:
-                        return subprocess.CompletedProcess(argv, 0, b"", b"")
-                    if argv[:3] == ["systemctl", "is-active", "--quiet"]:
-                        return subprocess.CompletedProcess(argv, 3, b"", b"")
-                    raise AssertionError(f"unexpected command: {argv}")
+                    return durable_systemd_runner(argv, **kwargs)
 
                 with (
                     mock.patch.object(core.dt, "datetime", RollbackClock),
@@ -4093,11 +4535,7 @@ class ObfuscationRollbackTests(unittest.TestCase):
                     )
 
                 def runner(argv, **kwargs):
-                    if argv[:2] == ["systemctl", "stop"]:
-                        return subprocess.CompletedProcess(argv, 0, b"", b"")
-                    if argv[:3] == ["systemctl", "is-active", "--quiet"]:
-                        return subprocess.CompletedProcess(argv, 3, b"", b"")
-                    raise AssertionError(f"unexpected command: {argv}")
+                    return durable_systemd_runner(argv, **kwargs)
 
                 with (
                     mock.patch.object(core.dt, "datetime", RollbackClock),
@@ -4132,6 +4570,7 @@ class ObfuscationRollbackTests(unittest.TestCase):
     def test_stale_timeout_id_never_rolls_back_a_later_active_transaction(self):
         args = argparse.Namespace(
             transaction_id="fedcba9876543210fedcba9876543210",
+            origin="final",
             json=False,
         )
         with tempfile.TemporaryDirectory() as directory:

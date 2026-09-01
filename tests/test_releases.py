@@ -5,6 +5,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 
 REPO_ROOT = pathlib.Path(__file__).parents[1]
@@ -13,6 +14,7 @@ sys.path.insert(0, str(REPO_ROOT / "src"))
 from awgctl.releases import (
     RELEASE_PUBLIC_KEY,
     ReleaseError,
+    discover_release_tag,
     parse_manifest,
     verify_artifact,
     verify_ssh_signature,
@@ -62,12 +64,18 @@ class ReleaseVerificationTests(unittest.TestCase):
     def test_committed_and_embedded_release_public_keys_match(self):
         self.assertEqual((REPO_ROOT / "release-signing-key.pub").read_text().strip(), RELEASE_PUBLIC_KEY)
 
-    def manifest(self, artifact: bytes = b"zipapp") -> bytes:
+    def manifest(
+        self,
+        artifact: bytes = b"zipapp",
+        *,
+        version: str = "0.1.0-beta.1",
+        channel: str = "beta",
+    ) -> bytes:
         value = {
             "schema_version": 1,
-            "version": "0.1.0-beta.1",
-            "tag": "v0.1.0-beta.1",
-            "channel": "beta",
+            "version": version,
+            "tag": f"v{version}",
+            "channel": channel,
             "platform": "ubuntu-24.04-amd64",
             "installation_schema_version": 1,
             "artifact": {
@@ -77,6 +85,33 @@ class ReleaseVerificationTests(unittest.TestCase):
             },
         }
         return (json.dumps(value, sort_keys=True) + "\n").encode()
+
+    def test_stable_discovery_does_not_trust_false_github_prerelease_metadata(self):
+        releases = [
+            {"draft": False, "prerelease": False, "tag_name": "v0.2.0-beta.1"},
+            {"draft": False, "prerelease": False, "tag_name": "v0.1.0"},
+        ]
+        with mock.patch(
+            "awgctl.releases.fetch_bytes",
+            return_value=json.dumps(releases).encode(),
+        ):
+            self.assertEqual(discover_release_tag(channel="stable"), "v0.1.0")
+
+    def test_signed_manifest_channel_and_tag_prerelease_must_match_request(self):
+        cases = (
+            ("stable", "0.1.0-beta.1", "stable"),
+            ("stable", "0.1.0", "beta"),
+            ("beta", "0.1.0", "beta"),
+            ("beta", "0.1.0-beta.1", "stable"),
+        )
+        for requested, version, signed in cases:
+            with self.subTest(requested=requested, version=version, signed=signed):
+                with self.assertRaisesRegex(ReleaseError, "channel"):
+                    parse_manifest(
+                        self.manifest(version=version, channel=signed),
+                        expected_platform="ubuntu-24.04-amd64",
+                        expected_channel=requested,
+                    )
 
     def test_manifest_and_artifact_must_match_platform_version_size_and_hash(self):
         artifact = b"zipapp"

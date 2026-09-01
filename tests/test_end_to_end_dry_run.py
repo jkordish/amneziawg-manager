@@ -288,38 +288,59 @@ class RepositoryDryRunAcceptanceTests(unittest.TestCase):
         self.assertGreaterEqual(reservation.release.call_count, 1)
 
     def test_timeout_rollback_uses_exact_internal_entrypoint_and_deadline(self):
-        runner = mock.Mock(
-            return_value=subprocess.CompletedProcess(["systemd-run"], 0, b"", b"")
+        deadline = "2026-09-01T10:11:00Z"
+        epoch = int(
+            dt.datetime(2026, 9, 1, 10, 11, tzinfo=dt.timezone.utc).timestamp()
         )
-        with (
-            mock.patch.object(core, "run", runner),
-            mock.patch.object(
-                core,
-                "INTERNAL_ENTRYPOINT",
-                pathlib.Path("/opt/amneziawg/libexec/awgctl-internal"),
-            ),
-        ):
-            core.schedule_transition_timeout(
-                TRANSACTION_ID,
-                "10m",
-                deadline_at="2026-09-01T10:11:00Z",
-            )
 
-        self.assertEqual(
-            runner.call_args.args[0],
-            [
-                "systemd-run",
-                "--quiet",
-                "--collect",
-                "--unit",
-                f"awgctl-obfuscation-rollback-{TRANSACTION_ID}",
-                "--timer-property=AccuracySec=1s",
-                "--on-calendar=2026-09-01T10:11:00Z",
-                "/opt/amneziawg/libexec/awgctl-internal",
-                "_obfuscation-timeout",
-                TRANSACTION_ID,
-            ],
-        )
+        def run_systemd(argv, **kwargs):
+            if argv[:3] == ["systemctl", "show", "--no-pager"]:
+                return subprocess.CompletedProcess(
+                    argv,
+                    0,
+                    (
+                        "ActiveState=active\nUnitFileState=enabled\n"
+                        f"NextElapseUSecRealtime=@{epoch}\n"
+                    ).encode(),
+                    b"",
+                )
+            return subprocess.CompletedProcess(argv, 0, b"", b"")
+
+        with tempfile.TemporaryDirectory() as directory:
+            unit_dir = pathlib.Path(directory) / "systemd"
+            with (
+                mock.patch.object(core, "run", side_effect=run_systemd) as runner,
+                mock.patch.object(core, "SYSTEMD_UNIT_DIR", unit_dir),
+                mock.patch.object(
+                    core,
+                    "INTERNAL_ENTRYPOINT",
+                    pathlib.Path("/opt/amneziawg/libexec/awgctl-internal"),
+                ),
+                mock.patch.object(
+                    core,
+                    "_systemd_unit_is_root_owned",
+                    return_value=True,
+                ),
+            ):
+                core.schedule_transition_timeout(
+                    TRANSACTION_ID,
+                    "10m",
+                    deadline_at=deadline,
+                )
+
+            base = f"awgctl-obfuscation-rollback-{TRANSACTION_ID}"
+            service = (unit_dir / f"{base}.service").read_text()
+            timer = (unit_dir / f"{base}.timer").read_text()
+            self.assertIn(
+                f"_obfuscation-timeout {TRANSACTION_ID} --origin final",
+                service,
+            )
+            self.assertIn(f"OnCalendar={deadline}", timer)
+            self.assertIn("Persistent=true", timer)
+            commands = [call.args[0] for call in runner.call_args_list]
+            self.assertIn(["systemctl", "enable", f"{base}.timer"], commands)
+            self.assertIn(["systemctl", "restart", f"{base}.timer"], commands)
+            self.assertFalse(any(command[0] == "systemd-run" for command in commands))
 
     def test_confirmation_rejects_a_fresh_handshake_without_transfer_data(self):
         now = dt.datetime.now(dt.timezone.utc).replace(microsecond=0)

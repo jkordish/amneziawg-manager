@@ -94,9 +94,12 @@ Activation directly replaces classic with AWG 3.1 on the same interface after
 the operator attests the new ingress rule. A protected recovery journal is
 armed before artifact installation. The manager reloads and proves the exact
 configuration, captures a fresh handshake and RX/TX floor, and creates an
-absolute-deadline transient systemd rollback unit. Classic and AWG 3.1 are
-never live together. Confirmation requires a post-activation handshake plus
-both counters increasing; failure or timeout restores the bound classic backup.
+absolute-deadline, root-owned persistent systemd rollback pair bound to the
+transaction ID. `Persistent=true` preserves the deadline across reboot, while
+exact unit content, enabled state, active state, and next-elapse time are all
+verified. Classic and AWG 3.1 are never live together. Confirmation requires a
+post-activation handshake plus both counters increasing; failure or timeout
+restores the bound classic backup.
 
 ## Transactions and audit
 
@@ -139,4 +142,5 @@ module before sandboxing, protects host filesystems/home/devices/kernel
 interfaces, and retains the address families needed by awg-quick. The installer
 validates and rolls back manager-owned host files on failure. It also installs
 a persistent daily client-expiry service/timer. Obfuscation rollback units are
-transaction-specific transient units, not reusable static service files.
+transaction-specific persistent files created and removed by the locked
+transition lifecycle, not reusable templates.
