@@ -183,6 +183,34 @@ class UpgradeTests(unittest.TestCase):
         self.assertEqual(settings.default_dns, ("1.1.1.2", "1.0.0.2"))
         self.assertEqual(settings.ingress_boundary, "equivalent-external-firewall")
 
+    def test_install_configure_and_check_cli_boundary_overrides_persisted_setting(self):
+        from awginstall import cli
+        from awginstall.settings import resolve_installation_settings
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory) / "opt/amneziawg"
+            persisted = root / "config/installation.json"
+            persisted.parent.mkdir(parents=True)
+            persisted.write_text(json.dumps(
+                resolve_installation_settings(
+                    sudo_user=None, overrides={"ingress_boundary": "lightsail"}
+                ).to_dict()
+            ))
+            for command in ("install", "configure", "check"):
+                argv = [
+                    command,
+                    "--ingress-boundary",
+                    "equivalent-external-firewall",
+                ]
+                if command == "install":
+                    argv.extend(["--settings", str(persisted), "--endpoint", "vpn.example.com"])
+                args = cli.build_parser().parse_args(argv)
+                with self.subTest(command=command):
+                    settings = cli._resolved_settings(args, root=root)
+                    self.assertEqual(
+                        settings.ingress_boundary, "equivalent-external-firewall"
+                    )
+
     def test_upgrade_persists_legacy_missing_ingress_override_before_new_health(self):
         from awginstall import cli
         from awginstall.settings import resolve_installation_settings

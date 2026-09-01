@@ -34,6 +34,12 @@ class InstallationSettingsTests(unittest.TestCase):
                 sudo_user=None,
                 overrides={"ingress_boundary": "inferred-aws"},
             )
+        for malformed in (False, 7, 2.5, [], {}, ["lightsail"]):
+            with self.subTest(malformed=malformed), self.assertRaises(SettingsError):
+                resolve_installation_settings(
+                    sudo_user=None,
+                    overrides={"ingress_boundary": malformed},
+                )
 
     def test_defaults_create_separate_staging_and_operator_identities(self):
         from awginstall.settings import resolve_installation_settings
@@ -321,6 +327,107 @@ class IdentityPlanTests(unittest.TestCase):
 
 
 class HostConfigurationTests(unittest.TestCase):
+    def test_outer_rollback_restores_exact_prior_expiry_timer_states(self):
+        from awginstall.host import HostPaths, configure_host, rollback_host_configuration
+        from awginstall.identity import IdentitySnapshot, UserRecord
+        from awginstall.settings import resolve_installation_settings
+
+        snapshot = IdentitySnapshot(users={}, groups={}, locked_users=set(), supplementary_groups={})
+        cases = (
+            ("preexisting-disabled", True, False, False),
+            ("enabled-inactive", True, True, False),
+            ("active", True, True, True),
+            ("new-timer", False, False, False),
+        )
+        for label, file_exists, enabled, active in cases:
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as directory:
+                root = pathlib.Path(directory)
+                paths = HostPaths.under(root)
+                if file_exists:
+                    paths.expiry_timer.parent.mkdir(parents=True)
+                    paths.expiry_timer.write_text("prior timer\n")
+                commands = []
+
+                def runner(argv):
+                    command = tuple(argv)
+                    commands.append(command)
+                    if command[:3] == ("systemctl", "is-enabled", "--quiet"):
+                        return subprocess.CompletedProcess(argv, 0 if enabled else (1 if file_exists else 4), b"", b"")
+                    if command[:3] == ("systemctl", "is-active", "--quiet"):
+                        return subprocess.CompletedProcess(argv, 0 if active else (3 if file_exists else 4), b"", b"")
+                    return subprocess.CompletedProcess(argv, 0, b"", b"")
+
+                settings = resolve_installation_settings(sudo_user=None)
+                with (
+                    mock.patch("awginstall.host._resolve_created_user", return_value=UserRecord(
+                        "awgctl", os.getuid(), os.getgid(), str(settings.staging_root), "/usr/sbin/nologin"
+                    )),
+                    mock.patch("awginstall.host._prepare_staging_root"),
+                ):
+                    report = configure_host(
+                        settings,
+                        product_root=root / "opt/amneziawg",
+                        paths=paths,
+                        allow_existing=False,
+                        dry_run=False,
+                        snapshot=snapshot,
+                        runner=runner,
+                    )
+                    rollback_host_configuration(report, runner=runner)
+
+                final_reload = max(
+                    index for index, command in enumerate(commands)
+                    if command == ("systemctl", "daemon-reload")
+                )
+                restoration = commands[final_reload + 1:]
+                expected_enabled = "enable" if enabled else "disable"
+                expected_active = "start" if active else "stop"
+                self.assertIn(
+                    ("systemctl", expected_enabled, "amneziawg-client-expiry.timer"),
+                    restoration,
+                )
+                self.assertIn(
+                    ("systemctl", expected_active, "amneziawg-client-expiry.timer"),
+                    restoration,
+                )
+                if file_exists:
+                    self.assertEqual(paths.expiry_timer.read_text(), "prior timer\n")
+                else:
+                    self.assertFalse(paths.expiry_timer.exists())
+
+    def test_unknown_expiry_timer_query_state_fails_closed_before_host_writes(self):
+        from awginstall.host import HostConfigurationError, HostPaths, configure_host
+        from awginstall.identity import IdentitySnapshot
+        from awginstall.settings import resolve_installation_settings
+
+        snapshot = IdentitySnapshot(users={}, groups={}, locked_users=set(), supplementary_groups={})
+
+        for failing_query, expected in (
+            ("is-enabled", "timer enabled state"),
+            ("is-active", "timer active state"),
+        ):
+            def runner(argv):
+                if tuple(argv[0:2]) == ("systemctl", failing_query):
+                    return subprocess.CompletedProcess(argv, 2, b"", b"query failed")
+                return subprocess.CompletedProcess(argv, 0, b"", b"")
+
+            with self.subTest(failing_query=failing_query), tempfile.TemporaryDirectory() as directory:
+                root = pathlib.Path(directory)
+                with (
+                    mock.patch("awginstall.host._prepare_staging_root"),
+                    self.assertRaisesRegex(HostConfigurationError, expected),
+                ):
+                    configure_host(
+                        resolve_installation_settings(sudo_user=None),
+                        product_root=root / "opt/amneziawg",
+                        paths=HostPaths.under(root),
+                        allow_existing=False,
+                        dry_run=False,
+                        snapshot=snapshot,
+                        runner=runner,
+                    )
+                self.assertFalse((root / "etc").exists())
+
     def test_successful_configuration_report_can_be_compensated_by_outer_transaction(self):
         from awginstall.host import HostPaths, configure_host, rollback_host_configuration
         from awginstall.identity import IdentitySnapshot, UserRecord
@@ -427,7 +534,9 @@ class HostConfigurationTests(unittest.TestCase):
                 f"ExecStart={root / 'opt/amneziawg/libexec/awgctl-internal'} _expire-clients",
                 expiry_service.read_text(),
             )
-            self.assertIn("OnCalendar=daily", expiry_timer.read_text())
+            timer_text = expiry_timer.read_text()
+            self.assertIn("OnCalendar=*-*-* 00:00:00 UTC", timer_text)
+            self.assertNotIn("RandomizedDelaySec", timer_text)
         self.assertTrue(any(command[0] == "visudo" for command in commands))
         self.assertTrue(any(command[:2] == ("systemd-analyze", "verify") for command in commands))
         self.assertIn(("systemctl", "daemon-reload"), commands)

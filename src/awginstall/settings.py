@@ -212,9 +212,9 @@ def resolve_installation_settings(
         raise SettingsError("unsupported sudo policy")
     if values["systemd_hardening"] not in {"conservative", "off"}:
         raise SettingsError("unsupported systemd hardening policy")
-    if (
-        values["ingress_boundary"] is not None
-        and values["ingress_boundary"] not in INGRESS_BOUNDARIES
+    if values["ingress_boundary"] is not None and (
+        not isinstance(values["ingress_boundary"], str)
+        or values["ingress_boundary"] not in INGRESS_BOUNDARIES
     ):
         raise SettingsError(
             "network.ingress_boundary must be lightsail or equivalent-external-firewall"
