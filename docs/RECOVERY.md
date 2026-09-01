@@ -74,7 +74,11 @@ replaces it with an absolute-deadline ten-minute rollback timer. A reload,
 verification, or timer-construction failure restores classic state
 synchronously. Both recovery and final rollback are root-owned, enabled,
 transaction-specific service/timer pairs under `/etc/systemd/system`; their
-absolute `OnCalendar` deadline and `Persistent=true` behavior survive reboot.
+absolute systemd-native UTC `OnCalendar` deadline and `Persistent=true`
+behavior survive reboot. Both timeout services retry failures after five
+seconds without a start-rate cutoff, so global-lock contention cannot consume
+the one-shot rollback. Activation retains the recovery deadline and restores
+classic if activation, final timer proof, or recovery cancellation reaches it.
 Each service binds both the transaction ID and its recovery/final origin to the
 root-only internal timeout command. Repeating rollback for the matching
 completed transaction is idempotent; another or stale ID is rejected.

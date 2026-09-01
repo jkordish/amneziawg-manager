@@ -1143,7 +1143,12 @@ class CpsDisclosureTests(unittest.TestCase):
                 self.assertIn("[redacted]", public)
 
     def test_native_selftest_and_public_errors_redact_all_awg_key_directives(self):
-        directives = ("PrivateKey", "PresharedKey", "HeaderProtectionKey")
+        directives = (
+            "PrivateKey",
+            "PublicKey",
+            "PresharedKey",
+            "HeaderProtectionKey",
+        )
         for index, directive in enumerate(directives, start=1):
             secret = key(20 + index)
             native_error = f"native parser rejected {directive} = {secret} at line 9"

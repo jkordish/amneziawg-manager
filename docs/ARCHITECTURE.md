@@ -97,9 +97,11 @@ configuration, captures a fresh handshake and RX/TX floor, and creates an
 absolute-deadline, root-owned persistent systemd rollback pair bound to the
 transaction ID. `Persistent=true` preserves the deadline across reboot, while
 exact unit content, enabled state, active state, and next-elapse time are all
-verified. Classic and AWG 3.1 are never live together. Confirmation requires a
-post-activation handshake plus both counters increasing; failure or timeout
-restores the bound classic backup.
+verified. The recovery and final services retry bounded lock contention without
+a start-rate cutoff, and activation restores classic rather than crossing its
+retained recovery deadline. Classic and AWG 3.1 are never live together.
+Confirmation requires a post-activation handshake plus both counters
+increasing; failure or timeout restores the bound classic backup.
 
 ## Transactions and audit
 
