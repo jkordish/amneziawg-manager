@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
+import argparse
 import base64
+import contextlib
+import io
 import ipaddress
 import os
 import pathlib
@@ -14,6 +17,11 @@ BUILD_ROOT = pathlib.Path(__file__).parents[1]
 sys.path.insert(0, str(BUILD_ROOT / "src"))
 
 from awgctl import core as awgctl
+
+
+class TtyStringIO(io.StringIO):
+    def isatty(self):
+        return True
 
 
 def key(byte: int) -> str:
@@ -39,6 +47,213 @@ class ValidationTests(unittest.TestCase):
     def test_endpoint_accepts_hostname_and_ipv4(self):
         self.assertEqual(awgctl.validate_endpoint("vpn.example.com"), "vpn.example.com")
         self.assertEqual(awgctl.validate_endpoint("54.185.178.74"), "54.185.178.74")
+
+
+class ClientAddWizardTests(unittest.TestCase):
+    def test_confirmed_wizard_collects_profile_creation_arguments(self):
+        answers = io.StringIO("Kat\niPhone\n\n2027-09-01\nyes\n")
+        output = io.StringIO()
+
+        values = awgctl.collect_client_add_wizard(answers, output)
+
+        self.assertEqual(values, {
+            "client_name": "kat-iphone",
+            "owner": "Kat",
+            "device": "iPhone",
+            "expires": "2027-09-01",
+        })
+        review = output.getvalue()
+        self.assertIn("Review profile", review)
+        self.assertIn("Name:    kat-iphone", review)
+        self.assertIn("reload the AmneziaWG server configuration", review)
+
+    def test_invalid_profile_name_is_corrected_without_restarting_wizard(self):
+        answers = io.StringIO("Kat\niPhone\n../shared\nkat-iphone\n\ny\n")
+        output = io.StringIO()
+
+        values = awgctl.collect_client_add_wizard(answers, output)
+
+        self.assertEqual(values["client_name"], "kat-iphone")
+        self.assertIn("Use 1-32 letters, numbers, underscores, or hyphens", output.getvalue())
+
+    def test_required_recipient_fields_are_corrected_at_their_prompts(self):
+        answers = io.StringIO(f"\nKat\n{'x' * 65}\niPhone\n\n\ny\n")
+        output = io.StringIO()
+
+        values = awgctl.collect_client_add_wizard(answers, output)
+
+        self.assertEqual(values["owner"], "Kat")
+        self.assertEqual(values["device"], "iPhone")
+        self.assertIn("Owner is required", output.getvalue())
+        self.assertIn("Device must be 1-64 printable characters", output.getvalue())
+
+    def test_invalid_expiration_is_corrected_before_review(self):
+        answers = io.StringIO("Kat\niPhone\n\n31-08-2027\n2027-09-01\ny\n")
+        output = io.StringIO()
+
+        values = awgctl.collect_client_add_wizard(answers, output)
+
+        self.assertEqual(values["expires"], "2027-09-01")
+        self.assertIn("Enter a date as YYYY-MM-DD", output.getvalue())
+
+    def test_declined_confirmation_cancels_without_error(self):
+        answers = io.StringIO("Kat\niPhone\n\n\nn\n")
+        output = io.StringIO()
+
+        values = awgctl.collect_client_add_wizard(answers, output)
+
+        self.assertIsNone(values)
+        self.assertIn("Cancelled. No changes were made.", output.getvalue())
+
+    def test_end_of_input_cancels_instead_of_repeating_prompts(self):
+        class OneShotEndOfInput(io.StringIO):
+            def readline(self, *args, **kwargs):
+                if self.tell() > 0:
+                    raise AssertionError("wizard read again after end of input")
+                self.seek(1)
+                return ""
+
+        output = io.StringIO()
+
+        values = awgctl.collect_client_add_wizard(OneShotEndOfInput(" "), output)
+
+        self.assertIsNone(values)
+        self.assertIn("Cancelled. No changes were made.", output.getvalue())
+
+    def test_missing_name_requires_an_interactive_terminal_before_mutation(self):
+        args = argparse.Namespace(
+            client_name=None,
+            owner=None,
+            device=None,
+            expires=None,
+            dry_run=False,
+            json=False,
+        )
+        with (
+            mock.patch.object(awgctl.sys, "stdin", io.StringIO()),
+            mock.patch.object(awgctl.sys, "stdout", io.StringIO()),
+            mock.patch.object(awgctl, "mutation_lock", side_effect=AssertionError("must not mutate")),
+        ):
+            with self.assertRaisesRegex(awgctl.AwgctlError, "interactive terminal"):
+                awgctl.cmd_client_add(args)
+
+    def test_json_mode_requires_explicit_name_without_prompting(self):
+        args = argparse.Namespace(
+            client_name=None,
+            owner=None,
+            device=None,
+            expires=None,
+            dry_run=False,
+            json=True,
+        )
+        answers = TtyStringIO("Kat\niPhone\n\n\ny\n")
+        with (
+            mock.patch.object(awgctl.sys, "stdin", answers),
+            mock.patch.object(awgctl.sys, "stdout", TtyStringIO()),
+            mock.patch.object(awgctl, "mutation_lock", side_effect=AssertionError("must not mutate")),
+        ):
+            with self.assertRaisesRegex(awgctl.AwgctlError, "--json requires NAME"):
+                awgctl.cmd_client_add(args)
+        self.assertEqual(answers.tell(), 0)
+
+    def test_confirmed_wizard_enters_existing_client_add_dry_run(self):
+        args = argparse.Namespace(
+            client_name=None,
+            owner=None,
+            device=None,
+            expires=None,
+            dry_run=True,
+            json=False,
+        )
+        answers = TtyStringIO("Kat\niPhone\n\n2027-09-01\ny\n")
+        output = TtyStringIO()
+        config = {
+            "subnet": "10.77.42.0/24",
+            "server_address": "10.77.42.1/24",
+            "interface": "awg0",
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            with (
+                mock.patch.object(awgctl.sys, "stdin", answers),
+                mock.patch.object(awgctl.sys, "stdout", output),
+                mock.patch.object(awgctl, "CLIENTS", pathlib.Path(directory) / "clients"),
+                mock.patch.object(awgctl, "CLIENT_KEYS", pathlib.Path(directory) / "keys"),
+                mock.patch.object(awgctl, "mutation_lock", return_value=contextlib.nullcontext()),
+                mock.patch.object(awgctl, "ensure_no_drift"),
+                mock.patch.object(awgctl, "load_config", return_value=config),
+                mock.patch.object(awgctl, "load_clients", return_value=[]),
+                mock.patch.object(awgctl, "generate_key_material", side_effect=AssertionError("must not generate")),
+                mock.patch.object(awgctl, "create_backup", side_effect=AssertionError("must not back up")),
+            ):
+                result = awgctl.cmd_client_add(args)
+
+        self.assertEqual(result, 0)
+        self.assertEqual(args.client_name, "kat-iphone")
+        self.assertIn("Review profile", output.getvalue())
+        self.assertIn("Dry run: create client kat-iphone", output.getvalue())
+        self.assertIn("address: 10.77.42.2", output.getvalue())
+
+    def test_dry_run_review_describes_a_non_mutating_preview(self):
+        answers = io.StringIO("Kat\niPhone\n\n\ny\n")
+        output = io.StringIO()
+
+        values = awgctl.collect_client_add_wizard(answers, output, dry_run=True)
+
+        self.assertEqual(values["client_name"], "kat-iphone")
+        self.assertIn(
+            "No credentials, backups, files, or service reloads will be created.",
+            output.getvalue(),
+        )
+
+    def test_completed_wizard_prints_secure_delivery_commands(self):
+        args = argparse.Namespace(
+            client_name=None,
+            owner=None,
+            device=None,
+            expires=None,
+            dry_run=False,
+            json=False,
+        )
+        answers = TtyStringIO("Kat\niPhone\n\n\ny\n")
+        output = TtyStringIO()
+        config = {
+            "subnet": "10.77.42.0/24",
+            "server_address": "10.77.42.1/24",
+            "interface": "awg0",
+            "use_psk": True,
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            with (
+                mock.patch.object(awgctl.sys, "stdin", answers),
+                mock.patch.object(awgctl.sys, "stdout", output),
+                mock.patch.object(awgctl, "CLIENTS", root / "clients"),
+                mock.patch.object(awgctl, "CLIENT_KEYS", root / "keys"),
+                mock.patch.object(awgctl, "mutation_lock", return_value=contextlib.nullcontext()),
+                mock.patch.object(awgctl, "ensure_no_drift"),
+                mock.patch.object(awgctl, "load_config", return_value=config),
+                mock.patch.object(awgctl, "load_clients", side_effect=[[], [{"name": "kat-iphone"}]]),
+                mock.patch.object(awgctl, "create_backup", return_value=root / "backups" / "before.tar"),
+                mock.patch.object(awgctl, "generate_key_material", return_value=("private", "public", "psk")),
+                mock.patch.object(awgctl, "write_client_state"),
+                mock.patch.object(awgctl, "server_private_key", return_value="server-private"),
+                mock.patch.object(awgctl, "render_server_config", return_value="server-config"),
+                mock.patch.object(awgctl, "commit_server_config", return_value=True),
+                mock.patch.object(awgctl, "verify_peer_state"),
+                mock.patch.object(awgctl, "audit"),
+            ):
+                result = awgctl.cmd_client_add(args)
+
+        self.assertEqual(result, 0)
+        self.assertIn("Next steps:", output.getvalue())
+        self.assertIn(
+            "sudo awgctl client export kat-iphone --output /home/OPERATOR/kat-iphone.conf",
+            output.getvalue(),
+        )
+        self.assertIn(
+            "sudo awgctl client qr kat-iphone --output /home/OPERATOR/kat-iphone.png",
+            output.getvalue(),
+        )
 
 
 class StateTests(unittest.TestCase):
@@ -151,6 +366,7 @@ class OperationalContractTests(unittest.TestCase):
     def test_cli_parser_supports_requested_simple_grammar(self):
         parser = awgctl.build_parser()
         self.assertEqual(parser.parse_args(["client", "add", "kat-iphone"]).client_name, "kat-iphone")
+        self.assertIsNone(parser.parse_args(["client", "add"]).client_name)
         export = parser.parse_args(["client", "export", "kat", "--output", "/tmp/kat.conf"])
         self.assertEqual(export.output, pathlib.Path("/tmp/kat.conf"))
         qr = parser.parse_args(["client", "qr", "kat", "--output", "/secure/kat.png"])

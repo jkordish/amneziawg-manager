@@ -26,7 +26,7 @@ import sys
 import tempfile
 import time
 import urllib.request
-from typing import Any, Iterable, Iterator, Sequence
+from typing import Any, Iterable, Iterator, Sequence, TextIO
 
 from .backups import BackupError, create_manifest as create_backup_manifest, verify_backup
 from .contracts import (
@@ -244,6 +244,148 @@ def validate_client_name(name: str) -> str:
     if not CLIENT_NAME_RE.fullmatch(name):
         raise AwgctlError("client name must match [A-Za-z0-9][A-Za-z0-9_-]{0,31}")
     return name
+
+
+def _wizard_prompt(input_stream: TextIO, output_stream: TextIO, prompt: str) -> str:
+    output_stream.write(prompt)
+    output_stream.flush()
+    value = input_stream.readline()
+    if value == "":
+        raise EOFError
+    return value.strip()
+
+
+def suggest_client_name(owner: str, device: str) -> str:
+    suggestion = re.sub(r"[^a-z0-9]+", "-", f"{owner}-{device}".lower()).strip("-")
+    return suggestion[:32].rstrip("-")
+
+
+def _wizard_metadata(owner: str, device: str, expires: str | None) -> dict[str, Any]:
+    return normalize_client_metadata({
+        "schema_version": 3,
+        "management": "managed",
+        "owner": owner,
+        "device": device,
+        "expires": expires,
+        "profile_revision": 1,
+        "profile_generated_at": "2000-01-01T00:00:00Z",
+        "profile_change_reason": "created",
+        "distribution_status": "pending",
+        "distributed_at": None,
+    })
+
+
+def _prompt_required_profile_field(
+    input_stream: TextIO,
+    output_stream: TextIO,
+    field: str,
+) -> str:
+    label = field.title()
+    while True:
+        value = _wizard_prompt(input_stream, output_stream, f"{label}: ")
+        if not value:
+            output_stream.write(f"{label} is required.\n")
+            continue
+        try:
+            metadata = _wizard_metadata(
+                value if field == "owner" else "recipient",
+                value if field == "device" else "device",
+                None,
+            )
+        except ContractError:
+            output_stream.write(f"{label} must be 1-64 printable characters.\n")
+            continue
+        return metadata[field]
+
+
+def _prompt_profile_expiration(
+    input_stream: TextIO,
+    output_stream: TextIO,
+    *,
+    owner: str,
+    device: str,
+) -> str | None:
+    while True:
+        value = _wizard_prompt(
+            input_stream,
+            output_stream,
+            "Expiration date (YYYY-MM-DD, optional): ",
+        ) or None
+        try:
+            metadata = _wizard_metadata(owner, device, value)
+        except ContractError:
+            output_stream.write("Enter a date as YYYY-MM-DD, or leave it blank for no expiration.\n")
+            continue
+        return metadata["expires"]
+
+
+def collect_client_add_wizard(
+    input_stream: TextIO,
+    output_stream: TextIO,
+    *,
+    dry_run: bool = False,
+) -> dict[str, str | None] | None:
+    try:
+        return _collect_client_add_wizard(input_stream, output_stream, dry_run=dry_run)
+    except EOFError:
+        output_stream.write("\nCancelled. No changes were made.\n")
+        return None
+
+
+def _collect_client_add_wizard(
+    input_stream: TextIO,
+    output_stream: TextIO,
+    *,
+    dry_run: bool,
+) -> dict[str, str | None] | None:
+    output_stream.write("Add a new client profile\n\n")
+    owner = _prompt_required_profile_field(input_stream, output_stream, "owner")
+    device = _prompt_required_profile_field(input_stream, output_stream, "device")
+    suggested_name = suggest_client_name(owner, device)
+    name_prompt = f"Profile name [{suggested_name}]: "
+    while True:
+        name = _wizard_prompt(input_stream, output_stream, name_prompt) or suggested_name
+        try:
+            validate_client_name(name)
+            break
+        except AwgctlError:
+            output_stream.write(
+                "Use 1-32 letters, numbers, underscores, or hyphens; "
+                "begin with a letter or number.\n"
+            )
+            name_prompt = "Profile name: "
+    expires = _prompt_profile_expiration(
+        input_stream,
+        output_stream,
+        owner=owner,
+        device=device,
+    )
+
+    action_description = (
+        "This preview will validate profile creation and allocate the next available address.\n"
+        "No credentials, backups, files, or service reloads will be created.\n"
+        if dry_run
+        else (
+            "Creating this profile will generate unique credentials and reload "
+            "the AmneziaWG server configuration.\n"
+        )
+    )
+    output_stream.write(
+        "\nReview profile\n"
+        f"  Name:    {name}\n"
+        f"  Owner:   {owner}\n"
+        f"  Device:  {device}\n"
+        f"  Expires: {expires or 'never'}\n\n"
+        f"{action_description}"
+    )
+    confirmation_prompt = (
+        "Run this preview? [y/N]: " if dry_run else "Create this profile? [y/N]: "
+    )
+    confirmed = _wizard_prompt(input_stream, output_stream, confirmation_prompt).lower()
+    if confirmed not in {"y", "yes"}:
+        output_stream.write("Cancelled. No changes were made.\n")
+        return None
+    return {"client_name": name, "owner": owner, "device": device, "expires": expires}
 
 
 def validate_endpoint(value: str) -> str:
@@ -1861,6 +2003,20 @@ def cmd_client_show(args: argparse.Namespace) -> int:
 
 
 def cmd_client_add(args: argparse.Namespace) -> int:
+    if args.client_name is None and getattr(args, "json", False):
+        raise AwgctlError("client add --json requires NAME")
+    if args.client_name is None and (not sys.stdin.isatty() or not sys.stdout.isatty()):
+        raise AwgctlError("client add without NAME requires an interactive terminal")
+    if args.client_name is None:
+        values = collect_client_add_wizard(
+            sys.stdin,
+            sys.stdout,
+            dry_run=getattr(args, "dry_run", False),
+        )
+        if values is None:
+            return 0
+        for field, value in values.items():
+            setattr(args, field, value)
     name = validate_client_name(args.client_name)
     with mutation_lock():
         ensure_no_drift()
@@ -1964,6 +2120,13 @@ def cmd_client_add(args: argparse.Namespace) -> int:
             print(f"QR: {data['qr']}")
             print(f"Pre-change backup: {backup}")
             print("Server configuration reloaded successfully." if active else "Server configuration installed; service is stopped.")
+            print("Next steps:")
+            print(f"  sudo awgctl client export {name} --output /home/OPERATOR/{name}.conf")
+            print(f"  sudo awgctl client qr {name} --output /home/OPERATOR/{name}.png")
+            print(
+                "Replace OPERATOR with the invoking operator's home directory "
+                "and use one delivery format."
+            )
     return 0
 
 
@@ -3289,7 +3452,15 @@ def build_parser(*, entrypoint: str = "public") -> argparse.ArgumentParser:
     output_flag(client_commands.add_parser("list"))
     for name in ("add", "show", "qr", "revoke", "rotate"):
         command = client_commands.add_parser(name)
-        command.add_argument("client_name", metavar="NAME")
+        if name == "add":
+            command.add_argument(
+                "client_name",
+                metavar="NAME",
+                nargs="?",
+                help="profile name; omit it to start the interactive wizard",
+            )
+        else:
+            command.add_argument("client_name", metavar="NAME")
         output_flag(command)
         if name != "show":
             dry_run_flag(command)

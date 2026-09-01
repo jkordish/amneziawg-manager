@@ -5,6 +5,8 @@ versioning while preserving explicit beta labels for unqualified host paths.
 
 ## 0.1.0-beta.4 - 2026-09-01
 
+- Add an interactive, validation-first client profile wizard with a final
+  review, safe cancellation, dry-run support, and secure delivery guidance.
 - Preserve installed privilege settings during upgrades unless an operator
   explicitly overrides them.
 - Reject undeclared operator-group members so local authorization cannot drift

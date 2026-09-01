@@ -41,6 +41,22 @@ stopping install/remove only the VPN-owned nftables state.
 
 ## Client lifecycle
 
+For guided profile creation, run:
+
+```bash
+sudo awgctl client add
+```
+
+The wizard requires an interactive terminal. It collects the intended owner
+and physical device, suggests a profile name, accepts an optional `YYYY-MM-DD`
+expiration date, and displays a review before making changes. Canceling the
+review or reaching end-of-input leaves credentials, backups, files, and the
+running service untouched. Use `sudo awgctl client add --dry-run` to walk
+through the same wizard and validate the proposed transaction without changing
+state.
+
+Automation, redirected input, and `--json` require an explicit profile name:
+
 ```bash
 sudo awgctl client add kat-iphone \
   --owner Kat --device iPhone --expires 2027-09-01
@@ -50,6 +66,11 @@ sudo awgctl client edit kat-iphone --device 'iPhone 18'
 sudo awgctl client edit kat-iphone --expires none
 sudo awgctl client edit kat-iphone --mark-distributed
 ```
+
+After successful creation, the command prints protected canonical locations
+and explicit `client export` and `client qr` examples. Choose one delivery
+format and replace the example operator directory with a secure directory
+owned by the invoking sudo user.
 
 Metadata tracks a monotonically increasing profile revision and one of
 `unknown`, `pending`, or `distributed`. Creating, rotating, or regenerating a

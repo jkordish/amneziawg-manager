@@ -113,6 +113,19 @@ sudo python3 install.py upgrade --yes --apply-default-dns --apply-live
 ```bash
 sudo awgctl status
 sudo awgctl health
+sudo awgctl client add
+```
+
+Running `client add` without a name opens an interactive profile wizard. It
+collects the owner, device, optional expiration date, suggests a safe profile
+name, and shows a final review before credentials are generated or the server
+configuration is reloaded. To preview the transaction without changing state,
+use `sudo awgctl client add --dry-run`.
+
+For scripts and other non-interactive use, keep supplying every value
+explicitly:
+
+```bash
 sudo awgctl client add kat-iphone --owner Kat --device iPhone
 sudo awgctl client list
 sudo awgctl client show kat-iphone
