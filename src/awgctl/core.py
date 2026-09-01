@@ -746,7 +746,7 @@ def _classic_profile(parameters: dict[str, Any]) -> dict[str, Any]:
         field: _strict_integer(
             parameters[field],
             field,
-            maximum=0xFFFFFFFF if field in AWG31_HEADER_FIELDS else 0xFFFF,
+            maximum=0xFFFFFFFF,
         )
         for field in OBFUSCATION_FIELDS
     }
@@ -767,7 +767,13 @@ def _normalize_awg31_profile(profile: dict[str, Any], *, mtu: int) -> dict[str, 
         raise AwgctlError("obfuscation profile must be an object")
     allowed = {"schema_version", "name", "parameters", "header_protection_key_path"}
     _reject_unknown_fields(profile, allowed, "obfuscation profile")
-    if set(profile) != allowed or profile.get("schema_version") != 1:
+    profile_schema = profile.get("schema_version")
+    if (
+        set(profile) != allowed
+        or not isinstance(profile_schema, int)
+        or isinstance(profile_schema, bool)
+        or profile_schema != 1
+    ):
         raise AwgctlError("invalid AWG 3.1 obfuscation profile contract")
     if profile.get("name") != "russia-ios-v1":
         raise AwgctlError("unsupported AWG 3.1 obfuscation profile")
@@ -850,7 +856,13 @@ def _normalize_obfuscation(value: Any, *, mtu: int) -> dict[str, Any]:
         _reject_unknown_fields(profile, {"schema_version", "name", "parameters"}, "obfuscation profile")
         if set(profile) != {"schema_version", "name", "parameters"}:
             raise AwgctlError("invalid classic obfuscation profile contract")
-        if profile.get("schema_version") != 1 or profile.get("name") != "classic-v1":
+        profile_schema = profile.get("schema_version")
+        if (
+            not isinstance(profile_schema, int)
+            or isinstance(profile_schema, bool)
+            or profile_schema != 1
+            or profile.get("name") != "classic-v1"
+        ):
             raise AwgctlError("unsupported classic obfuscation profile")
         return {"mode": "classic", "profile": _classic_profile(profile["parameters"])}
     if mode == "awg31":
@@ -1226,6 +1238,17 @@ def obfuscation_status(config: dict[str, Any]) -> dict[str, str]:
     if normalized["obfuscation"]["mode"] == "awg31":
         material = read_header_protection_key(pathlib.Path(profile["header_protection_key_path"]))
         result["header_protection_key_fingerprint"] = header_protection_fingerprint(material)
+    return result
+
+
+def public_server_config(config: dict[str, Any]) -> dict[str, Any]:
+    """Return the one secret-safe server-state representation for public output."""
+    result = normalize_server_config(config)
+    if result["obfuscation"]["mode"] == "awg31":
+        parameters = result["obfuscation"]["profile"]["parameters"]
+        for field in AWG31_CPS_FIELDS:
+            if parameters[field] is not None:
+                parameters[field] = "[redacted]"
     return result
 
 
@@ -1905,6 +1928,178 @@ def verify_managed_backup(value: pathlib.Path) -> tuple[pathlib.Path, dict[str, 
 RESTORE_COMPONENTS = ("config", "keys", "clients", "revoked", "generated")
 
 
+def _restore_inventory(directory: pathlib.Path, *, directories: bool) -> set[str]:
+    """List one protected restore directory through its validated descriptor."""
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
+    try:
+        descriptor = os.open(directory, flags)
+    except OSError as exc:
+        raise AwgctlError("backup client artifact directory is missing or unsafe") from exc
+    try:
+        metadata = os.fstat(descriptor)
+        if (
+            not stat.S_ISDIR(metadata.st_mode)
+            or (metadata.st_uid, metadata.st_gid) != (os.geteuid(), os.getegid())
+            or stat.S_IMODE(metadata.st_mode) != 0o700
+        ):
+            raise AwgctlError("backup client artifact directory is not protected")
+        names = set(os.listdir(descriptor))
+        for name in names:
+            item = os.stat(name, dir_fd=descriptor, follow_symlinks=False)
+            expected_type = stat.S_ISDIR(item.st_mode) if directories else stat.S_ISREG(item.st_mode)
+            expected_mode = 0o700 if directories else 0o600
+            if (
+                not expected_type
+                or (not directories and item.st_nlink != 1)
+                or (item.st_uid, item.st_gid) != (os.geteuid(), os.getegid())
+                or stat.S_IMODE(item.st_mode) != expected_mode
+            ):
+                raise AwgctlError("backup client artifact inventory is unsafe")
+        return names
+    except OSError as exc:
+        raise AwgctlError("cannot inspect backup client artifact inventory") from exc
+    finally:
+        os.close(descriptor)
+
+
+def _read_restore_artifact(
+    path: pathlib.Path,
+    *,
+    label: str,
+    maximum: int,
+) -> bytes:
+    """Read one staged private artifact through its validated descriptor."""
+    flags = os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as exc:
+        raise AwgctlError(f"cannot read backup {label}") from exc
+    try:
+        metadata = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_nlink != 1
+            or (metadata.st_uid, metadata.st_gid) != (os.geteuid(), os.getegid())
+            or stat.S_IMODE(metadata.st_mode) != 0o600
+            or metadata.st_size > maximum
+        ):
+            raise AwgctlError(f"backup {label} is not one protected bounded file")
+        chunks: list[bytes] = []
+        total = 0
+        while True:
+            chunk = os.read(descriptor, min(16 * 1024, maximum + 1 - total))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            total += len(chunk)
+            if total > maximum:
+                raise AwgctlError(f"backup {label} is unexpectedly large")
+        return b"".join(chunks)
+    except OSError as exc:
+        raise AwgctlError(f"cannot read backup {label}") from exc
+    finally:
+        os.close(descriptor)
+
+
+def _restore_text(path: pathlib.Path, *, label: str, maximum: int = 64 * 1024) -> str:
+    try:
+        return _read_restore_artifact(path, label=label, maximum=maximum).decode("utf-8")
+    except UnicodeError as exc:
+        raise AwgctlError(f"backup {label} is not valid UTF-8") from exc
+
+
+def _validate_restore_clients(
+    stage: pathlib.Path,
+    config: dict[str, Any],
+    *,
+    server_public: str,
+    header_key: bytes | None,
+) -> list[dict[str, Any]]:
+    clients_root = stage / "clients"
+    keys_root = stage / "keys/clients"
+    client_names = _restore_inventory(clients_root, directories=True)
+    key_names = _restore_inventory(keys_root, directories=True)
+    if client_names != key_names:
+        raise AwgctlError("backup client metadata and key inventories differ")
+    records: list[dict[str, Any]] = []
+    for name in sorted(client_names):
+        validate_client_name(name)
+        client_dir = clients_root / name
+        key_dir = keys_root / name
+        client_files = _restore_inventory(client_dir, directories=False)
+        key_files = _restore_inventory(key_dir, directories=False)
+        try:
+            metadata = json.loads(
+                _restore_text(client_dir / "metadata.json", label=f"client metadata: {name}")
+            )
+            metadata = normalize_client_metadata(metadata)
+        except (json.JSONDecodeError, ContractError) as exc:
+            raise AwgctlError(f"invalid backup client metadata: {name}") from exc
+        if metadata.get("name") != name or metadata.get("status") not in {"active", "expired"}:
+            raise AwgctlError(f"invalid backup client metadata identity: {name}")
+        public = validate_key(metadata.get("public_key", ""), "backup client public key")
+        try:
+            address = ipaddress.ip_interface(metadata["address"])
+        except (KeyError, ValueError) as exc:
+            raise AwgctlError(f"invalid backup client address: {name}") from exc
+        if address.version != 4 or address.network.prefixlen != 32:
+            raise AwgctlError(f"invalid backup client address: {name}")
+        managed = metadata.get("management", "managed") == "managed"
+        expected_client_files = {"metadata.json"}
+        if managed:
+            expected_client_files.update({f"{name}.conf", f"{name}.png"})
+        expected_key_files = {"public"}
+        if managed:
+            expected_key_files.add("private")
+        if metadata.get("use_psk"):
+            expected_key_files.add("psk")
+        if client_files != expected_client_files or key_files != expected_key_files:
+            raise AwgctlError(f"backup client artifact inventory differs from metadata: {name}")
+        public_file = validate_key(
+            _restore_text(key_dir / "public", label=f"client public key: {name}", maximum=256).strip(),
+            "backup client public key",
+        )
+        if public_file != public:
+            raise AwgctlError(f"backup client public key metadata drift: {name}")
+        psk = None
+        if metadata.get("use_psk"):
+            psk = validate_key(
+                _restore_text(key_dir / "psk", label=f"client preshared key: {name}", maximum=256).strip(),
+                "backup client preshared key",
+            )
+        record = dict(metadata)
+        record["psk"] = psk
+        if managed:
+            private = validate_key(
+                _restore_text(key_dir / "private", label=f"client private key: {name}", maximum=256).strip(),
+                "backup client private key",
+            )
+            derived = run(
+                ["awg", "pubkey"], input_data=(private + "\n").encode("ascii")
+            ).stdout.decode("ascii").strip()
+            if derived != public:
+                raise AwgctlError(f"backup client keypair does not match: {name}")
+            profile = _restore_text(client_dir / f"{name}.conf", label=f"client profile: {name}")
+            expected_profile = render_client_config(
+                config,
+                private,
+                psk,
+                server_public,
+                str(address),
+                header_protection_key=header_key,
+            )
+            if profile != expected_profile:
+                raise AwgctlError(f"backup client profile differs from managed state: {name}")
+            record["private_key"] = private
+        else:
+            record["private_key"] = None
+        records.append(record)
+    duplicates = find_duplicate_client_state(records)
+    if duplicates:
+        raise AwgctlError("backup contains duplicate client identity or address")
+    return records
+
+
 def validate_restore_stage(stage: pathlib.Path) -> dict[str, Any]:
     try:
         config = json.loads((stage / "config/server.json").read_text(encoding="utf-8"))
@@ -1959,6 +2154,12 @@ def validate_restore_stage(stage: pathlib.Path) -> dict[str, Any]:
         raise AwgctlError(
             "backup generated configuration header-protection or obfuscation differs from managed state"
         )
+    _validate_restore_clients(
+        stage,
+        config,
+        server_public=server_public,
+        header_key=header_key,
+    )
     validate_native_server(generated_server)
     validate_nftables_text(generated_nft)
     return config
@@ -3769,7 +3970,7 @@ def cmd_client_qr(args: argparse.Namespace) -> int:
 
 
 def cmd_config_show(args: argparse.Namespace) -> int:
-    config = load_config()
+    config = public_server_config(load_config())
     if getattr(args, "json", False):
         print(json.dumps(json_envelope("config show", data=config), indent=2, sort_keys=True))
     else:
@@ -4139,7 +4340,7 @@ def cmd_diagnose(args: argparse.Namespace) -> int:
                     if key not in {"public_key", "private_key", "psk"}
                 }
             )
-        safe_config = json.loads(json.dumps(config))
+        safe_config = public_server_config(config)
         files: dict[str, bytes] = {
             "manager/server.json": (json.dumps(safe_config, indent=2, sort_keys=True) + "\n").encode(),
             "manager/clients.json": (json.dumps(client_rows, indent=2, sort_keys=True) + "\n").encode(),
