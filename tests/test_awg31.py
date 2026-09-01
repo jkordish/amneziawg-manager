@@ -1217,6 +1217,26 @@ class CpsDisclosureTests(unittest.TestCase):
         harmless = "native parser: interface I count = 5"
         self.assertEqual(diagnostics.sanitize_cps_text(harmless), harmless)
 
+    def test_cps_sanitizer_bounds_line_searches_between_adjacent_assignments(self):
+        class SearchCountingText(str):
+            def __new__(cls, value):
+                instance = super().__new__(cls, value)
+                instance.find_work = 0
+                return instance
+
+            def find(self, sub, start=0, end=None):
+                boundary = len(self) if end is None else end
+                self.find_work += max(0, boundary - start)
+                if end is None:
+                    return super().find(sub, start)
+                return super().find(sub, start, end)
+
+        assignments = 4096
+        source = SearchCountingText("I1=x " * assignments + "\n")
+        sanitized = diagnostics.sanitize_cps_text(source)
+        self.assertEqual(sanitized, "I1=[redacted]" * assignments + "\n")
+        self.assertLessEqual(source.find_work, len(source) * 3)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
