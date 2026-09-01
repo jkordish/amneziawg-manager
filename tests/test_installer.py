@@ -138,6 +138,77 @@ class UpgradeTests(unittest.TestCase):
         self.assertEqual(custom.default_dns, "9.9.9.9,149.112.112.112")
         self.assertTrue(custom.adopt_existing_identities)
 
+    def test_upgrade_settings_start_from_persisted_policy_then_apply_cli_overrides(self):
+        from awginstall import cli
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory) / "opt/amneziawg"
+            config = root / "config"
+            config.mkdir(parents=True)
+            (config / "installation.json").write_text(json.dumps({
+                "schema_version": 1,
+                "staging": {
+                    "user": "vpn-stage", "group": "vpn-stage", "uid": 450, "gid": 451,
+                    "root": "/var/lib/vpn-stage",
+                },
+                "operators": {
+                    "group": "vpn-admins", "users": ["deploy"],
+                    "enroll_sudo_invoker": False, "sudo_policy": "existing-sudo",
+                },
+                "systemd": {"hardening": "off"},
+                "dns": {"default": ["9.9.9.9", "149.112.112.112"], "policy": "custom"},
+            }))
+            args = cli.build_parser().parse_args([
+                "upgrade", "--dry-run", "--default-dns", "cloudflare-malware"
+            ])
+            settings = cli._resolved_settings(args, root=root)
+        self.assertEqual(settings.staging_user, "vpn-stage")
+        self.assertEqual(settings.operator_group, "vpn-admins")
+        self.assertEqual(settings.operators, ("deploy",))
+        self.assertEqual(settings.sudo_policy, "existing-sudo")
+        self.assertEqual(settings.default_dns, ("1.1.1.2", "1.0.0.2"))
+
+    def test_first_upgrade_applies_no_sudo_bootstrap_before_release_then_final_policy(self):
+        from awginstall import cli
+
+        configured = []
+        deployed = []
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory) / "opt/amneziawg"
+            with (
+                mock.patch.object(cli, "_configure_host_for_command", side_effect=lambda _args, **kwargs: configured.append(kwargs["settings"])),
+                mock.patch.object(cli, "_deploy_source_release", side_effect=lambda *_args, **kwargs: deployed.append(kwargs["settings"])),
+                mock.patch.object(cli, "_apply_requested_runtime_settings"),
+            ):
+                result = installer_main(
+                    ["upgrade", "--yes"], root=root, repo_root=REPO_ROOT, output=io.StringIO()
+                )
+        self.assertEqual(result, 0)
+        self.assertEqual([value.sudo_policy for value in configured], ["none", "scoped-nopasswd"])
+        self.assertEqual(configured[0].operators, ())
+        self.assertEqual(configured[0].systemd_hardening, "off")
+        self.assertEqual(deployed, [configured[0]])
+
+    def test_first_upgrade_rolls_back_bootstrap_when_release_validation_fails(self):
+        from awginstall import cli
+
+        bootstrap_report = object()
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory) / "opt/amneziawg"
+            errors = io.StringIO()
+            with (
+                mock.patch.object(cli, "_configure_host_for_command", return_value=bootstrap_report),
+                mock.patch.object(cli, "_deploy_source_release", side_effect=InstallerError("health failed")),
+                mock.patch.object(cli, "rollback_host_configuration") as rollback,
+                mock.patch("sys.stderr", errors),
+            ):
+                result = installer_main(
+                    ["upgrade", "--yes"], root=root, repo_root=REPO_ROOT, output=io.StringIO()
+                )
+        self.assertEqual(result, 1)
+        rollback.assert_called_once_with(bootstrap_report)
+        self.assertIn("health failed", errors.getvalue())
+
     def test_top_level_installer_help_is_runnable_without_pip(self):
         result = subprocess.run(
             [sys.executable, str(REPO_ROOT / "install.py"), "--help"],

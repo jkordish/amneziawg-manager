@@ -11,8 +11,8 @@ import shutil
 import stat
 import subprocess
 import tempfile
-from collections.abc import Callable, Sequence
-from dataclasses import dataclass
+from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass, field, replace
 
 from .identity import (
     GroupRecord,
@@ -58,6 +58,9 @@ class HostConfigurationReport:
     module_load: str
     settings: dict[str, object]
     dry_run: bool
+    rollback_files: Mapping[pathlib.Path, "_FileSnapshot"] | None = field(
+        default=None, repr=False, compare=False
+    )
 
 
 @dataclass(frozen=True)
@@ -237,6 +240,30 @@ def _rollback_identities(plan: IdentityPlan, runner: Runner) -> None:
             pass
 
 
+def rollback_host_configuration(
+    report: HostConfigurationReport,
+    *,
+    runner: Runner | None = None,
+) -> None:
+    """Compensate a successful host step when a later outer transaction fails."""
+    runner = runner or _run_local
+    if report.rollback_files is None:
+        raise HostConfigurationError("host configuration report has no rollback snapshot")
+    errors: list[str] = []
+    for path, previous in report.rollback_files.items():
+        try:
+            _restore_file(path, previous)
+        except Exception as exc:
+            errors.append(f"restore {path}: {exc}")
+    try:
+        runner(("systemctl", "daemon-reload"))
+    except Exception as exc:
+        errors.append(f"daemon-reload: {exc}")
+    _rollback_identities(report.identity, runner)
+    if errors:
+        raise HostConfigurationError("host rollback was incomplete: " + "; ".join(errors))
+
+
 def configure_host(
     settings: InstallationSettings,
     *,
@@ -270,6 +297,7 @@ def configure_host(
     installation_path = product_root / "config/installation.json"
     managed_paths = (paths.sudoers, paths.service_dropin, paths.module_load, installation_path)
     file_snapshots = {path: _file_snapshot(path) for path in managed_paths}
+    report = replace(report, rollback_files=file_snapshots)
     commands_started = False
     try:
         for command in identity_plan.commands:

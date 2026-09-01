@@ -13,11 +13,17 @@ import subprocess
 import sys
 import tempfile
 from collections.abc import Sequence
+from dataclasses import replace
 from typing import TextIO
 
 from awgctl.version import VERSION
 
-from .host import HostConfigurationError, HostPaths, configure_host
+from .host import (
+    HostConfigurationError,
+    HostPaths,
+    configure_host,
+    rollback_host_configuration,
+)
 from .identity import UserRecord
 from .installer import InstallerError, upgrade_product
 from .platform import PlatformError, read_os_release, validate_platform
@@ -82,7 +88,17 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _resolved_settings(args: argparse.Namespace) -> InstallationSettings:
+def _persisted_settings(root: pathlib.Path) -> InstallationSettings | None:
+    path = root / "config/installation.json"
+    try:
+        if not path.is_file():
+            return None
+    except PermissionError:
+        return None
+    return resolve_installation_settings(settings_path=path, sudo_user=None)
+
+
+def _resolved_settings(args: argparse.Namespace, *, root: pathlib.Path) -> InstallationSettings:
     names = (
         "staging_user", "staging_group", "staging_uid", "staging_gid", "staging_root",
         "operator_group", "sudo_policy", "systemd_hardening",
@@ -98,10 +114,29 @@ def _resolved_settings(args: argparse.Namespace) -> InstallationSettings:
         overrides["enroll_sudo_invoker"] = args.enroll_sudo_invoker
     if getattr(args, "default_dns", None) is not None:
         overrides["default_dns"] = args.default_dns
+    settings_path = getattr(args, "settings", None)
+    if settings_path is None and args.command in {"upgrade", "configure"}:
+        persisted = root / "config/installation.json"
+        try:
+            if persisted.is_file():
+                settings_path = persisted
+        except PermissionError:
+            pass
     return resolve_installation_settings(
-        settings_path=getattr(args, "settings", None),
+        settings_path=settings_path,
         sudo_user=os.environ.get("SUDO_USER"),
         overrides=overrides,
+    )
+
+
+def _bootstrap_settings(settings: InstallationSettings) -> InstallationSettings:
+    """Provision a builder without granting the pre-upgrade public CLI sudo."""
+    return replace(
+        settings,
+        operators=(),
+        enroll_sudo_invoker=False,
+        sudo_policy="none",
+        systemd_hardening="off",
     )
 
 
@@ -365,7 +400,7 @@ def main(
     args = parser.parse_args(argv)
     repo_root = (repo_root or pathlib.Path(__file__).parents[2]).resolve()
     try:
-        settings = _resolved_settings(args)
+        settings = _resolved_settings(args, root=root)
         if args.command == "check":
             platform_info = validate_platform(read_os_release())
             _emit(
@@ -448,8 +483,14 @@ def main(
                 raise InstallerError("existing awg0 state detected; use adopt or upgrade, not fresh install")
             _install_amneziawg_packages()
             external = external or _detect_external_interface()
+            bootstrap = _bootstrap_settings(settings)
+            bootstrap_report = _configure_host_for_command(args, root=root, settings=bootstrap)
+            try:
+                _deploy_source_release(root, repo_root, health=False, settings=bootstrap)
+            except Exception:
+                rollback_host_configuration(bootstrap_report)
+                raise
             _configure_host_for_command(args, root=root, settings=settings)
-            _deploy_source_release(root, repo_root, health=False, settings=settings)
             command = [
                 str(root / "libexec/awgctl-internal"), "_initialize-fresh",
                 "--endpoint", args.endpoint,
@@ -517,8 +558,14 @@ def main(
                     raise InstallerError(f"working-host adoption requires command: {command_name}")
             external = external or _detect_external_interface()
             backup = _adoption_backup(root, server, client)
+            bootstrap = _bootstrap_settings(settings)
+            bootstrap_report = _configure_host_for_command(args, root=root, settings=bootstrap)
+            try:
+                _deploy_source_release(root, repo_root, health=False, settings=bootstrap)
+            except Exception:
+                rollback_host_configuration(bootstrap_report)
+                raise
             _configure_host_for_command(args, root=root, settings=settings)
-            _deploy_source_release(root, repo_root, health=False, settings=settings)
             adopted = _run(
                 [
                     str(root / "libexec/awgctl-internal"), "_migrate-existing",
@@ -564,8 +611,20 @@ def main(
                 raise InstallerError("run installation with sudo")
             if not args.yes:
                 raise InstallerError("upgrade is mutating; rerun with --yes after reviewing --dry-run")
+            existing_settings = _persisted_settings(root)
+            if existing_settings is None:
+                build_settings = _bootstrap_settings(settings)
+                bootstrap_report = _configure_host_for_command(args, root=root, settings=build_settings)
+            else:
+                build_settings = existing_settings
+                bootstrap_report = None
+            try:
+                _deploy_source_release(root, repo_root, health=True, settings=build_settings)
+            except Exception:
+                if bootstrap_report is not None:
+                    rollback_host_configuration(bootstrap_report)
+                raise
             _configure_host_for_command(args, root=root, settings=settings)
-            _deploy_source_release(root, repo_root, health=True, settings=settings)
             _apply_requested_runtime_settings(args, root=root, settings=settings)
             _emit(
                 output,

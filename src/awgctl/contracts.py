@@ -164,3 +164,28 @@ def mark_profile_regenerated(
         }
     )
     return normalize_client_metadata(result)
+
+
+def mark_profile_rotated(
+    previous: dict[str, Any],
+    replacement: dict[str, Any],
+    *,
+    timestamp: str,
+) -> dict[str, Any]:
+    """Bind a replacement identity to the prior recipient and next revision."""
+    old = normalize_client_metadata(previous)
+    result = normalize_client_metadata(replacement)
+    result.update(
+        {
+            "owner": old.get("owner"),
+            "device": old.get("device"),
+            "expires": old.get("expires"),
+            "profile_revision": old["profile_revision"] + 1,
+            "profile_generated_at": timestamp,
+            "profile_change_reason": "rotated",
+            "distribution_status": "pending",
+            "distributed_at": None,
+            "updated_at": timestamp,
+        }
+    )
+    return normalize_client_metadata(result)

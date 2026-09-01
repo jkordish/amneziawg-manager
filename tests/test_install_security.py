@@ -177,6 +177,31 @@ class IdentityPlanTests(unittest.TestCase):
         with self.assertRaisesRegex(IdentityError, "does not match"):
             build_identity_plan(settings, mismatched, allow_existing=True)
 
+    def test_existing_operator_group_rejects_undeclared_members(self):
+        from awginstall.identity import GroupRecord, IdentityError, IdentitySnapshot, UserRecord, build_identity_plan
+        from awginstall.settings import resolve_installation_settings
+
+        settings = resolve_installation_settings(
+            sudo_user=None,
+            overrides={"operators": ["ubuntu"]},
+        )
+        snapshot = IdentitySnapshot(
+            users={
+                "awgctl": UserRecord(
+                    "awgctl", 450, 451, "/var/lib/amneziawg-manager", "/usr/sbin/nologin"
+                ),
+                "ubuntu": None,
+            },
+            groups={
+                "awgctl": GroupRecord("awgctl", 451, ()),
+                "awgctl-admin": GroupRecord("awgctl-admin", 452, ("ubuntu", "stale-admin")),
+            },
+            locked_users={"awgctl"},
+            supplementary_groups={"awgctl": ()},
+        )
+        with self.assertRaisesRegex(IdentityError, "undeclared members: stale-admin"):
+            build_identity_plan(settings, snapshot, allow_existing=True)
+
     def test_sudoers_grants_only_public_entrypoint(self):
         from awginstall.identity import render_sudoers
 
@@ -230,6 +255,44 @@ class IdentityPlanTests(unittest.TestCase):
 
 
 class HostConfigurationTests(unittest.TestCase):
+    def test_successful_configuration_report_can_be_compensated_by_outer_transaction(self):
+        from awginstall.host import HostPaths, configure_host, rollback_host_configuration
+        from awginstall.identity import IdentitySnapshot, UserRecord
+        from awginstall.settings import resolve_installation_settings
+
+        snapshot = IdentitySnapshot(users={}, groups={}, locked_users=set(), supplementary_groups={})
+        commands = []
+
+        def runner(argv):
+            commands.append(tuple(argv))
+            return subprocess.CompletedProcess(argv, 0, b"", b"")
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            settings = resolve_installation_settings(sudo_user=None)
+            paths = HostPaths.under(root)
+            with (
+                mock.patch("awginstall.host._resolve_created_user", return_value=UserRecord(
+                    "awgctl", os.getuid(), os.getgid(), str(settings.staging_root), "/usr/sbin/nologin"
+                )),
+                mock.patch("awginstall.host._prepare_staging_root"),
+            ):
+                report = configure_host(
+                    settings,
+                    product_root=root / "opt/amneziawg",
+                    paths=paths,
+                    allow_existing=False,
+                    dry_run=False,
+                    snapshot=snapshot,
+                    runner=runner,
+                )
+                rollback_host_configuration(report, runner=runner)
+            self.assertFalse(paths.sudoers.exists())
+            self.assertFalse(paths.service_dropin.exists())
+            self.assertFalse(paths.module_load.exists())
+            self.assertFalse((root / "opt/amneziawg/config/installation.json").exists())
+        self.assertIn(("userdel", "--remove", "awgctl"), commands)
+
     def test_dry_run_returns_complete_plan_without_commands_or_writes(self):
         from awginstall.host import HostPaths, configure_host
         from awginstall.identity import IdentitySnapshot

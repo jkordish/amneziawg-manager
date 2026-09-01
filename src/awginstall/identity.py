@@ -128,6 +128,11 @@ def build_identity_plan(
         set(snapshot.groups[settings.operator_group].members)
         if operator_group_exists else set()
     )
+    unexpected_members = sorted(existing_members - set(settings.operators))
+    if unexpected_members:
+        raise IdentityError(
+            "existing operator group has undeclared members: " + ", ".join(unexpected_members)
+        )
     for operator in settings.operators:
         if operator not in snapshot.users:
             raise IdentityError(f"operator account does not exist: {operator}")

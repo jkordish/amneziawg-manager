@@ -3,6 +3,17 @@
 All notable changes are documented here. The project follows semantic
 versioning while preserving explicit beta labels for unqualified host paths.
 
+## 0.1.0-beta.4 - 2026-09-01
+
+- Preserve installed privilege settings during upgrades unless an operator
+  explicitly overrides them.
+- Reject undeclared operator-group members so local authorization cannot drift
+  wider than the manager's declared policy.
+- Deploy and health-check the split public/internal CLI before installing its
+  final sudo grant, with compensating rollback for failed bootstraps.
+- Preserve client recipient metadata and increment profile revisions during
+  credential rotation.
+
 ## 0.1.0-beta.3 - 2026-09-01
 
 - Added locked staging and separate operator identities with validated adoption,

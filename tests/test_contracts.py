@@ -18,6 +18,7 @@ from awgctl.contracts import (
     health_envelope,
     json_envelope,
     mark_profile_regenerated,
+    mark_profile_rotated,
     normalize_client_metadata,
 )
 
@@ -267,6 +268,48 @@ class ClientMetadataTests(unittest.TestCase):
         self.assertEqual(regenerated["profile_change_reason"], "config:dns")
         self.assertEqual(regenerated["distribution_status"], "pending")
         self.assertIsNone(regenerated["distributed_at"])
+
+    def test_profile_rotation_preserves_recipient_metadata_and_increments_revision(self):
+        previous = normalize_client_metadata({
+            **self.legacy_metadata(),
+            "schema_version": 3,
+            "management": "managed",
+            "owner": "Kat",
+            "device": "iPhone",
+            "expires": "2027-09-01",
+            "profile_revision": 4,
+            "profile_generated_at": "2026-09-01T08:00:00Z",
+            "profile_change_reason": "config:dns",
+            "distribution_status": "distributed",
+            "distributed_at": "2026-09-01T09:00:00Z",
+        })
+        replacement = dict(previous)
+        replacement.update({
+            "public_key": "replacement-public",
+            "public_key_fingerprint": "replacement-fingerprint",
+            "owner": None,
+            "device": None,
+            "expires": None,
+            "profile_revision": 1,
+            "profile_generated_at": "2026-09-01T10:00:00Z",
+            "profile_change_reason": "created",
+            "distribution_status": "pending",
+            "distributed_at": None,
+        })
+        rotated = mark_profile_rotated(
+            previous,
+            replacement,
+            timestamp="2026-09-01T10:00:00Z",
+        )
+        self.assertEqual(rotated["public_key"], "replacement-public")
+        self.assertEqual(rotated["profile_revision"], 5)
+        self.assertEqual(rotated["profile_change_reason"], "rotated")
+        self.assertEqual(rotated["distribution_status"], "pending")
+        self.assertIsNone(rotated["distributed_at"])
+        self.assertEqual(
+            (rotated["owner"], rotated["device"], rotated["expires"]),
+            ("Kat", "iPhone", "2027-09-01"),
+        )
 
 
 if __name__ == "__main__":

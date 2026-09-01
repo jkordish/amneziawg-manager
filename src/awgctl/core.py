@@ -34,6 +34,7 @@ from .contracts import (
     health_envelope,
     json_envelope,
     mark_profile_regenerated,
+    mark_profile_rotated,
     normalize_client_metadata,
 )
 from .diagnostics import DiagnosticsError, create_bundle as create_diagnostic_bundle, redact_awg_config
@@ -1549,11 +1550,19 @@ def management_security_checks() -> list[tuple[str, str, str]]:
     except KeyError:
         add("FAIL", "operator group", f"missing {settings.operator_group}")
     else:
-        missing_operators = sorted(set(settings.operators) - set(operator_group.gr_mem))
+        actual_operators = set(operator_group.gr_mem)
+        missing_operators = sorted(set(settings.operators) - actual_operators)
+        extra_operators = sorted(actual_operators - set(settings.operators))
+        membership_problem = missing_operators or extra_operators
+        membership_detail = settings.operator_group
+        if missing_operators:
+            membership_detail = f"missing members: {', '.join(missing_operators)}"
+        elif extra_operators:
+            membership_detail = f"undeclared members: {', '.join(extra_operators)}"
         add(
-            "FAIL" if missing_operators else "PASS",
+            "FAIL" if membership_problem else "PASS",
             "operator group",
-            f"missing members: {', '.join(missing_operators)}" if missing_operators else settings.operator_group,
+            membership_detail,
         )
 
     expected_sudoers = render_sudoers(settings.operator_group, settings.sudo_policy)
@@ -2296,10 +2305,19 @@ def cmd_client_rotate(args: argparse.Namespace) -> int:
                 public,
                 psk,
                 created_at=target["created_at"],
+                owner=target.get("owner"),
+                device=target.get("device"),
+                expires=target.get("expires"),
             )
             metadata_path = CLIENTS / name / "metadata.json"
             metadata = json.loads(metadata_path.read_text())
-            metadata["rotated_at"] = iso_now()
+            rotation_timestamp = iso_now()
+            metadata = mark_profile_rotated(
+                target,
+                metadata,
+                timestamp=rotation_timestamp,
+            )
+            metadata["rotated_at"] = rotation_timestamp
             metadata["previous_public_key_fingerprint"] = target["public_key_fingerprint"]
             atomic_json(metadata_path, metadata, 0o600)
             new_clients = load_clients(include_secrets=True)
