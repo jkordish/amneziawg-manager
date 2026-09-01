@@ -3,6 +3,12 @@
 All notable changes are documented here. The project follows semantic
 versioning while preserving explicit beta labels for unqualified host paths.
 
+## 0.1.0-beta.2 - 2026-09-01
+
+- Made successful mutation commands honor the stable JSON response envelope.
+- Rejected the unsafe/ambiguous `client export --stdout --json` combination.
+- Updated GitHub workflow checkout runtime to the current maintained release.
+
 ## 0.1.0-beta.1 - 2026-09-01
 
 - Added fresh Ubuntu 24.04 amd64 installation and working-host adoption.

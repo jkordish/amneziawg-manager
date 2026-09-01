@@ -16,6 +16,7 @@ from awginstall.deploy import active_release
 from awginstall.cli import build_parser, main as installer_main, package_install_plan, parse_default_interface
 from awginstall.installer import InstallerError, upgrade_product
 from awginstall.platform import PlatformError, validate_platform
+from awgctl.version import VERSION
 
 
 class PlatformValidationTests(unittest.TestCase):
@@ -88,7 +89,7 @@ class UpgradeTests(unittest.TestCase):
             )
             self.assertEqual(result, 0)
             self.assertFalse(root.exists())
-            self.assertIn("would install awgctl 0.1.0-beta.1", output.getvalue())
+            self.assertIn(f"would install awgctl {VERSION}", output.getvalue())
 
     def test_installer_parser_exposes_all_product_workflows(self):
         parser = build_parser()

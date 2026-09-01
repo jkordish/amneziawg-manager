@@ -120,7 +120,7 @@ class JsonContractTests(unittest.TestCase):
         with mock.patch.object(core, "require_root", side_effect=AssertionError("must not be called")), redirect_stdout(output):
             result = core.main(["version", "--json"])
         self.assertEqual(result, 0)
-        self.assertEqual(json.loads(output.getvalue())["data"]["version"], "0.1.0-beta.1")
+        self.assertEqual(json.loads(output.getvalue())["data"]["version"], core.VERSION)
 
     def test_json_errors_use_the_same_envelope_and_not_plain_stderr(self):
         output = io.StringIO()

@@ -75,6 +75,23 @@ class DryRunTests(unittest.TestCase):
         self.assertTrue(payload["data"]["dry_run"])
         self.assertEqual(payload["data"]["action"], "restart")
 
+    def test_service_execution_json_uses_the_stable_envelope(self):
+        args = argparse.Namespace(command="reload", dry_run=False, json=True)
+        output = io.StringIO()
+        with (
+            mock.patch.object(core, "load_config", return_value={"interface": "awg0"}),
+            mock.patch.object(core, "mutation_lock", return_value=contextlib.nullcontext()),
+            mock.patch.object(core, "ensure_no_drift"),
+            mock.patch.object(core, "service_action"),
+            redirect_stdout(output),
+        ):
+            result = core.cmd_service(args)
+        payload = json.loads(output.getvalue())
+        self.assertEqual(result, 0)
+        self.assertTrue(payload["ok"])
+        self.assertEqual(payload["command"], "reload")
+        self.assertEqual(payload["data"]["service"], "awg-quick@awg0.service")
+
     def test_revoke_dry_run_does_not_archive_backup_or_reload(self):
         client = {
             "name": "kat-phone",

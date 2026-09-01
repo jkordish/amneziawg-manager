@@ -1736,12 +1736,23 @@ def cmd_client_add(args: argparse.Namespace) -> int:
             audit(f"client creation failed: {name}")
             raise
         audit(f"client created: {name} address={address.ip}")
-        print(f"Created client: {name}")
-        print(f"Address: {address.ip}")
-        print(f"Config: {CLIENTS / name / (name + '.conf')}")
-        print(f"QR: {CLIENTS / name / (name + '.png')}")
-        print(f"Pre-change backup: {backup}")
-        print("Server configuration reloaded successfully." if active else "Server configuration installed; service is stopped.")
+        data = {
+            "name": name,
+            "address": str(address.ip),
+            "config": str(CLIENTS / name / (name + ".conf")),
+            "qr": str(CLIENTS / name / (name + ".png")),
+            "backup": str(backup),
+            "runtime_action": "reload" if active else "none-service-stopped",
+        }
+        if getattr(args, "json", False):
+            print(json.dumps(json_envelope("client add", data=data), indent=2, sort_keys=True))
+        else:
+            print(f"Created client: {name}")
+            print(f"Address: {address.ip}")
+            print(f"Config: {data['config']}")
+            print(f"QR: {data['qr']}")
+            print(f"Pre-change backup: {backup}")
+            print("Server configuration reloaded successfully." if active else "Server configuration installed; service is stopped.")
     return 0
 
 
@@ -1997,10 +2008,20 @@ def cmd_client_revoke(args: argparse.Namespace) -> int:
             raise
         remove_client_state(name)
         audit(f"client revoked: {name}")
-        print(f"Revoked client: {name}")
-        print(f"Archived credentials: {archive}")
-        print(f"Pre-change backup: {backup}")
-        print("Peer removed from the running server." if active else "Peer removed from managed configuration; service is stopped.")
+        data = {
+            "name": name,
+            "archive": str(archive),
+            "backup": str(backup),
+            "runtime_action": "reload" if active else "none-service-stopped",
+            "peer_removed": True,
+        }
+        if getattr(args, "json", False):
+            print(json.dumps(json_envelope("client revoke", data=data), indent=2, sort_keys=True))
+        else:
+            print(f"Revoked client: {name}")
+            print(f"Archived credentials: {archive}")
+            print(f"Pre-change backup: {backup}")
+            print("Peer removed from the running server." if active else "Peer removed from managed configuration; service is stopped.")
     return 0
 
 
@@ -2084,13 +2105,26 @@ def cmd_client_rotate(args: argparse.Namespace) -> int:
             audit(f"client rotation failed: {name}")
             raise
         audit(f"client rotated: {name}")
-        print(f"Rotated client: {name}")
-        print(f"Address: {ipaddress.ip_interface(target['address']).ip}")
-        print(f"Config: {CLIENTS / name / (name + '.conf')}")
-        print(f"QR: {CLIENTS / name / (name + '.png')}")
-        print(f"Prior credentials archived: {archive}")
-        print(f"Pre-change backup: {backup}")
-        print("Old profile is no longer accepted by the server." if active else "Rotation is staged; service is stopped.")
+        data = {
+            "name": name,
+            "address": str(ipaddress.ip_interface(target["address"]).ip),
+            "config": str(CLIENTS / name / (name + ".conf")),
+            "qr": str(CLIENTS / name / (name + ".png")),
+            "archive": str(archive),
+            "backup": str(backup),
+            "runtime_action": "reload" if active else "none-service-stopped",
+            "old_profile_revoked": active,
+        }
+        if getattr(args, "json", False):
+            print(json.dumps(json_envelope("client rotate", data=data), indent=2, sort_keys=True))
+        else:
+            print(f"Rotated client: {name}")
+            print(f"Address: {data['address']}")
+            print(f"Config: {data['config']}")
+            print(f"QR: {data['qr']}")
+            print(f"Prior credentials archived: {archive}")
+            print(f"Pre-change backup: {backup}")
+            print("Old profile is no longer accepted by the server." if active else "Rotation is staged; service is stopped.")
     return 0
 
 
@@ -2103,12 +2137,18 @@ def cmd_client_export(args: argparse.Namespace) -> int:
             raise AwgctlError("external client has no local profile; use client import first")
         raise AwgctlError(f"unknown active client: {name}")
     if args.stdout:
+        if getattr(args, "json", False):
+            raise AwgctlError("--stdout cannot be combined with --json because the profile is secret data")
         print("WARNING: the following profile contains credentials; protect terminal scrollback and logs.", file=sys.stderr)
         sys.stdout.write(profile.read_text(encoding="utf-8"))
         return 0
     if args.output is None:
-        print(f"Protected profile: {profile}")
-        print("Use --output PATH to copy it, or explicit --stdout only when secret output is intended.")
+        data = {"name": name, "profile": str(profile), "copied": False}
+        if getattr(args, "json", False):
+            print(json.dumps(json_envelope("client export", data=data), indent=2, sort_keys=True))
+        else:
+            print(f"Protected profile: {profile}")
+            print("Use --output PATH to copy it, or explicit --stdout only when secret output is intended.")
         return 0
     output = args.output.expanduser()
     if output.exists():
@@ -2119,8 +2159,12 @@ def cmd_client_export(args: argparse.Namespace) -> int:
     if os.geteuid() == 0:
         os.chown(output, 0, 0)
     audit(f"client profile exported: {name}")
-    print(f"Exported client profile: {output}")
-    print("The file contains credentials and is mode 0600.")
+    data = {"name": name, "profile": str(output), "copied": True, "mode": "0600"}
+    if getattr(args, "json", False):
+        print(json.dumps(json_envelope("client export", data=data), indent=2, sort_keys=True))
+    else:
+        print(f"Exported client profile: {output}")
+        print("The file contains credentials and is mode 0600.")
     return 0
 
 
@@ -2144,8 +2188,12 @@ def cmd_client_qr(args: argparse.Namespace) -> int:
             return 0
         generate_qr(profile_path.read_text(encoding="utf-8"), output)
         audit(f"client QR regenerated: {name}")
-        print(f"Protected QR image: {output}")
-        print("The QR was not displayed in terminal output.")
+        data = {"name": name, "qr": str(output), "displayed": False}
+        if getattr(args, "json", False):
+            print(json.dumps(json_envelope("client qr", data=data), indent=2, sort_keys=True))
+        else:
+            print(f"Protected QR image: {output}")
+            print("The QR was not displayed in terminal output.")
     return 0
 
 
@@ -2212,7 +2260,11 @@ def cmd_config_set(args: argparse.Namespace) -> int:
             raise AwgctlError("unsupported managed configuration key")
         validate_server_config(new_config)
         if new_config == config:
-            print(f"No change: {args.key} is already {new_display}")
+            data = {"key": args.key, "old": old_display, "new": new_display, "changed": False}
+            if getattr(args, "json", False):
+                print(json.dumps(json_envelope("config set", data=data), indent=2, sort_keys=True))
+            else:
+                print(f"No change: {args.key} is already {new_display}")
             return 0
         if getattr(args, "dry_run", False):
             data = {
@@ -2271,18 +2323,36 @@ def cmd_config_set(args: argparse.Namespace) -> int:
             audit(f"configuration change failed: {args.key}")
             raise
         audit(f"configuration changed: {args.key} {old_display} -> {new_display}")
-        print(f"Updated {args.key}: {old_display} -> {new_display}")
-        print(f"Pre-change backup: {backup}")
-        if runtime_action and active:
-            print(f"Interface {runtime_action} completed and verified.")
-        elif runtime_action:
-            print("Configuration updated; interface is stopped, so no restart was attempted.")
-        else:
-            print("Client profiles updated; no tunnel restart was required.")
+        data = {
+            "key": args.key,
+            "old": old_display,
+            "new": new_display,
+            "changed": True,
+            "backup": str(backup),
+            "runtime_action": runtime_action if runtime_action and active else "none",
+            "service_stopped": bool(runtime_action and not active),
+        }
         if args.key == "listen-port":
-            print("AWS LIGHTSAIL FIREWALL UPDATE REQUIRED")
-            print(f"  old: Custom / UDP / {old_display} / 0.0.0.0/0")
-            print(f"  new: Custom / UDP / {new_display} / 0.0.0.0/0")
+            data.update(
+                aws_firewall_update_required=True,
+                old_aws_rule=f"Custom / UDP / {old_display} / 0.0.0.0/0",
+                new_aws_rule=f"Custom / UDP / {new_display} / 0.0.0.0/0",
+            )
+        if getattr(args, "json", False):
+            print(json.dumps(json_envelope("config set", data=data), indent=2, sort_keys=True))
+        else:
+            print(f"Updated {args.key}: {old_display} -> {new_display}")
+            print(f"Pre-change backup: {backup}")
+            if runtime_action and active:
+                print(f"Interface {runtime_action} completed and verified.")
+            elif runtime_action:
+                print("Configuration updated; interface is stopped, so no restart was attempted.")
+            else:
+                print("Client profiles updated; no tunnel restart was required.")
+            if args.key == "listen-port":
+                print("AWS LIGHTSAIL FIREWALL UPDATE REQUIRED")
+                print(f"  old: {data['old_aws_rule']}")
+                print(f"  new: {data['new_aws_rule']}")
     return 0
 
 
@@ -2305,7 +2375,15 @@ def cmd_service(args: argparse.Namespace) -> int:
             return 0
         service_action(args.command, config["interface"])
         audit(f"service {args.command}: {config['interface']}")
-        print(f"{SERVICE_TEMPLATE.format(interface=config['interface'])}: {args.command} successful")
+        data = {
+            "action": args.command,
+            "service": SERVICE_TEMPLATE.format(interface=config["interface"]),
+            "successful": True,
+        }
+        if getattr(args, "json", False):
+            print(json.dumps(json_envelope(args.command, data=data), indent=2, sort_keys=True))
+        else:
+            print(f"{data['service']}: {args.command} successful")
     return 0
 
 
