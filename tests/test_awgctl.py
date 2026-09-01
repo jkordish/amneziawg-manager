@@ -1,22 +1,16 @@
 #!/usr/bin/env python3
 import base64
-import importlib.machinery
-import importlib.util
 import ipaddress
 import pathlib
+import sys
 import tempfile
 import unittest
 
 
 BUILD_ROOT = pathlib.Path(__file__).parents[1]
-MODULE_PATH = BUILD_ROOT / "awgctl.py"
-if not MODULE_PATH.exists():
-    MODULE_PATH = BUILD_ROOT / "bin/awgctl"
-LOADER = importlib.machinery.SourceFileLoader("awgctl", str(MODULE_PATH))
-SPEC = importlib.util.spec_from_loader("awgctl", LOADER)
-awgctl = importlib.util.module_from_spec(SPEC)
-assert SPEC.loader is not None
-SPEC.loader.exec_module(awgctl)
+sys.path.insert(0, str(BUILD_ROOT / "src"))
+
+from awgctl import core as awgctl
 
 
 def key(byte: int) -> str:

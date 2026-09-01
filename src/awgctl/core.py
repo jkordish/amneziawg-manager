@@ -24,6 +24,8 @@ import time
 import urllib.request
 from typing import Any, Iterable, Iterator, Sequence
 
+from .version import VERSION
+
 
 ROOT = pathlib.Path("/opt/amneziawg")
 CONFIG_FILE = ROOT / "config/server.json"
@@ -1725,6 +1727,7 @@ def cmd_migrate_existing(args: argparse.Namespace) -> int:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="awgctl", description="Manage the host's AmneziaWG installation")
+    parser.add_argument("--version", action="version", version=f"awgctl {VERSION}")
     subcommands = parser.add_subparsers(dest="command", required=True)
     for name in ("status", "health", "check", "start", "stop", "restart", "reload", "backup", "aws-rule"):
         subcommands.add_parser(name)
