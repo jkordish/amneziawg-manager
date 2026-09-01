@@ -618,6 +618,8 @@ def parse_awg_config(text: str) -> dict[str, list[dict[str, str]]]:
         value = value.strip()
         if not key:
             raise AwgctlError(f"empty key at line {number}")
+        if key in current:
+            raise AwgctlError(f"duplicate key {key} at line {number}")
         current[key] = value
     return sections
 
@@ -1476,12 +1478,23 @@ def parse_import_profile(
 ) -> dict[str, Any]:
     """Validate a client profile against managed server semantics."""
     parsed = parse_awg_config(profile_text)
+    unknown_sections = sorted(set(parsed) - {"Interface", "Peer"})
+    if unknown_sections:
+        raise AwgctlError(f"unsupported client profile section: {unknown_sections[0]}")
     interfaces = parsed.get("Interface", [])
     peers = parsed.get("Peer", [])
     if len(interfaces) != 1 or len(peers) != 1:
         raise AwgctlError("client profile must contain exactly one Interface and one Peer")
     interface = interfaces[0]
     peer = peers[0]
+    interface_fields = {"PrivateKey", "Address", "DNS", "MTU", *config.get("obfuscation", {})}
+    peer_fields = {"PublicKey", "PresharedKey", "Endpoint", "AllowedIPs", "PersistentKeepalive"}
+    unknown_interface = sorted(set(interface) - interface_fields)
+    unknown_peer = sorted(set(peer) - peer_fields)
+    if unknown_interface:
+        raise AwgctlError(f"unsupported client Interface directive: {unknown_interface[0]}")
+    if unknown_peer:
+        raise AwgctlError(f"unsupported client Peer directive: {unknown_peer[0]}")
     try:
         private = validate_key(interface["PrivateKey"], "client private key")
         address = ipaddress.ip_interface(interface["Address"])
@@ -1520,12 +1533,13 @@ def parse_import_profile(
                 "derived client public key",
             )
     public = validate_key(derive_public(private), "derived client public key")
+    canonical_config = {**config, "use_psk": bool(config.get("use_psk", True))}
     return {
         "private_key": private,
         "public_key": public,
         "psk": psk,
         "address": str(address),
-        "profile": profile_text,
+        "profile": render_client_config(canonical_config, private, psk, server_public, str(address)),
     }
 
 
@@ -2144,20 +2158,46 @@ def _server_peer_for_public(public_key: str) -> dict[str, str]:
     return matches[0]
 
 
+def read_client_profile(path: pathlib.Path, *, maximum: int = 64 * 1024) -> str:
+    """Read one private regular file through the descriptor that was validated."""
+    flags = os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
+    try:
+        fd = os.open(path, flags)
+    except OSError as exc:
+        raise AwgctlError(f"cannot read client profile: {path}") from exc
+    try:
+        metadata = os.fstat(fd)
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+            raise AwgctlError("client profile must be a regular non-linked file")
+        if stat.S_IMODE(metadata.st_mode) & 0o077:
+            raise AwgctlError("client profile must not be accessible by group or other users")
+        if metadata.st_size > maximum:
+            raise AwgctlError("client profile is unexpectedly large")
+        chunks: list[bytes] = []
+        total = 0
+        while True:
+            chunk = os.read(fd, min(16 * 1024, maximum + 1 - total))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            total += len(chunk)
+            if total > maximum:
+                raise AwgctlError("client profile is unexpectedly large")
+        data = b"".join(chunks)
+    except OSError as exc:
+        raise AwgctlError(f"cannot read client profile: {path}") from exc
+    finally:
+        os.close(fd)
+    try:
+        return data.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise AwgctlError("client profile is not valid UTF-8") from exc
+
+
 def cmd_client_import(args: argparse.Namespace) -> int:
     name = validate_client_name(args.client_name)
     profile_path = args.profile.expanduser()
-    try:
-        metadata = profile_path.lstat()
-    except OSError as exc:
-        raise AwgctlError(f"cannot read client profile: {profile_path}") from exc
-    if not stat.S_ISREG(metadata.st_mode) or profile_path.is_symlink():
-        raise AwgctlError("client profile must be a regular non-symlink file")
-    if stat.S_IMODE(metadata.st_mode) & 0o077:
-        raise AwgctlError("client profile must not be accessible by group or other users")
-    if metadata.st_size > 64 * 1024:
-        raise AwgctlError("client profile is unexpectedly large")
-    profile_text = profile_path.read_text(encoding="utf-8")
+    profile_text = read_client_profile(profile_path)
     with mutation_lock():
         ensure_no_drift()
         config = load_config()
@@ -2241,7 +2281,7 @@ def cmd_client_import(args: argparse.Namespace) -> int:
                     imported["psk"],
                     created_at=same_name.get("created_at") if same_name else None,
                     imported_from=str(profile_path),
-                    profile_text=profile_text,
+                    profile_text=imported["profile"],
                     owner=proposed["owner"],
                     device=proposed["device"],
                     expires=proposed["expires"],
@@ -2994,7 +3034,7 @@ def diagnostic_command(argv: Sequence[str]) -> bytes:
 
 def cmd_diagnose(args: argparse.Namespace) -> int:
     config = load_config()
-    parent = args.output.expanduser().resolve() if args.output else DIAGNOSTICS
+    parent = args.output.expanduser().absolute() if args.output else DIAGNOSTICS
     if args.dry_run:
         data = {
             "dry_run": True,
@@ -3049,7 +3089,6 @@ def cmd_diagnose(args: argparse.Namespace) -> int:
             except OSError as exc:
                 files[name] = f"unavailable: {exc}\n".encode()
         bundle = create_diagnostic_bundle(parent, product_version=VERSION, created_at=iso_now(), files=files)
-        chmod_secret_tree(bundle)
     audit(f"redacted diagnostics created: {bundle.name}")
     data = {"path": str(bundle), "redacted": True, "manifest": str(bundle / "manifest.json")}
     if getattr(args, "json", False):

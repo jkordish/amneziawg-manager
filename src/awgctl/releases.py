@@ -13,12 +13,12 @@ import urllib.error
 import urllib.request
 from typing import Any
 
+from .semver import InvalidVersion, precedence_key
+
 
 RELEASE_IDENTITY = "releases@amneziawg-manager"
 RELEASE_PUBLIC_KEY = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAILyqkGfE04/pFwwS2b+K0trRm6SFVhAGSqrTewfpOhpO releases@amneziawg-manager"
-_VERSION_RE = re.compile(r"^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$")
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
-_TAG_RE = re.compile(r"^v\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$")
 GITHUB_REPOSITORY = "jkordish/amneziawg-manager"
 
 
@@ -26,12 +26,23 @@ class ReleaseError(RuntimeError):
     """A release failed authenticity or integrity validation."""
 
 
-def version_key(value: str) -> tuple[int, int, int, int, str]:
-    if not _VERSION_RE.fullmatch(value):
-        raise ReleaseError(f"invalid release version: {value}")
-    base, separator, prerelease = value.partition("-")
-    major, minor, patch = (int(part) for part in base.split("."))
-    return major, minor, patch, 0 if separator else 1, prerelease
+def version_key(
+    value: str,
+) -> tuple[int, int, int, int, tuple[tuple[int, int | str], ...]]:
+    try:
+        return precedence_key(value)
+    except InvalidVersion as exc:
+        raise ReleaseError(f"invalid release version: {value}") from exc
+
+
+def _valid_tag(value: object) -> bool:
+    if not isinstance(value, str) or not value.startswith("v"):
+        return False
+    try:
+        version_key(value[1:])
+    except ReleaseError:
+        return False
+    return True
 
 
 def parse_manifest(data: bytes, *, expected_platform: str) -> dict[str, Any]:
@@ -45,7 +56,11 @@ def parse_manifest(data: bytes, *, expected_platform: str) -> dict[str, Any]:
     }:
         raise ReleaseError("release manifest fields are incomplete or unexpected")
     version = manifest["version"]
-    if manifest["schema_version"] != 1 or not isinstance(version, str) or not _VERSION_RE.fullmatch(version):
+    try:
+        version_key(version)
+    except ReleaseError as exc:
+        raise ReleaseError("unsupported release manifest schema or version") from exc
+    if manifest["schema_version"] != 1:
         raise ReleaseError("unsupported release manifest schema or version")
     if manifest["tag"] != f"v{version}":
         raise ReleaseError("release tag and version do not match")
@@ -142,7 +157,7 @@ def discover_release_tag(*, channel: str = "beta") -> str:
         if channel == "stable" and release.get("prerelease"):
             continue
         tag = release.get("tag_name")
-        if isinstance(tag, str) and _TAG_RE.fullmatch(tag):
+        if _valid_tag(tag):
             return tag
     raise ReleaseError(f"no published {channel} release was found")
 
@@ -153,7 +168,7 @@ def fetch_verified_release(
     expected_platform: str,
     include_artifact: bool,
 ) -> tuple[dict[str, Any], bytes | None]:
-    if not _TAG_RE.fullmatch(tag):
+    if not _valid_tag(tag):
         raise ReleaseError("invalid discovered release tag")
     base = f"https://github.com/{GITHUB_REPOSITORY}/releases/download/{tag}"
     manifest_bytes = fetch_bytes(f"{base}/release.json", maximum=64 * 1024)

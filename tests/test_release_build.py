@@ -37,6 +37,29 @@ class ReleaseBuildTests(unittest.TestCase):
             self.assertEqual(manifest["installation_schema_version"], 1)
             self.assertEqual(manifest["artifact"]["name"], "awgctl.pyz")
 
+    def test_manifest_builder_rejects_invalid_semver(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            artifact = root / "awgctl.pyz"
+            artifact.write_bytes(b"artifact")
+            output = root / "release.json"
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(REPO_ROOT / "tools/build_manifest.py"),
+                    "--artifact", str(artifact),
+                    "--output", str(output),
+                    "--version", "0.1.0-beta.01",
+                ],
+                cwd=REPO_ROOT,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                check=False,
+            )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertFalse(output.exists())
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

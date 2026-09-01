@@ -10,10 +10,42 @@ import unittest
 REPO_ROOT = pathlib.Path(__file__).parents[1]
 sys.path.insert(0, str(REPO_ROOT / "src"))
 
-from awgctl.releases import RELEASE_PUBLIC_KEY, ReleaseError, parse_manifest, verify_artifact, verify_ssh_signature
+from awgctl.releases import (
+    RELEASE_PUBLIC_KEY,
+    ReleaseError,
+    parse_manifest,
+    verify_artifact,
+    verify_ssh_signature,
+    version_key,
+)
 
 
 class ReleaseVerificationTests(unittest.TestCase):
+    def test_semver_prerelease_identifiers_follow_semver_precedence(self):
+        ordered = [
+            "0.1.0-beta.4",
+            "0.1.0-beta.10",
+            "0.1.0-beta.10.1",
+            "0.1.0-beta.alpha",
+            "0.1.0-rc.1",
+            "0.1.0",
+        ]
+        self.assertEqual(sorted(reversed(ordered), key=version_key), ordered)
+
+    def test_invalid_semver_versions_are_rejected(self):
+        for value in (
+            "01.2.3",
+            "1.02.3",
+            "1.2.03",
+            "1.2.3-beta.01",
+            "1.2.3-beta..1",
+            "1.2.3-",
+            "v1.2.3",
+            "1.2.3+build",
+        ):
+            with self.subTest(value=value), self.assertRaises(ReleaseError):
+                version_key(value)
+
     def test_committed_and_embedded_release_public_keys_match(self):
         self.assertEqual((REPO_ROOT / "release-signing-key.pub").read_text().strip(), RELEASE_PUBLIC_KEY)
 

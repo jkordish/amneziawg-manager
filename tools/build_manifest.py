@@ -8,10 +8,12 @@ import hashlib
 import json
 import os
 import pathlib
-import re
+import sys
 
+REPO_ROOT = pathlib.Path(__file__).parents[1]
+sys.path.insert(0, str(REPO_ROOT / "src"))
 
-VERSION_RE = re.compile(r"^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$")
+from awgctl.semver import InvalidVersion, precedence_key
 
 
 def main() -> int:
@@ -20,7 +22,9 @@ def main() -> int:
     parser.add_argument("--output", type=pathlib.Path, required=True)
     parser.add_argument("--version", required=True)
     args = parser.parse_args()
-    if not VERSION_RE.fullmatch(args.version):
+    try:
+        precedence_key(args.version)
+    except InvalidVersion:
         parser.error("--version must be a semantic release version without a leading v")
     if not args.artifact.is_file():
         parser.error("--artifact must be an existing regular file")
