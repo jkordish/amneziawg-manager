@@ -38,7 +38,12 @@ from .contracts import (
     mark_profile_rotated,
     normalize_client_metadata,
 )
-from .diagnostics import DiagnosticsError, create_bundle as create_diagnostic_bundle, redact_awg_config
+from .diagnostics import (
+    DiagnosticsError,
+    create_bundle as create_diagnostic_bundle,
+    redact_awg_config,
+    sanitize_cps_text,
+)
 from .releases import ReleaseError, discover_release_tag, fetch_verified_release, version_key
 from .selftest import SelfTestError, run_namespace_selftest
 from .version import VERSION
@@ -2110,6 +2115,7 @@ def validate_restore_stage(stage: pathlib.Path) -> dict[str, Any]:
     except (OSError, UnicodeError, json.JSONDecodeError) as exc:
         raise AwgctlError("backup is missing required managed state") from exc
     config = validate_server_config(config)
+    restore_now = dt.datetime.now(dt.timezone.utc)
     validate_key(server_private, "server private key")
     validate_key(server_public, "server public key")
     derived_public = run(["awg", "pubkey"], input_data=(server_private + "\n").encode("ascii")).stdout.decode().strip()
@@ -2154,12 +2160,28 @@ def validate_restore_stage(stage: pathlib.Path) -> dict[str, Any]:
         raise AwgctlError(
             "backup generated configuration header-protection or obfuscation differs from managed state"
         )
-    _validate_restore_clients(
+    clients = _validate_restore_clients(
         stage,
         config,
         server_public=server_public,
         header_key=header_key,
     )
+    expected_server = render_server_config(
+        config,
+        server_private,
+        clients,
+        now=restore_now,
+        header_protection_key=header_key,
+    )
+    expected_parsed = parse_awg_config(expected_server)
+
+    def complete_signature(value: dict[str, list[dict[str, str]]]) -> tuple[Any, ...]:
+        interface = tuple(sorted(value["Interface"][0].items()))
+        peers = tuple(sorted(tuple(sorted(peer.items())) for peer in value.get("Peer", [])))
+        return interface, peers
+
+    if complete_signature(parsed) != complete_signature(expected_parsed):
+        raise AwgctlError("backup generated server differs from managed client and interface state")
     validate_native_server(generated_server)
     validate_nftables_text(generated_nft)
     return config
@@ -4905,6 +4927,7 @@ def main(argv: Sequence[str] | None = None, *, entrypoint: str = "public") -> in
         PlatformError, ReleaseError, SelfTestError,
     ) as exc:
         audit(f"command failed: {args.command}")
+        public_error = sanitize_cps_text(str(exc))
         if getattr(args, "json", False):
             command = args.command
             for attribute in ("config_command", "client_command", "backup_command", "update_action"):
@@ -4912,9 +4935,9 @@ def main(argv: Sequence[str] | None = None, *, entrypoint: str = "public") -> in
                 if value:
                     command += f" {value}"
                     break
-            print(json.dumps(json_envelope(command, errors=[str(exc)]), indent=2, sort_keys=True))
+            print(json.dumps(json_envelope(command, errors=[public_error]), indent=2, sort_keys=True))
         else:
-            print(f"awgctl: {exc}", file=sys.stderr)
+            print(f"awgctl: {public_error}", file=sys.stderr)
         return 1
     except KeyboardInterrupt:
         print("awgctl: interrupted", file=sys.stderr)

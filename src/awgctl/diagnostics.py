@@ -18,11 +18,20 @@ _KEY_LINE = re.compile(
     r"(?P<value>\S+)(\s*)$",
     re.MULTILINE,
 )
-_CPS_LINE = re.compile(r"^(\s*I[1-5]\s*=\s*)[^\r\n]*$", re.MULTILINE)
+_CPS_ASSIGNMENT = re.compile(
+    r"(\bI[1-5][ \t]*=[ \t]*)(?:"
+    r"'[^'\r\n]*'|\"[^\"\r\n]*\"|(?:<[^>\r\n]*>)+|[^'\"\r\n]*"
+    r")"
+)
 
 
 class DiagnosticsError(RuntimeError):
     """A diagnostic bundle could not be created safely."""
+
+
+def sanitize_cps_text(text: str) -> str:
+    """Remove CPS assignment payloads from standalone or embedded native text."""
+    return _CPS_ASSIGNMENT.sub(r"\1[redacted]", text)
 
 
 def redact_awg_config(text: str) -> str:
@@ -42,7 +51,7 @@ def redact_awg_config(text: str) -> str:
         digest = hashlib.sha256(value).hexdigest()[:length]
         return f"{match.group(1)}[redacted sha256:{digest}]{match.group(4)}"
 
-    return _CPS_LINE.sub(r"\1[redacted]", _KEY_LINE.sub(replace, text))
+    return sanitize_cps_text(_KEY_LINE.sub(replace, text))
 
 
 def _safe_relative(name: str) -> pathlib.PurePosixPath:
