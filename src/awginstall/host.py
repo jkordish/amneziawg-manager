@@ -217,23 +217,21 @@ def _probe_expiry_timer_state(
             "could not determine a supported expiry timer unit-file state "
             f"(exit {enabled_result.returncode})"
         )
-    active_states = {
-        (0, b"active\n"): "active",
-        (3, b"inactive\n"): "inactive",
-    }
+    if unit_file_state == "not-found":
+        active_states = {(4, b"inactive\n"): "inactive"}
+        if allow_loaded_not_found:
+            active_states[(0, b"active\n")] = "active"
+    else:
+        active_states = {
+            (0, b"active\n"): "active",
+            (3, b"inactive\n"): "inactive",
+        }
     active_state = active_states.get((active_result.returncode, active_result.stdout))
     if active_state is None:
         raise HostConfigurationError(
-            "could not determine a supported expiry timer active state "
+            "could not determine a supported expiry timer active state for "
+            f"unit-file state {unit_file_state} "
             f"(exit {active_result.returncode})"
-        )
-    if (
-        unit_file_state == "not-found"
-        and active_state != "inactive"
-        and not allow_loaded_not_found
-    ):
-        raise HostConfigurationError(
-            "expiry timer not-found unit-file state must be inactive"
         )
     return ExpiryTimerState(
         unit_file_state=unit_file_state,
