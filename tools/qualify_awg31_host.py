@@ -31,8 +31,12 @@ sys.path.insert(0, str(REPO_ROOT / "src"))
 
 from awgctl.core import (
     AWG31_QUALIFICATION_POLICY_VERSION,
+    ACTIVATION_JOURNAL_FILE,
     AwgctlError,
     LOCK_FILE,
+    SERVICE_OPERATION_FILE,
+    TRANSITION_FILE,
+    TRANSITION_OUTCOME_FILE,
     build_russia_ios_obfuscation,
     inspect_awg_versions,
     load_config,
@@ -94,6 +98,10 @@ _OPEN_DIRECTORY_FLAGS = (
 
 class QualificationError(RuntimeError):
     """The host could not be qualified without weakening a safety invariant."""
+
+
+class QualificationInterrupted(QualificationError):
+    """A handled termination request that must survive verified cleanup."""
 
 
 @dataclasses.dataclass(frozen=True)
@@ -493,9 +501,12 @@ def _runner_output(
 def cleanup_owned_resources(resources: OwnedResources) -> None:
     """Best-effort delete, then prove absence of only the recorded resources."""
     cleanup_errors: list[Exception] = []
+    interruption: QualificationInterrupted | None = None
     for link in reversed(resources.host_links):
         try:
             _runner_output(resources.runner, ["ip", "link", "delete", link])
+        except QualificationInterrupted as exc:
+            interruption = interruption or exc
         except Exception as exc:
             cleanup_errors.append(exc)
     for namespace in reversed(resources.namespaces):
@@ -503,6 +514,8 @@ def cleanup_owned_resources(resources: OwnedResources) -> None:
             _runner_output(
                 resources.runner, ["ip", "netns", "delete", namespace]
             )
+        except QualificationInterrupted as exc:
+            interruption = interruption or exc
         except Exception as exc:
             cleanup_errors.append(exc)
 
@@ -513,6 +526,8 @@ def cleanup_owned_resources(resources: OwnedResources) -> None:
         remaining_links = _root_link_names(
             _runner_output(resources.runner, ["ip", "-j", "link", "show"])
         )
+    except QualificationInterrupted:
+        raise
     except Exception as exc:
         raise QualificationError(
             "could not verify isolated qualification cleanup"
@@ -524,6 +539,8 @@ def cleanup_owned_resources(resources: OwnedResources) -> None:
 
     resources.namespaces.clear()
     resources.host_links.clear()
+    if interruption is not None:
+        raise interruption
     if cleanup_errors:
         # A moved veth is expected to be absent from the root namespace. Only the
         # post-cleanup inventories decide whether the cleanup succeeded.
@@ -966,6 +983,13 @@ _SAFE_STABLE_AWG_FIELDS = (
     "allowed-ips",
     "persistent-keepalive",
 )
+_SAFE_CLASSIC_AWG_FIELDS = tuple(field.lower() for field in _CLASSIC_CANDIDATE)
+RECOVERY_ARTIFACT_PATHS = (
+    SERVICE_OPERATION_FILE,
+    TRANSITION_FILE,
+    TRANSITION_OUTCOME_FILE,
+    ACTIVATION_JOURNAL_FILE,
+)
 
 
 class ProtectedReader(Protocol):
@@ -1172,6 +1196,52 @@ def verify_preflight(
     )
 
 
+def resolve_public_preflight_path(
+    path: pathlib.Path,
+    *,
+    lstat_reader: Callable[[pathlib.Path], Any] = os.lstat,
+    link_reader: Callable[[pathlib.Path], str] = os.readlink,
+) -> pathlib.Path:
+    """Resolve only Ubuntu's canonical os-release symlink without following others."""
+    if path != pathlib.Path("/etc/os-release"):
+        return path
+    try:
+        metadata = lstat_reader(path)
+    except OSError as exc:
+        raise QualificationError("platform OS release metadata is unavailable") from exc
+    if not stat.S_ISLNK(metadata.st_mode):
+        return path
+    try:
+        target = link_reader(path)
+    except OSError as exc:
+        raise QualificationError("platform OS release link is unreadable") from exc
+    if (
+        metadata.st_uid != 0
+        or metadata.st_gid != 0
+        or target not in {"../usr/lib/os-release", "/usr/lib/os-release"}
+    ):
+        _fail("platform OS release link is not the trusted system link")
+    return pathlib.Path("/usr/lib/os-release")
+
+
+def present_recovery_artifacts(
+    paths: Sequence[pathlib.Path] = RECOVERY_ARTIFACT_PATHS,
+) -> tuple[pathlib.Path, ...]:
+    """Report exact manager journals without reading or reconciling their contents."""
+    present: list[pathlib.Path] = []
+    for path in paths:
+        try:
+            os.lstat(path)
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            raise QualificationError(
+                "manager recovery artifact state cannot be inspected"
+            ) from exc
+        present.append(path)
+    return tuple(present)
+
+
 class LiveProtectedReader:
     """Descriptor-safe reader that returns only aggregate protected-state hashes."""
 
@@ -1184,11 +1254,18 @@ class LiveProtectedReader:
             pathlib.Path("/sys/module/amneziawg/version"),
         }:
             _fail("protected reader received an unsupported public path")
+        open_path = resolve_public_preflight_path(path)
         flags = os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
-        fd = os.open(path, flags)
+        fd = os.open(open_path, flags)
         try:
             metadata = os.fstat(fd)
-            if not stat.S_ISREG(metadata.st_mode) or metadata.st_size > 65536:
+            if (
+                not stat.S_ISREG(metadata.st_mode)
+                or metadata.st_uid != 0
+                or metadata.st_gid != 0
+                or stat.S_IMODE(metadata.st_mode) & 0o022
+                or metadata.st_size > 65536
+            ):
                 _fail("public preflight file is not a bounded regular file")
             chunks: list[bytes] = []
             while True:
@@ -1376,14 +1453,14 @@ def capture_production_snapshot(
         field: _runner_output(
             command_runner, ["awg", "show", "awg0", field]
         )
-        for field in _SAFE_STABLE_AWG_FIELDS
+        for field in (*_SAFE_STABLE_AWG_FIELDS, *_SAFE_CLASSIC_AWG_FIELDS)
     }
     stable_live_size = sum(len(output) for output in stable_live_outputs.values())
     if stable_live_size == 0 or stable_live_size > 1024 * 1024:
         _fail("complete safe live AWG state is unavailable or unbounded")
     stable_live_configuration = b"".join(
         field.encode("ascii") + b"\0" + stable_live_outputs[field] + b"\0"
-        for field in _SAFE_STABLE_AWG_FIELDS
+        for field in (*_SAFE_STABLE_AWG_FIELDS, *_SAFE_CLASSIC_AWG_FIELDS)
     )
     peers = _normalized_peer_lines(stable_live_outputs["peers"])
     handshake_peers = _normalized_peer_lines(
@@ -1475,6 +1552,9 @@ class LiveAdapters:
     ).replace(microsecond=0).isoformat().replace("+00:00", "Z")
     effective_uid: Callable[[], int] = os.geteuid
     lock_factory: Callable[[], Any] = qualification_mutation_exclusion
+    recovery_artifact_probe: Callable[[], tuple[pathlib.Path, ...]] = (
+        present_recovery_artifacts
+    )
 
     def mutation_exclusion(self) -> Any:
         return self.lock_factory()
@@ -1484,6 +1564,8 @@ class LiveAdapters:
     ) -> PreflightEvidence:
         if self.effective_uid() != 0:
             _fail("non-root qualification is forbidden")
+        if self.recovery_artifact_probe():
+            _fail("manager recovery artifact blocks qualification preflight")
         git_prefix = ["git", "-C", str(REPO_ROOT)]
         git_status = _runner_output(
             self.command_runner, [*git_prefix, "status", "--porcelain=v1"]
@@ -1504,6 +1586,8 @@ class LiveAdapters:
             ["/usr/local/sbin/awgctl", "status", "--json"],
             timeout=30,
         )
+        if self.recovery_artifact_probe():
+            _fail("manager recovery artifact appeared during qualification preflight")
         service = _runner_output(
             self.command_runner,
             ["systemctl", "is-active", "awg-quick@awg0.service"],
@@ -1739,7 +1823,9 @@ def main(
         return 2
 
     def interrupted(signum: int, _frame: Any) -> NoReturn:
-        raise QualificationError(f"qualification interrupted by signal {signum}")
+        raise QualificationInterrupted(
+            f"qualification interrupted by signal {signum}"
+        )
 
     previous_umask = os.umask(0o077)
     previous_handlers: dict[signal.Signals, Any] = {}

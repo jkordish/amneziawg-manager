@@ -11,6 +11,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from types import SimpleNamespace
 from unittest import mock
 
 
@@ -521,6 +522,40 @@ class NamespaceQualificationTests(unittest.TestCase):
 
         self.assertEqual(len(restored_masks), 3)
 
+    def test_cleanup_preserves_termination_after_proving_resources_absent(self):
+        runner = ScriptedRunner()
+        runner.namespaces.add("awgq-s-a1b2c3")
+        runner.root_links.add("awgq-vs-a1b2c3")
+        resources = qualification.OwnedResources(
+            runner=runner,
+            namespaces=["awgq-s-a1b2c3"],
+            host_links=["awgq-vs-a1b2c3"],
+        )
+        original_runner = runner.__call__
+        interrupted = False
+
+        def interrupt_after_delete(argv, *, input_data=None, timeout=20):
+            nonlocal interrupted
+            result = original_runner(
+                argv, input_data=input_data, timeout=timeout
+            )
+            if tuple(argv[:3]) == ("ip", "link", "delete") and not interrupted:
+                interrupted = True
+                raise qualification.QualificationInterrupted(
+                    "qualification interrupted by signal 15"
+                )
+            return result
+
+        resources.runner = interrupt_after_delete
+
+        with self.assertRaisesRegex(
+            qualification.QualificationInterrupted, "signal 15"
+        ):
+            qualification.cleanup_owned_resources(resources)
+
+        self.assertNotIn("awgq-s-a1b2c3", runner.namespaces)
+        self.assertNotIn("awgq-vs-a1b2c3", runner.root_links)
+
 
 class StaticProtectedReader:
     def __init__(self, digest="f" * 64, module="3.1.20260812\n"):
@@ -588,7 +623,7 @@ def status_document():
 
 def stable_live_awg_outputs(*, allowed_ips=b"peer\t10.77.42.2/32\n"):
     peer = b"A" * 43 + b"="
-    return {
+    outputs = {
         ("awg", "show", "awg0", "public-key"): peer + b"\n",
         ("awg", "show", "awg0", "private-key"): b"B" * 43 + b"=\n",
         ("awg", "show", "awg0", "listen-port"): b"55323\n",
@@ -599,6 +634,13 @@ def stable_live_awg_outputs(*, allowed_ips=b"peer\t10.77.42.2/32\n"):
         ("awg", "show", "awg0", "allowed-ips"): allowed_ips,
         ("awg", "show", "awg0", "persistent-keepalive"): peer + b"\toff\n",
     }
+    outputs.update(
+        {
+            ("awg", "show", "awg0", field.lower()): f"{value}\n".encode()
+            for field, value in classic_obfuscation().items()
+        }
+    )
+    return outputs
 
 
 class QualificationCliTests(unittest.TestCase):
@@ -744,6 +786,56 @@ class QualificationCliTests(unittest.TestCase):
 
         runner.assert_not_called()
 
+    def test_live_preflight_rejects_recovery_artifacts_before_manager_commands(self):
+        runner = mock.Mock(side_effect=AssertionError("must not run"))
+        adapters = qualification.LiveAdapters(
+            command_runner=runner,
+            protected_reader=StaticProtectedReader(),
+            effective_uid=lambda: 0,
+            recovery_artifact_probe=lambda: (
+                pathlib.Path("/run/awgctl/service-operation.json"),
+            ),
+        )
+
+        with self.assertRaisesRegex(
+            qualification.QualificationError, "recovery artifact"
+        ):
+            adapters.verify_preflight(
+                expected_tools="3.1.20260812",
+                expected_module="3.1.20260812",
+            )
+
+        runner.assert_not_called()
+
+    def test_public_preflight_path_accepts_standard_os_release_symlink(self):
+        metadata = SimpleNamespace(
+            st_mode=stat.S_IFLNK | 0o777,
+            st_uid=0,
+            st_gid=0,
+        )
+
+        resolved = qualification.resolve_public_preflight_path(
+            pathlib.Path("/etc/os-release"),
+            lstat_reader=lambda _path: metadata,
+            link_reader=lambda _path: "../usr/lib/os-release",
+        )
+
+        self.assertEqual(resolved, pathlib.Path("/usr/lib/os-release"))
+
+    def test_public_preflight_path_rejects_untrusted_os_release_symlink(self):
+        metadata = SimpleNamespace(
+            st_mode=stat.S_IFLNK | 0o777,
+            st_uid=1000,
+            st_gid=1000,
+        )
+
+        with self.assertRaises(qualification.QualificationError):
+            qualification.resolve_public_preflight_path(
+                pathlib.Path("/etc/os-release"),
+                lstat_reader=lambda _path: metadata,
+                link_reader=lambda _path: "/tmp/attacker-release",
+            )
+
     def test_snapshot_normalizes_only_volatile_handshakes_and_nft_counters(self):
         peer = b"A" * 43 + b"="
         common = {
@@ -839,6 +931,39 @@ class QualificationCliTests(unittest.TestCase):
 
         self.assertNotEqual(first.interface_sha256, second.interface_sha256)
 
+    def test_snapshot_detects_classic_obfuscation_change(self):
+        common = {
+            **stable_live_awg_outputs(),
+            ("ip", "-j", "address", "show", "dev", "awg0"): b'[{"ifname":"awg0"}]',
+            ("awg", "show", "awg0", "latest-handshakes"): b"A" * 43 + b"=\t0\n",
+            ("ss", "-H", "-lunp"): b"UNCONN 0 0 0.0.0.0:55323 0.0.0.0:*\n",
+            ("nft", "-j", "list", "ruleset"): b'{"nftables":[]}',
+            ("systemctl", "is-active", "awg-quick@awg0.service"): b"active\n",
+            ("systemctl", "is-enabled", "awg-quick@awg0.service"): b"enabled\n",
+            (
+                "dpkg-query",
+                "-W",
+                "-f=${Package}\\t${Version}\\n",
+                "amneziawg",
+                "amneziawg-tools",
+                "amneziawg-dkms",
+            ): b"packages\n",
+            ("dkms", "status"): b"dkms\n",
+        }
+        changed = {
+            **common,
+            ("awg", "show", "awg0", "jc"): b"7\n",
+        }
+
+        before = qualification.capture_production_snapshot(
+            MappingRunner(common), StaticProtectedReader()
+        )
+        after = qualification.capture_production_snapshot(
+            MappingRunner(changed), StaticProtectedReader()
+        )
+
+        self.assertNotEqual(before.interface_sha256, after.interface_sha256)
+
     def test_snapshot_uses_only_closed_safe_awg_selectors(self):
         outputs = {
             **stable_live_awg_outputs(),
@@ -866,6 +991,15 @@ class QualificationCliTests(unittest.TestCase):
         )
 
         self.assertNotIn(("awg", "showconf", "awg0"), runner.argv)
+        queried_fields = {
+            command[3]
+            for command in runner.argv
+            if command[:3] == ("awg", "show", "awg0") and len(command) == 4
+        }
+        self.assertTrue(
+            {field.lower() for field in classic_obfuscation()} <= queried_fields
+        )
+        self.assertTrue({"i1", "i2", "i3", "i4", "i5"}.isdisjoint(queried_fields))
 
     def test_snapshot_binds_the_loaded_module_identity(self):
         outputs = {
