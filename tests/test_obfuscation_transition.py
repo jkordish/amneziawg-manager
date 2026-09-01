@@ -527,6 +527,13 @@ class MutationLockTests(unittest.TestCase):
 
 
 class TransitionInterlockTests(unittest.TestCase):
+    def test_firewall_hook_authorization_rejects_supplied_invalid_operation_id(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with patched_layout(pathlib.Path(directory)), mock.patch.object(core, "require_root"):
+                classic_state()
+                with core.mutation_lock(), self.assertRaisesRegex(core.AwgctlError, "transaction ID"):
+                    core.issue_firewall_hook_authorizations("start", "awg0", operation_id="")
+
     def test_lock_held_service_hooks_consume_one_shot_authorization_without_deadlock(self):
         for service_operation, firewall_action in (("start", "up"), ("stop", "down")):
             with (
@@ -542,33 +549,32 @@ class TransitionInterlockTests(unittest.TestCase):
                         ["_firewall", firewall_action]
                     )
                     applied = []
+                    manager_environment = {}
+                    environment_name = "AWGCTL_FIREWALL_HOOK_OPERATION_ID"
 
                     def systemd_runner(argv, **kwargs):
-                        self.assertEqual(
-                            argv,
-                            [
-                                "systemctl",
-                                service_operation,
-                                "awg-quick@awg0.service",
-                            ],
-                        )
-                        core.dispatch(args)
-                        with self.assertRaisesRegex(
-                            core.AwgctlError,
-                            "firewall hook authorization.*consumed",
-                        ):
-                            core.dispatch(args)
+                        if argv == ["systemctl", "import-environment", environment_name]:
+                            operation_id = kwargs["environment"][environment_name]
+                            self.assertRegex(operation_id, r"^[0-9a-f]{32}$")
+                            manager_environment[environment_name] = operation_id
+                        elif argv == [
+                            "systemctl",
+                            service_operation,
+                            "awg-quick@awg0.service",
+                        ]:
+                            with mock.patch.dict(
+                                core.os.environ,
+                                {environment_name: manager_environment[environment_name]},
+                            ):
+                                core.dispatch(args)
+                        elif argv == ["systemctl", "unset-environment", environment_name]:
+                            manager_environment.pop(environment_name, None)
+                        else:
+                            self.fail("unexpected systemd command")
                         return subprocess.CompletedProcess(argv, 0, b"", b"")
 
                     with core.mutation_lock():
                         with (
-                            mock.patch.object(
-                                core,
-                                "mutation_lock",
-                                side_effect=AssertionError(
-                                    "service hook tried to acquire the manager lock recursively"
-                                ),
-                            ),
                             mock.patch.object(core, "run", side_effect=systemd_runner),
                             mock.patch.object(
                                 core,
@@ -580,10 +586,276 @@ class TransitionInterlockTests(unittest.TestCase):
                             core.service_action(service_operation, "awg0")
 
                     self.assertEqual(applied, [firewall_action])
+                    self.assertEqual(manager_environment, {})
                     self.assertEqual(
                         list(core.RUNTIME_DIR.glob("firewall-hook-*.json")),
                         [],
                     )
+
+    def test_concurrent_action_only_firewall_cannot_steal_lock_held_service_token(self):
+        direct_started = threading.Event()
+        direct_finished = threading.Event()
+        direct_errors = []
+        applied = []
+        direct_thread = None
+        operation_id = None
+        environment_name = "AWGCTL_FIREWALL_HOOK_OPERATION_ID"
+
+        with tempfile.TemporaryDirectory() as directory:
+            with (
+                patched_layout(pathlib.Path(directory)),
+                mock.patch.object(core, "require_root"),
+            ):
+                classic_state()
+                args = core.build_parser(entrypoint="internal").parse_args(
+                    ["_firewall", "down"]
+                )
+
+                def run_direct():
+                    direct_started.set()
+                    try:
+                        core.dispatch(args)
+                    except Exception as exc:
+                        direct_errors.append(exc)
+                    finally:
+                        direct_finished.set()
+
+                def presented_context(parsed):
+                    if threading.current_thread().name == "ordinary-firewall":
+                        return None
+                    return core.os.environ.get(environment_name)
+
+                def systemd_runner(argv, **kwargs):
+                    nonlocal operation_id, direct_thread
+                    if argv == ["systemctl", "import-environment", environment_name]:
+                        operation_id = kwargs["environment"][environment_name]
+                    elif argv == ["systemctl", "stop", "awg-quick@awg0.service"]:
+                        direct_thread = threading.Thread(
+                            target=run_direct,
+                            name="ordinary-firewall",
+                        )
+                        direct_thread.start()
+                        self.assertTrue(direct_started.wait(timeout=5))
+                        self.assertFalse(
+                            direct_finished.wait(timeout=0.1),
+                            "ordinary firewall invocation crossed the manager lock",
+                        )
+                        self.assertEqual(applied, [])
+                        authorization, _ = core._firewall_hook_paths("down")
+                        self.assertTrue(authorization.exists())
+                        with mock.patch.dict(
+                            core.os.environ,
+                            {environment_name: operation_id},
+                        ):
+                            core.dispatch(args)
+                            with self.assertRaisesRegex(
+                                core.AwgctlError,
+                                "firewall hook authorization.*consumed",
+                            ):
+                                core.dispatch(args)
+                    elif argv == ["systemctl", "unset-environment", environment_name]:
+                        pass
+                    else:
+                        self.fail(f"unexpected systemd command: {argv}")
+                    return subprocess.CompletedProcess(argv, 0, b"", b"")
+
+                with (
+                    mock.patch.object(
+                        core,
+                        "presented_firewall_hook_operation_id",
+                        side_effect=presented_context,
+                    ),
+                    mock.patch.object(core, "run", side_effect=systemd_runner),
+                    mock.patch.object(
+                        core,
+                        "firewall_cleanup",
+                        side_effect=lambda: applied.append(threading.current_thread().name),
+                    ),
+                ):
+                    with core.mutation_lock():
+                        core.service_action("stop", "awg0")
+                        self.assertFalse(direct_finished.is_set())
+                    self.assertTrue(direct_finished.wait(timeout=5))
+                    direct_thread.join(timeout=5)
+                    self.assertFalse(direct_thread.is_alive())
+                self.assertEqual(direct_errors, [])
+                self.assertEqual(applied, [threading.current_thread().name, "ordinary-firewall"])
+
+    def test_firewall_hook_context_requires_exact_internal_operation_id(self):
+        environment_name = "AWGCTL_FIREWALL_HOOK_OPERATION_ID"
+        cases = ("wrong", "old", "invalid", "absent", "public")
+        for case in cases:
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as directory:
+                with (
+                    patched_layout(pathlib.Path(directory)),
+                    mock.patch.object(core, "require_root"),
+                ):
+                    classic_state()
+                    with core.mutation_lock():
+                        if case == "old":
+                            old_actions = core.issue_firewall_hook_authorizations(
+                                "start",
+                                "awg0",
+                                operation_id="e" * 32,
+                            )
+                            core.cleanup_firewall_hook_authorizations(old_actions)
+                        actions = core.issue_firewall_hook_authorizations(
+                            "start",
+                            "awg0",
+                            operation_id="d" * 32,
+                        )
+                    authorization, _ = core._firewall_hook_paths("up")
+                    operation_id = json.loads(authorization.read_text())["operation_id"]
+                    parser = core.build_parser(
+                        entrypoint="public" if case == "public" else "internal"
+                    )
+                    args = parser.parse_args(["_firewall", "up"])
+                    presented = {
+                        "wrong": "f" * 32,
+                        "old": "e" * 32,
+                        "invalid": "not-a-capability",
+                        "absent": None,
+                        "public": operation_id,
+                    }[case]
+                    environment = {} if presented is None else {environment_name: presented}
+                    try:
+                        with mock.patch.dict(core.os.environ, environment, clear=False):
+                            if presented is None:
+                                core.os.environ.pop(environment_name, None)
+                            if case in {"absent", "public"}:
+                                with (
+                                    mock.patch.object(
+                                        core,
+                                        "mutation_lock",
+                                        side_effect=AssertionError("protected lock attempted"),
+                                    ),
+                                    self.assertRaisesRegex(AssertionError, "protected lock attempted"),
+                                ):
+                                    core.dispatch(args)
+                            else:
+                                with self.assertRaisesRegex(
+                                    core.AwgctlError,
+                                    "authorization context",
+                                ):
+                                    core.dispatch(args)
+                        self.assertTrue(authorization.exists())
+                        self.assertEqual(
+                            json.loads(authorization.read_text())["operation_id"],
+                            operation_id,
+                        )
+                    finally:
+                        core.cleanup_firewall_hook_authorizations(actions)
+
+    def test_service_hook_environment_failures_are_stable_and_revoke_authorization(self):
+        environment_name = "AWGCTL_FIREWALL_HOOK_OPERATION_ID"
+        cases = ("setup", "unset")
+        for case in cases:
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as directory:
+                with (
+                    patched_layout(pathlib.Path(directory)),
+                    mock.patch.object(core, "require_root"),
+                ):
+                    classic_state()
+                    observed_operation_id = None
+                    calls = []
+
+                    def runner(argv, **kwargs):
+                        nonlocal observed_operation_id
+                        calls.append(list(argv))
+                        if argv == ["systemctl", "import-environment", environment_name]:
+                            observed_operation_id = kwargs["environment"][environment_name]
+                            return subprocess.CompletedProcess(
+                                argv,
+                                1 if case == "setup" else 0,
+                                b"",
+                                b"injected token-shaped detail " + observed_operation_id.encode(),
+                            )
+                        if argv[:2] == ["systemctl", "stop"]:
+                            return subprocess.CompletedProcess(argv, 0, b"", b"")
+                        if argv == ["systemctl", "unset-environment", environment_name]:
+                            return subprocess.CompletedProcess(
+                                argv,
+                                1 if case == "unset" else 0,
+                                b"",
+                                b"injected cleanup detail",
+                            )
+                        self.fail(f"unexpected systemd command: {argv}")
+
+                    expected = {
+                        "setup": "environment setup failed",
+                        "unset": "environment cleanup failed",
+                    }[case]
+                    with core.mutation_lock():
+                        with (
+                            mock.patch.object(core, "run", side_effect=runner),
+                            self.assertRaisesRegex(core.AwgctlError, expected) as raised,
+                        ):
+                            core.service_action("stop", "awg0")
+                    self.assertNotIn(observed_operation_id, str(raised.exception))
+                    self.assertTrue(
+                        all(
+                            not path.exists()
+                            for action in ("up", "down")
+                            for path in core._firewall_hook_paths(action)
+                        )
+                    )
+                    self.assertEqual(
+                        calls[-1],
+                        ["systemctl", "unset-environment", environment_name],
+                    )
+
+    def test_fresh_install_failure_uses_authorized_service_stop_under_lock(self):
+        args = argparse.Namespace(
+            endpoint="vpn.example.com",
+            subnet="10.77.42.0/24",
+            listen_port=4242,
+            external_interface="ens5",
+            dns="1.1.1.2,1.0.0.2",
+            mtu=1280,
+            keepalive=25,
+            first_client="kat-iphone",
+            owner=None,
+            device=None,
+        )
+        actions = []
+
+        def service(action, interface):
+            actions.append((action, interface))
+            if action == "start":
+                raise core.AwgctlError("injected start failure")
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            with patched_layout(root), mock.patch.object(core, "require_root"):
+                config, _ = classic_state()
+                core.CONFIG_FILE.unlink()
+                core.RUNTIME_CONFIG.unlink()
+                with (
+                    mock.patch.object(core, "ensure_layout"),
+                    mock.patch.object(core, "build_fresh_server_config", return_value=config),
+                    mock.patch.object(
+                        core,
+                        "generate_key_material",
+                        side_effect=[("server-private", "server-public", None), ("client-private", "client-public", "psk")],
+                    ),
+                    mock.patch.object(core, "write_client_state", return_value={}),
+                    mock.patch.object(core, "render_server_config", return_value="server\n"),
+                    mock.patch.object(core, "render_nftables_config", return_value="nft\n"),
+                    mock.patch.object(core, "validate_native_server"),
+                    mock.patch.object(core, "validate_nftables_text"),
+                    mock.patch.object(core, "atomic_json"),
+                    mock.patch.object(core, "atomic_write"),
+                    mock.patch.object(core, "service_action", side_effect=service),
+                    mock.patch.object(core, "run", return_value=subprocess.CompletedProcess([], 0, b"", b"")),
+                    mock.patch.object(core, "firewall_cleanup"),
+                    mock.patch.object(core, "cleanup_failed_fresh_install"),
+                    mock.patch.object(core, "audit"),
+                    self.assertRaisesRegex(core.AwgctlError, "state rollback was attempted") as raised,
+                ):
+                    core.cmd_initialize_fresh(args)
+
+        self.assertEqual(str(raised.exception.__cause__), "injected start failure")
+        self.assertEqual(actions, [("start", "awg0"), ("stop", "awg0")])
 
     def test_firewall_hook_authorization_rejects_stale_foreign_replayed_and_changed_context(self):
         cases = ("stale", "foreign", "replayed", "generation", "transition")
@@ -596,25 +868,26 @@ class TransitionInterlockTests(unittest.TestCase):
                     classic_state()
                     with core.mutation_lock():
                         actions = core.issue_firewall_hook_authorizations("start", "awg0")
+                    authorization, _ = core._firewall_hook_paths("up")
+                    operation_id = json.loads(authorization.read_text())["operation_id"]
                     try:
                         if case == "stale":
-                            authorization, _ = core._firewall_hook_paths("up")
                             value = json.loads(authorization.read_text())
                             value["expires_at"] = value["issued_at"]
                             core.atomic_json(authorization, value, 0o600)
                             expected = "authorization is stale"
-                            invocation = lambda: core.consume_firewall_hook_authorization("up")
+                            invocation = lambda: core.consume_firewall_hook_authorization("up", operation_id)
                         elif case == "foreign":
                             expected = "does not match the requested action"
-                            invocation = lambda: core.consume_firewall_hook_authorization("down")
+                            invocation = lambda: core.consume_firewall_hook_authorization("down", operation_id)
                         elif case == "replayed":
-                            self.assertTrue(core.consume_firewall_hook_authorization("up"))
+                            core.consume_firewall_hook_authorization("up", operation_id)
                             expected = "already consumed"
-                            invocation = lambda: core.consume_firewall_hook_authorization("up")
+                            invocation = lambda: core.consume_firewall_hook_authorization("up", operation_id)
                         elif case == "generation":
                             core.atomic_write(core.GENERATED_NFT, b"changed generation\n", 0o600)
                             expected = "generation changed"
-                            invocation = lambda: core.consume_firewall_hook_authorization("up")
+                            invocation = lambda: core.consume_firewall_hook_authorization("up", operation_id)
                         else:
                             with core.mutation_lock(transition_lifecycle=True):
                                 core.compare_and_swap_transition(
@@ -626,7 +899,7 @@ class TransitionInterlockTests(unittest.TestCase):
                                     expected_state=None,
                                 )
                             expected = "transition changed"
-                            invocation = lambda: core.consume_firewall_hook_authorization("up")
+                            invocation = lambda: core.consume_firewall_hook_authorization("up", operation_id)
 
                         with self.assertRaisesRegex(core.AwgctlError, expected):
                             invocation()
@@ -645,6 +918,7 @@ class TransitionInterlockTests(unittest.TestCase):
                     with core.mutation_lock():
                         actions = core.issue_firewall_hook_authorizations("start", "awg0")
                     authorization, _ = core._firewall_hook_paths("up")
+                    operation_id = json.loads(authorization.read_text())["operation_id"]
                     try:
                         if case in {"unknown-field", "bool-schema"}:
                             value = json.loads(authorization.read_text())
@@ -664,7 +938,7 @@ class TransitionInterlockTests(unittest.TestCase):
                             authorization.symlink_to(target)
 
                         with self.assertRaises(core.AwgctlError):
-                            core.consume_firewall_hook_authorization("up")
+                            core.consume_firewall_hook_authorization("up", operation_id)
                     finally:
                         core.cleanup_firewall_hook_authorizations(actions)
 

@@ -84,6 +84,7 @@ ACTIVATION_JOURNAL_FILE = TRANSITIONS / "obfuscation-activation.json"
 RUNTIME_CONFIG = pathlib.Path("/etc/amnezia/amneziawg/awg0.conf")
 RUNTIME_DIR = pathlib.Path("/run/awgctl")
 LOCK_FILE = RUNTIME_DIR / "mutation.lock"
+FIREWALL_HOOK_OPERATION_ENV = "AWGCTL_FIREWALL_HOOK_OPERATION_ID"
 PUBLIC_ENTRYPOINT = pathlib.Path("/usr/local/sbin/awgctl")
 INTERNAL_ENTRYPOINT = ROOT / "libexec/awgctl-internal"
 SUDOERS_CONFIG = pathlib.Path("/etc/sudoers.d/amneziawg-manager")
@@ -194,14 +195,20 @@ def run(
     argv: Sequence[str],
     *,
     input_data: bytes | None = None,
+    environment: dict[str, str] | None = None,
     check: bool = True,
     timeout: float = 15,
 ) -> subprocess.CompletedProcess[bytes]:
-    """Run a command without a shell; secrets may be supplied only on stdin."""
+    """Run without a shell; keep secret material out of the process argv."""
+    child_environment = None
+    if environment is not None:
+        child_environment = os.environ.copy()
+        child_environment.update(environment)
     try:
         result = subprocess.run(
             list(argv),
             input=input_data,
+            env=child_environment,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             check=False,
@@ -2284,6 +2291,8 @@ def _firewall_hook_actions(service_operation: str) -> tuple[str, ...]:
 def issue_firewall_hook_authorizations(
     service_operation: str,
     interface: str,
+    *,
+    operation_id: str | None = None,
 ) -> tuple[str, ...]:
     actions = _firewall_hook_actions(service_operation)
     if not actions:
@@ -2296,7 +2305,9 @@ def issue_firewall_hook_authorizations(
     transition_id = current["transaction_id"] if current is not None else None
     issued_at = dt.datetime.now(dt.timezone.utc).replace(microsecond=0)
     expires_at = issued_at + dt.timedelta(seconds=60)
-    operation_id = validate_transaction_id(secrets.token_hex(16))
+    if operation_id is None:
+        operation_id = secrets.token_hex(16)
+    operation_id = validate_transaction_id(operation_id)
     generation = managed_transition_prestate_digest()
     for action in actions:
         authorization_path, consumed_path = _firewall_hook_paths(action)
@@ -2352,7 +2363,11 @@ def cleanup_firewall_hook_authorizations(actions: Sequence[str]) -> None:
         fsync_directory(RUNTIME_DIR)
 
 
-def consume_firewall_hook_authorization(action: str) -> bool:
+def consume_firewall_hook_authorization(action: str, operation_id: str) -> None:
+    try:
+        operation_id = validate_transaction_id(operation_id)
+    except AwgctlError as exc:
+        raise AwgctlError("firewall hook authorization context is invalid") from exc
     authorization_path, consumed_path = _firewall_hook_paths(action)
     all_paths = {
         candidate
@@ -2365,41 +2380,109 @@ def consume_firewall_hook_authorization(action: str) -> bool:
             raise AwgctlError("firewall hook authorization was already consumed")
         if all_paths:
             raise AwgctlError("firewall hook authorization does not match the requested action")
-        return False
+        raise AwgctlError("firewall hook authorization is unavailable")
     if consumed_path in all_paths:
         raise AwgctlError("firewall hook authorization was already consumed")
-    try:
-        os.link(authorization_path, consumed_path, follow_symlinks=False)
-        authorization_path.unlink()
-        fsync_directory(RUNTIME_DIR)
-    except OSError as exc:
-        raise AwgctlError("firewall hook authorization could not be consumed") from exc
-    value = _read_protected_json(consumed_path)
+    value = _read_protected_json(authorization_path)
     normalized = _normalize_firewall_hook_authorization(
         value,
         expected_action=action,
         now=dt.datetime.now(dt.timezone.utc),
     )
+    if not secrets.compare_digest(normalized["operation_id"], operation_id):
+        raise AwgctlError("firewall hook authorization context does not match")
     current = load_transition_document(required=False)
     current_transition = current["transaction_id"] if current is not None else None
     if normalized["transition_id"] != current_transition:
         raise AwgctlError("firewall hook authorization transition changed")
     if normalized["generation_sha256"] != managed_transition_prestate_digest():
         raise AwgctlError("firewall hook authorization generation changed")
-    return True
+    try:
+        os.link(authorization_path, consumed_path, follow_symlinks=False)
+        authorization_path.unlink()
+        fsync_directory(RUNTIME_DIR)
+    except OSError as exc:
+        raise AwgctlError("firewall hook authorization could not be consumed") from exc
+    consumed = _normalize_firewall_hook_authorization(
+        _read_protected_json(consumed_path),
+        expected_action=action,
+        now=dt.datetime.now(dt.timezone.utc),
+    )
+    if consumed != normalized:
+        raise AwgctlError("firewall hook authorization changed while being consumed")
+
+
+def presented_firewall_hook_operation_id(args: argparse.Namespace) -> str | None:
+    if getattr(args, "_entrypoint", None) != "internal":
+        return None
+    operation_id = os.environ.get(FIREWALL_HOOK_OPERATION_ENV)
+    if operation_id is None:
+        return None
+    try:
+        return validate_transaction_id(operation_id)
+    except AwgctlError as exc:
+        raise AwgctlError("firewall hook authorization context is invalid") from exc
 
 
 def service_action(action: str, interface: str) -> None:
     if action not in {"start", "stop", "restart", "reload"}:
         raise AwgctlError("invalid service action")
     service = SERVICE_TEMPLATE.format(interface=interface)
-    authorizations = issue_firewall_hook_authorizations(action, interface)
+    hook_actions = _firewall_hook_actions(action)
+    operation_id = validate_transaction_id(secrets.token_hex(16)) if hook_actions else None
+    authorizations = issue_firewall_hook_authorizations(
+        action,
+        interface,
+        operation_id=operation_id,
+    )
+    operation_error: BaseException | None = None
     try:
+        if operation_id is not None:
+            result = run(
+                [
+                    "systemctl",
+                    "import-environment",
+                    FIREWALL_HOOK_OPERATION_ENV,
+                ],
+                environment={FIREWALL_HOOK_OPERATION_ENV: operation_id},
+                check=False,
+                timeout=15,
+            )
+            if result.returncode != 0:
+                raise AwgctlError("firewall hook environment setup failed")
         run(["systemctl", action, service], timeout=45)
         if action in {"start", "restart", "reload"} and not is_service_active(interface):
             raise AwgctlError(f"service did not remain active after {action}")
+    except BaseException as exc:
+        operation_error = exc
     finally:
-        cleanup_firewall_hook_authorizations(authorizations)
+        cleanup_error: BaseException | None = None
+        try:
+            cleanup_firewall_hook_authorizations(authorizations)
+        except BaseException as exc:
+            cleanup_error = exc
+        environment_error: BaseException | None = None
+        if operation_id is not None:
+            try:
+                result = run(
+                    ["systemctl", "unset-environment", FIREWALL_HOOK_OPERATION_ENV],
+                    check=False,
+                    timeout=15,
+                )
+                if result.returncode != 0:
+                    raise AwgctlError("firewall hook environment cleanup failed")
+            except BaseException as exc:
+                environment_error = exc
+        if operation_error is not None:
+            if cleanup_error is not None or environment_error is not None:
+                raise AwgctlError(
+                    "service action failed and firewall hook cleanup could not be verified"
+                ) from operation_error
+            raise operation_error
+        if cleanup_error is not None:
+            raise cleanup_error
+        if environment_error is not None:
+            raise environment_error
 
 
 def commit_server_config(
@@ -7676,7 +7759,8 @@ def cmd_initialize_fresh(args: argparse.Namespace) -> int:
                 raise AwgctlError("fresh server failed its complete health postcondition")
             backup = create_backup()
         except Exception as original:
-            run(["systemctl", "stop", service], check=False, timeout=45)
+            with contextlib.suppress(Exception):
+                service_action("stop", config["interface"])
             run(["systemctl", "disable", service], check=False, timeout=45)
             firewall_cleanup()
             cleanup_failed_fresh_install(client_name)
@@ -7819,6 +7903,7 @@ def build_parser(*, entrypoint: str = "public") -> argparse.ArgumentParser:
     if entrypoint not in {"public", "internal"}:
         raise ValueError("entrypoint must be public or internal")
     parser = argparse.ArgumentParser(prog="awgctl", description="Manage the host's AmneziaWG installation")
+    parser.set_defaults(_entrypoint=entrypoint)
     parser.add_argument("--version", action="version", version=f"awgctl {VERSION}")
     parser.add_argument("--json", action="store_true", help="emit a stable machine-readable response")
     subcommands = parser.add_subparsers(dest="command", required=True)
@@ -8054,7 +8139,9 @@ def dispatch(args: argparse.Namespace) -> int:
         }
         return handlers[args.obfuscation_command](args)
     if args.command == "_firewall":
-        if consume_firewall_hook_authorization(args.firewall_action):
+        operation_id = presented_firewall_hook_operation_id(args)
+        if operation_id is not None:
+            consume_firewall_hook_authorization(args.firewall_action, operation_id)
             return cmd_firewall(args)
         with mutation_lock():
             return cmd_firewall(args)
