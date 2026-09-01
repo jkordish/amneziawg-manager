@@ -227,6 +227,24 @@ def _remove_incomplete_candidate(
     os.fsync(parent_fd)
 
 
+def _remove_created_candidate(
+    parent_fd: int,
+    candidate_name: str,
+    expected: os.stat_result | None,
+) -> None:
+    try:
+        named = os.stat(candidate_name, dir_fd=parent_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return
+    if not stat.S_ISDIR(named.st_mode) or (
+        expected is not None
+        and (named.st_dev, named.st_ino) != (expected.st_dev, expected.st_ino)
+    ):
+        raise DiagnosticsError("diagnostic candidate changed during cleanup")
+    os.rmdir(candidate_name, dir_fd=parent_fd)
+    os.fsync(parent_fd)
+
+
 def create_bundle(
     parent: pathlib.Path,
     *,
@@ -249,26 +267,39 @@ def create_bundle(
     stem = created_at.replace("-", "").replace(":", "").replace("Z", "Z").replace("T", "T")
     candidate_name = ""
     candidate_fd: int | None = None
-    for _ in range(128):
-        candidate_name = f"{stem}-{secrets.token_hex(16)}"
-        try:
-            os.mkdir(candidate_name, mode=0o700, dir_fd=parent_fd)
-        except FileExistsError:
-            continue
-        candidate_fd = os.open(
-            candidate_name,
-            os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0),
-            dir_fd=parent_fd,
-        )
-        _set_private_descriptor(candidate_fd, 0o700)
-        break
-    if candidate_fd is None:
-        os.close(parent_fd)
-        raise DiagnosticsError("could not allocate a unique diagnostic bundle")
-    candidate = parent / candidate_name
+    candidate_created = False
+    candidate_metadata: os.stat_result | None = None
+    candidate: pathlib.Path | None = None
     manifest_files: list[dict[str, object]] = []
-    directory_fds: dict[tuple[str, ...], int] = {(): candidate_fd}
+    directory_fds: dict[tuple[str, ...], int] = {}
     try:
+        for _ in range(128):
+            candidate_name = f"{stem}-{secrets.token_hex(16)}"
+            try:
+                os.mkdir(candidate_name, mode=0o700, dir_fd=parent_fd)
+            except FileExistsError:
+                continue
+            candidate_created = True
+            candidate_metadata = os.stat(
+                candidate_name,
+                dir_fd=parent_fd,
+                follow_symlinks=False,
+            )
+            if not stat.S_ISDIR(candidate_metadata.st_mode):
+                raise DiagnosticsError("diagnostic candidate is not a directory")
+            candidate_fd = os.open(candidate_name, flags, dir_fd=parent_fd)
+            opened = os.fstat(candidate_fd)
+            if (opened.st_dev, opened.st_ino) != (
+                candidate_metadata.st_dev,
+                candidate_metadata.st_ino,
+            ):
+                raise DiagnosticsError("diagnostic candidate changed during setup")
+            _set_private_descriptor(candidate_fd, 0o700)
+            directory_fds[()] = candidate_fd
+            candidate = parent / candidate_name
+            break
+        if candidate_fd is None:
+            raise DiagnosticsError("could not allocate a unique diagnostic bundle")
         for name, data in sorted(files.items()):
             relative = _safe_relative(name)
             parent_parts = relative.parts[:-1]
@@ -300,16 +331,27 @@ def create_bundle(
         os.fsync(parent_fd)
         if not _same_open_directory(parent, parent_metadata):
             raise DiagnosticsError("diagnostic parent path changed during bundle creation")
-    except BaseException as original:
+    except BaseException:
         try:
-            _remove_incomplete_candidate(parent_fd, candidate_name, candidate_fd)
+            if candidate_fd is not None:
+                _remove_incomplete_candidate(parent_fd, candidate_name, candidate_fd)
+            elif candidate_created:
+                _remove_created_candidate(
+                    parent_fd,
+                    candidate_name,
+                    candidate_metadata,
+                )
         except BaseException as cleanup_error:
             raise DiagnosticsError(
                 "diagnostic bundle creation failed and incomplete bundle cleanup failed"
             ) from cleanup_error
-        raise original
+        raise
     finally:
         for _, fd in sorted(directory_fds.items(), key=lambda item: len(item[0]), reverse=True):
             os.close(fd)
+        if candidate_fd is not None and candidate_fd not in directory_fds.values():
+            os.close(candidate_fd)
         os.close(parent_fd)
+    if candidate is None:
+        raise DiagnosticsError("diagnostic bundle creation did not complete")
     return candidate

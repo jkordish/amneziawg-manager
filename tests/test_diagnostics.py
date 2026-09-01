@@ -110,6 +110,51 @@ class DiagnosticsTests(unittest.TestCase):
 
             self.assertEqual(list(parent.iterdir()), [])
 
+    def test_incomplete_bundle_is_removed_after_candidate_open_failure(self):
+        with tempfile.TemporaryDirectory() as directory:
+            parent = pathlib.Path(directory)
+            real_open = os.open
+
+            def fail_candidate_open(path, flags, mode=0o777, *, dir_fd=None):
+                if dir_fd is not None:
+                    raise OSError("injected candidate open failure")
+                return real_open(path, flags, mode, dir_fd=dir_fd)
+
+            with (
+                mock.patch(
+                    "awgctl.diagnostics.os.open",
+                    side_effect=fail_candidate_open,
+                ),
+                self.assertRaisesRegex(OSError, "candidate open failure"),
+            ):
+                create_bundle(
+                    parent,
+                    product_version="0.1.0-beta.1",
+                    created_at="2026-09-01T02:00:00Z",
+                    files={},
+                )
+
+            self.assertEqual(list(parent.iterdir()), [])
+
+    def test_incomplete_bundle_is_removed_after_candidate_setup_failure(self):
+        with tempfile.TemporaryDirectory() as directory:
+            parent = pathlib.Path(directory)
+            with (
+                mock.patch(
+                    "awgctl.diagnostics._set_private_descriptor",
+                    side_effect=DiagnosticsError("injected candidate setup failure"),
+                ),
+                self.assertRaisesRegex(DiagnosticsError, "candidate setup failure"),
+            ):
+                create_bundle(
+                    parent,
+                    product_version="0.1.0-beta.1",
+                    created_at="2026-09-01T02:00:00Z",
+                    files={},
+                )
+
+            self.assertEqual(list(parent.iterdir()), [])
+
     def test_preexisting_candidate_symlink_cannot_reach_its_sink(self):
         with tempfile.TemporaryDirectory() as directory:
             parent = pathlib.Path(directory) / "output"

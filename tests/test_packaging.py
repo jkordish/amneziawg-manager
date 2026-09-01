@@ -1,12 +1,14 @@
 import json
 import os
 import pathlib
+import stat
 import subprocess
 import sys
 import tempfile
 import tomllib
 import unittest
 import zipfile
+from unittest import mock
 
 
 REPO_ROOT = pathlib.Path(__file__).parents[1]
@@ -15,10 +17,72 @@ sys.path.insert(0, str(SRC_ROOT))
 
 from awgctl.version import VERSION
 from awginstall.cli import _share_files
-from awginstall.deploy import DeploymentError, active_release, install_release
+from awginstall.deploy import (
+    DeploymentError,
+    activate_release,
+    active_release,
+    install_release,
+)
 
 
 class VersionedDeploymentTests(unittest.TestCase):
+    def test_activation_and_rollback_fsync_each_selector_replacement(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory) / "opt/amneziawg"
+            for version in ("0.1.0-beta.1", "0.1.0-beta.2"):
+                artifact = root / "releases" / version / "awgctl"
+                artifact.parent.mkdir(parents=True)
+                artifact.write_bytes(version.encode())
+            fsync_targets = []
+            real_fsync = os.fsync
+
+            def record_fsync(descriptor):
+                fsync_targets.append(
+                    "directory"
+                    if stat.S_ISDIR(os.fstat(descriptor).st_mode)
+                    else "file"
+                )
+                return real_fsync(descriptor)
+
+            with mock.patch("awginstall.deploy.os.fsync", side_effect=record_fsync):
+                activate_release(root, "0.1.0-beta.1")
+                activate_release(root, "0.1.0-beta.2")
+                activate_release(root, "0.1.0-beta.1")
+
+            self.assertEqual(fsync_targets, ["directory", "directory", "directory"])
+
+    def test_install_makes_release_directory_durable_before_selector(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory) / "opt/amneziawg"
+            artifact = pathlib.Path(directory) / "awgctl"
+            artifact.write_bytes(b"artifact")
+            directory_syncs = []
+            real_fsync = os.fsync
+
+            def record_fsync(descriptor):
+                metadata = os.fstat(descriptor)
+                for label, path in (
+                    ("releases", root / "releases"),
+                    ("bin", root / "bin"),
+                ):
+                    if path.is_dir():
+                        current = path.stat()
+                        if (metadata.st_dev, metadata.st_ino) == (
+                            current.st_dev,
+                            current.st_ino,
+                        ):
+                            directory_syncs.append(label)
+                return real_fsync(descriptor)
+
+            with mock.patch("awginstall.deploy.os.fsync", side_effect=record_fsync):
+                install_release(
+                    root=root,
+                    artifact=artifact,
+                    version="0.1.0-beta.1",
+                )
+
+            self.assertEqual(directory_syncs[-2:], ["releases", "bin"])
+
     def test_install_release_rejects_invalid_semver_directory(self):
         invalid = {
             "leading zero": "0.1.0-beta.01",
