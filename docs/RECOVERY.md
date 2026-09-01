@@ -49,6 +49,45 @@ sudo awgctl health
 
 The selector change does not restart the tunnel.
 
+## AWG 3.1 transition recovery
+
+Every preparation retains an ordinary verified classic backup plus protected
+pending artifacts bound to one unpredictable transaction ID. Inspect the
+secret-free lifecycle state before acting:
+
+```bash
+sudo awgctl obfuscation show
+sudo awgctl obfuscation show --json
+```
+
+For a known prepared or active transaction, request a normal rollback with the
+exact ID:
+
+```bash
+sudo awgctl obfuscation rollback TRANSACTION_ID --json
+sudo awgctl status
+sudo awgctl health
+```
+
+Activation arms crash recovery before installing AWG 3.1 artifacts and then
+replaces it with an absolute-deadline ten-minute rollback timer. A reload,
+verification, or timer-construction failure restores classic state
+synchronously. If activation succeeds but is not confirmed, the transient
+root-only `_obfuscation-timeout TRANSACTION_ID` unit performs the same verified
+restore. Repeating rollback for the matching completed transaction is
+idempotent; another or stale ID is rejected.
+
+Do not edit transition JSON, copy a pending profile around the manager, cancel
+the transient timer manually, or remove the classic backup during an active
+window. The next lock-protected lifecycle command reconciles an interrupted
+cleanup from its durable checkpoint. If recovery cannot prove classic state,
+the manager stops the interface rather than serving an uncertain configuration.
+
+After rollback, Kat's AWG 3.1 profile is not accepted evidence and must not be
+marked distributed. After confirmation, retain the ordinary backup, securely
+acknowledge the new profile revision, and remove the old ingress rule only when
+the confirmation output says it is safe.
+
 ## Package/kernel failure
 
 Before a kernel upgrade, resolve disk warnings and confirm DKMS is installed for
@@ -68,15 +107,19 @@ package. Do not regenerate VPN identities during package recovery.
 
 Do not edit `server.json` or runtime `awg0.conf` casually. Preserve the broken
 files, use a verified backup, and run health after restore. Never use
-`nft flush ruleset`; `_firewall down` removes only manager-owned rules:
+`nft flush ruleset`. Normal service stop removes only manager-owned rules and
+proves the kernel interface is absent before firewall down:
 
 ```bash
-sudo /opt/amneziawg/libexec/awgctl-internal _firewall down
+sudo awgctl stop
 sudo awgctl restart
 sudo awgctl health
 ```
 
-Do not claim client connectivity until a new handshake is observed.
+The internal `_firewall` command is a service hook, not a general repair API.
+Do not call it directly while the service or kernel interface is present. Do
+not claim client connectivity until a new handshake and increasing traffic are
+observed.
 
 ## Host-policy rollback
 
@@ -89,6 +132,8 @@ manager-owned files:
 /etc/sudoers.d/amneziawg-manager
 /etc/modules-load.d/amneziawg-manager.conf
 /etc/systemd/system/awg-quick@awg0.service.d/20-awgctl-hardening.conf
+/etc/systemd/system/amneziawg-client-expiry.service
+/etc/systemd/system/amneziawg-client-expiry.timer
 ```
 
 The installer restores those files and removes only accounts, groups, and

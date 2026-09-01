@@ -20,12 +20,25 @@ The private key must exist only as the GitHub Actions secret
 
 1. Update `src/awgctl/version.py` and `CHANGELOG.md`.
 2. Run `make verify`.
+   This includes the complete serial unittest suite, Python compilation,
+   release/manifest build, zipapp version smoke, and installer preflight.
 3. Confirm the tag is exactly `v` plus the code version.
 4. Push the signed/annotated tag. The release workflow rebuilds and retests the
    artifact, verifies tag/version equality, signs `release.json`, and publishes
    all three assets.
 5. On a managed beta host, run `sudo awgctl update check`, then a dry run, then
-   apply and run health.
+   `sudo awgctl update apply --dry-run`, then
+   `sudo awgctl update apply` and health.
+
+The release and installation manifest schemas stay at 1 because AWG 3.1 does
+not change either serialized shape. Server configuration is separately schema
+2 and client metadata remains schema 3. Product and changelog versions still
+advance normally.
+
+The `make verify` installer check passes an explicit
+`equivalent-external-firewall` test fixture so the read-only source gate can
+exercise the supported parser/platform contract. It is not deployed-host
+ingress evidence and must not be cited as such.
 
 Tags containing a prerelease suffix create a GitHub prerelease. A stable tag is
 not justified until fresh-install E2E has passed on a disposable supported
@@ -44,3 +57,34 @@ instance.
 - Verify backup/restore and signed update rollback.
 - Destroy the test instance and profiles after evidence is retained without
   secrets.
+
+## AWG 3.1 qualification gates
+
+The production `AWG31_QUALIFIED_PAIRS_V1` allowlist is intentionally empty for
+this release. Do not publish a release as AWG 3.1-capable merely because the
+model, dry runs, namespace renderer, or transaction tests pass, and do not add
+the currently installed/newest package pair merely because it is available.
+
+An allowlist change must name one exact native tools version and the matching
+loaded/packaged module version and retain disposable Ubuntu 24.04 amd64
+evidence for parsing, canonical native validation, classic compatibility,
+AWG 3.1 handshake/traffic, restart, rollback, and relevant kernel/package
+upgrade behavior. This qualifies the server pair only; it does not prove
+Russian-network reachability.
+
+After a qualified pair exists, release acceptance must also exercise the direct
+cutover: prepared remains non-serving, the new external UDP rule precedes
+activation, classic and AWG 3.1 are never concurrent, activation failure and
+deadline both restore classic, confirmation rejects a handshake without both
+counters increasing, and secure profile-delivery acknowledgement remains
+separate.
+
+Kat acceptance uses the free standalone native AmneziaWG iOS/iPadOS app and
+requires a fresh handshake, increasing bidirectional counters, DNS, expected
+egress IP, HTTPS, multi-megabyte download and upload, reconnect, screen-lock
+resume, and Wi-Fi/cellular switching on the intended Russian network. Record
+redacted timestamps/results only. IP blocking, blanket UDP blocking, or a UDP
+whitelist may still prevent AWG; there is no alternate transport to claim.
+
+Release notes must label evidence precisely: source/generated/local/prepared,
+deployed-host, exact-package qualification, and Kat acceptance are distinct.

@@ -3,6 +3,34 @@
 All notable changes are documented here. The project follows semantic
 versioning while preserving explicit beta labels for unqualified host paths.
 
+## 0.1.0-beta.5 - 2026-09-01
+
+- Add a versioned AWG 3.1 server/profile model with `russia-ios-v1`, strict CPS
+  validation, protected header-key custody, secret-safe status/diagnostics, and
+  lossless schema-1 classic normalization. Client metadata remains schema 3.
+- Add an exact tools/loaded/packaged-module capability gate. The production
+  qualification allowlist is intentionally empty, so this release does not
+  activate AWG 3.1 or claim successful use from inside Russia.
+- Add one-interface `prepare`, `activate`, `confirm`, and `rollback` lifecycle
+  with protected pending artifacts, exact ingress requirements, a verified
+  classic backup, direct cutover, synchronous failure rollback, and an exact
+  ten-minute transient rollback timer.
+- Require a fresh post-activation Kat handshake and increasing receive and
+  transmit counters before confirmation, while keeping secure profile delivery
+  acknowledgement and full native-iOS acceptance as separate gates.
+- Add explicit Lightsail/equivalent external-ingress attestation, exact UTC
+  client expiration with a daily systemd timer, and transaction-aware service
+  and canonical nftables lifecycle proof.
+- Harden release workflow references, SemVer precedence, diagnostic directory
+  creation, profile import, transition recovery, service/firewall coordination,
+  and AWG 3.1 CPS redaction.
+- Ship updated completion and repository-only end-to-end dry-run coverage for
+  classic compatibility, preparation, activation rollback, timeout construction,
+  confirmation rejection, and public-output redaction.
+- Document that generated/source/local/prepared evidence is not deployed or Kat
+  acceptance evidence, and that IP blocking or blanket/whitelist UDP policy has
+  no AWG-only fallback in this project.
+
 ## 0.1.0-beta.4 - 2026-09-01
 
 - Add an interactive, validation-first client profile wizard with a final

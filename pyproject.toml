@@ -1,6 +1,6 @@
 [project]
 name = "amneziawg-manager"
-version = "0.1.0b4"
+version = "0.1.0b5"
 description = "Production-oriented AmneziaWG management for Ubuntu 24.04 amd64"
 readme = "README.md"
 requires-python = ">=3.12"

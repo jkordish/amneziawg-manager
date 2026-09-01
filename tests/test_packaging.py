@@ -4,7 +4,9 @@ import pathlib
 import subprocess
 import sys
 import tempfile
+import tomllib
 import unittest
+import zipfile
 
 
 REPO_ROOT = pathlib.Path(__file__).parents[1]
@@ -12,6 +14,7 @@ SRC_ROOT = REPO_ROOT / "src"
 sys.path.insert(0, str(SRC_ROOT))
 
 from awgctl.version import VERSION
+from awginstall.cli import _share_files
 from awginstall.deploy import DeploymentError, active_release, install_release
 
 
@@ -82,6 +85,63 @@ class VersionedDeploymentTests(unittest.TestCase):
             )
             self.assertEqual(version.returncode, 0, version.stderr)
             self.assertEqual(version.stdout.strip(), f"awgctl {VERSION}")
+
+            with zipfile.ZipFile(output) as archive:
+                shipped = set(archive.namelist())
+            self.assertIn("awgctl/semver.py", shipped)
+            self.assertIn("awgctl/selftest.py", shipped)
+            self.assertIn("awginstall/host.py", shipped)
+            self.assertIn("awginstall/settings.py", shipped)
+
+            internal = output.with_name("awgctl-internal")
+            internal.symlink_to(output)
+            timeout = subprocess.run(
+                [internal, "_obfuscation-timeout", "not-a-transaction-id"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                check=False,
+            )
+            self.assertNotEqual(timeout.returncode, 0)
+            self.assertIn("transaction ID", timeout.stderr)
+
+    def test_completion_ships_expiry_and_obfuscation_lifecycle(self):
+        completion = (REPO_ROOT / "awgctl-completion.bash").read_text(encoding="utf-8")
+        self.assertIn("expire", completion)
+        self.assertIn("obfuscation", completion)
+        self.assertIn("prepare activate confirm rollback show", completion)
+        self.assertIn("--mode --profile --client --dry-run --json", completion)
+
+    def test_source_release_ships_operator_security_and_completion_contracts(self):
+        shared = _share_files(REPO_ROOT)
+        self.assertEqual(shared["VERSION"], (VERSION + "\n").encode())
+        for name in (
+            "README.md",
+            "SECURITY.md",
+            "CHANGELOG.md",
+            "completions/awgctl.bash",
+            "docs/ARCHITECTURE.md",
+            "docs/INSTALL.md",
+            "docs/OPERATIONS.md",
+            "docs/RECOVERY.md",
+            "docs/DEVELOPMENT.md",
+            "docs/RELEASING.md",
+        ):
+            with self.subTest(name=name):
+                self.assertIn(name, shared)
+
+    def test_source_and_python_project_versions_match_the_changelog(self):
+        project = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+        self.assertEqual(project["project"]["version"], VERSION.replace("-beta.", "b"))
+        changelog = (REPO_ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
+        self.assertIn(f"## {VERSION} - ", changelog)
+
+    def test_release_verify_uses_an_explicit_non_live_ingress_fixture(self):
+        makefile = (REPO_ROOT / "Makefile").read_text(encoding="utf-8")
+        self.assertIn(
+            "python3 install.py check --ingress-boundary equivalent-external-firewall",
+            makefile,
+        )
 
 
 if __name__ == "__main__":

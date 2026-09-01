@@ -13,7 +13,7 @@ build:
 
 verify: test compile build
 	dist/awgctl.pyz version
-	python3 install.py check
+	python3 install.py check --ingress-boundary equivalent-external-firewall
 
 clean:
 	rm -rf build dist

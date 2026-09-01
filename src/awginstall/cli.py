@@ -289,6 +289,8 @@ def _share_files(repo_root: pathlib.Path) -> dict[str, bytes]:
     result: dict[str, bytes] = {"VERSION": (VERSION + "\n").encode()}
     candidates = {
         "README.md": repo_root / "README.md",
+        "SECURITY.md": repo_root / "SECURITY.md",
+        "CHANGELOG.md": repo_root / "CHANGELOG.md",
         "completions/awgctl.bash": repo_root / "awgctl-completion.bash",
     }
     docs = repo_root / "docs"

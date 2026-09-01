@@ -3,7 +3,16 @@
 ## Sources of truth
 
 `/opt/amneziawg/config/server.json` stores stable non-secret configuration.
+Server schema 2 carries either a losslessly normalized classic profile or a
+versioned AWG 3.1 profile. Legacy server schema 1 remains readable and
+normalizes to classic without changing its nine obfuscation values. Client
+metadata is a separate serialized contract and remains schema 3.
+
 Keys live in separate protected files, and every client has explicit metadata.
+In AWG 3.1 mode the 32-byte `HeaderProtectionKey` is held in a root-only key
+file; manager state contains only its protected path. Rendering receives the
+material explicitly. Public output exposes at most a 12-hex SHA-256 fingerprint
+and never the key or CPS-generated `I1`-`I5` packet bytes.
 The manager renders `/opt/amneziawg/generated/awg0.conf`, validates it through
 the native tools and a disposable interface, then atomically installs it at
 `/etc/amnezia/amneziawg/awg0.conf`.
@@ -11,12 +20,19 @@ the native tools and a disposable interface, then atomically installs it at
 `SaveConfig=true` is never used. Manual edits are reported as drift and block
 mutations until an operator reconciles them.
 
-## Public ingress
+## Public ingress and transport boundary
 
-AWS Lightsail is the public-ingress firewall. `awgctl` never enables UFW,
-creates nftables/iptables INPUT filtering, duplicates public port policy, or
-uses AWS credentials. `awgctl aws-rule` reports the one required public UDP
-rule.
+Installation state must explicitly attest `lightsail` or
+`equivalent-external-firewall` as the public-ingress boundary. The manager does
+not infer a provider from Ubuntu, amd64, or generic cloud metadata. `awgctl`
+never enables UFW, creates nftables/iptables INPUT filtering, duplicates public
+port policy, or uses cloud credentials. `awgctl aws-rule` reports the one
+required public UDP rule and its attested owner.
+
+AWG 3.1 changes the native AmneziaWG UDP packet representation; it is not a
+second transport. Destination IP blocking, blanket UDP blocking, and UDP
+whitelists can still stop it. There is no XRay, TCP/TLS encapsulation, or other
+AWG-only fallback in this architecture.
 
 Because there is intentionally no host INPUT firewall, an authenticated VPN
 peer may reach a service bound to `awg0` or `0.0.0.0`. Health reports wildcard
@@ -57,12 +73,44 @@ External peers imported from an existing server can be listed, labeled, and
 revoked without inventing a private key. Profile-dependent operations remain
 unavailable until the exact profile is securely imported.
 
+Kat's AWG 3.1 target is the free standalone native AmneziaWG app for
+iOS/iPadOS. A generated configuration or QR is still a credential at rest, not
+proof that the app imported it, connected in Russia, resolved DNS, or carried
+traffic. Delivery acknowledgement and network acceptance are separate records.
+
+## AWG 3.1 qualification and direct cutover
+
+Capability inspection binds the exact native tools version to matching loaded
+and packaged module versions. Only pairs in the versioned source allowlist may
+prepare AWG 3.1. The production allowlist is intentionally empty in this
+release, so the state machine is present but cannot activate a real pair.
+
+Preparation is non-serving: it validates Kat and the complete managed client
+set, selects an unused UDP port, creates an ordinary verified classic backup,
+and writes protected pending server/profile artifacts. It does not change
+`awg0`, the runtime config, current profiles, or distribution metadata.
+
+Activation directly replaces classic with AWG 3.1 on the same interface after
+the operator attests the new ingress rule. A protected recovery journal is
+armed before artifact installation. The manager reloads and proves the exact
+configuration, captures a fresh handshake and RX/TX floor, and creates an
+absolute-deadline transient systemd rollback unit. Classic and AWG 3.1 are
+never live together. Confirmation requires a post-activation handshake plus
+both counters increasing; failure or timeout restores the bound classic backup.
+
 ## Transactions and audit
 
 Mutation commands acquire `/run/lock/awgctl.lock`, verify no drift, create a
 backup/snapshot, stage and validate changes, commit atomically, reload or
 restart only when needed, verify runtime identity, and roll back on failure.
 Non-secret events are logged with syslog/journald tag `awgctl`.
+
+The awg-quick PostUp/PostDown hooks coordinate through a protected durable
+service-operation intent. Hooks normally take the same mutation lock, reject an
+unrelated generation/transition, and prove canonical nftables postconditions.
+Firewall down additionally requires the systemd service and kernel interface to
+be absent. This avoids a public reusable bearer while allowing bounded crash
+compensation.
 
 No private key, PSK, complete profile, or QR content is printed or logged by a
 normal command.
@@ -89,4 +137,6 @@ Custom policy is recorded in `config/installation.json` and checked by health.
 The native service remains root-run. Its conservative drop-in preloads the
 module before sandboxing, protects host filesystems/home/devices/kernel
 interfaces, and retains the address families needed by awg-quick. The installer
-validates and rolls back manager-owned host files on failure.
+validates and rolls back manager-owned host files on failure. It also installs
+a persistent daily client-expiry service/timer. Obfuscation rollback units are
+transaction-specific transient units, not reusable static service files.
