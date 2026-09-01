@@ -679,7 +679,11 @@ def client_is_server_eligible(
 
 
 def render_server_config(
-    config: dict[str, Any], server_private: str, clients: Sequence[dict[str, Any]]
+    config: dict[str, Any],
+    server_private: str,
+    clients: Sequence[dict[str, Any]],
+    *,
+    now: dt.datetime | None = None,
 ) -> str:
     validate_server_config({"schema_version": 1, "blocked_forward_ipv4": list(BLOCKED_FORWARD_IPV4), "paths": {
         "runtime_config": str(RUNTIME_CONFIG), "generated_config": str(GENERATED_CONFIG),
@@ -699,8 +703,9 @@ def render_server_config(
         "PostUp = /opt/amneziawg/libexec/awgctl-internal _firewall up",
         "PostDown = /opt/amneziawg/libexec/awgctl-internal _firewall down",
     ])
+    render_now = now or dt.datetime.now(dt.timezone.utc)
     for client in clients:
-        if not client_is_server_eligible(client):
+        if not client_is_server_eligible(client, now=render_now):
             continue
         validate_client_name(client["name"])
         validate_key(client["public_key"], "client public key")
@@ -843,8 +848,14 @@ def server_records_for_render(clients: Sequence[dict[str, Any]] | None = None) -
     return list(clients) if clients is not None else load_clients(include_secrets=True)
 
 
-def render_current_server(clients: Sequence[dict[str, Any]] | None = None) -> str:
-    return render_server_config(load_config(), server_private_key(), server_records_for_render(clients))
+def render_current_server(
+    clients: Sequence[dict[str, Any]] | None = None,
+    *,
+    now: dt.datetime | None = None,
+) -> str:
+    return render_server_config(
+        load_config(), server_private_key(), server_records_for_render(clients), now=now
+    )
 
 
 def semantic_signature(text: str) -> dict[str, Any]:
@@ -2028,13 +2039,39 @@ def verify_peer_state(interface: str, public_key: str, *, present: bool) -> None
         raise AwgctlError(f"peer did not {expectation} in the running interface")
 
 
-def clients_due_for_expiry(clients: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
+def clients_due_for_expiry(
+    clients: Sequence[dict[str, Any]], *, now: dt.datetime | None = None
+) -> list[dict[str, Any]]:
     return [
         client
         for client in clients
         if client.get("status", "active") == "active"
-        and effective_client_status(client) == "expired"
+        and effective_client_status(client, now=now) == "expired"
     ]
+
+
+def clients_requiring_expiry_reconciliation(
+    clients: Sequence[dict[str, Any]], *, now: dt.datetime
+) -> list[dict[str, Any]]:
+    """Return every peer that must be absent, including terminal expiry records."""
+    return [client for client in clients if effective_client_status(client, now=now) == "expired"]
+
+
+def bind_expiry_records(
+    selected: Sequence[dict[str, Any]], reloaded: Sequence[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    """Bind secret-bearing records to the identities selected at transaction start."""
+    by_name = {client["name"]: client for client in reloaded}
+    bound: list[dict[str, Any]] = []
+    identity_fields = ("name", "address", "public_key", "expires", "status")
+    for original in selected:
+        current = by_name.get(original["name"])
+        if current is None or any(current.get(field) != original.get(field) for field in identity_fields):
+            raise AwgctlError(
+                f"client identity changed during expiry: {original['name']}"
+            )
+        bound.append(current)
+    return bound
 
 
 def client_expiry_health_check(clients: Sequence[dict[str, Any]]) -> tuple[str, str, str]:
@@ -2051,9 +2088,11 @@ def ensure_expiry_reconcilable(
     config: dict[str, Any],
     clients: Sequence[dict[str, Any]],
     due: Sequence[dict[str, Any]],
+    *,
+    now: dt.datetime,
 ) -> None:
-    """Allow only the exact managed pre-expiry peer set before the fail-closed rewrite."""
-    expected = semantic_signature(render_current_server(clients))
+    """Allow either exact pre-expiry peers or the already-filtered retry state."""
+    expected = semantic_signature(render_current_server(clients, now=now))
     actual = semantic_signature(generated_text)
     due_peers: list[tuple[tuple[str, str], ...]] = []
     for client in due:
@@ -2064,8 +2103,11 @@ def ensure_expiry_reconcilable(
         if config.get("use_psk", True):
             peer["PresharedKey"] = client["psk"]
         due_peers.append(tuple(sorted(peer.items())))
-    allowed_peers = sorted([*expected["peers"], *due_peers])
-    if actual["interface"] != expected["interface"] or actual["peers"] != allowed_peers:
+    pre_expiry_peers = sorted([*expected["peers"], *due_peers])
+    if actual["interface"] != expected["interface"] or actual["peers"] not in (
+        expected["peers"],
+        pre_expiry_peers,
+    ):
         raise AwgctlError("managed-state drift detected before client expiry")
 
 
@@ -2081,21 +2123,26 @@ def cmd_client_expire(args: argparse.Namespace) -> int:
 
 
 def cmd_expire_clients(args: argparse.Namespace) -> int:
-    with mutation_lock():
+    if getattr(args, "dry_run", False):
+        transaction_now = dt.datetime.now(dt.timezone.utc)
         clients = load_clients()
-        due = clients_due_for_expiry(clients)
-        if getattr(args, "dry_run", False):
-            data = {
-                "dry_run": True,
-                "due_clients": [client["name"] for client in due],
-                "runtime_action": "reload" if due else "none",
-            }
-            if getattr(args, "json", False):
-                print(json.dumps(json_envelope("client expire", data=data), indent=2, sort_keys=True))
-            else:
-                print("Due clients: " + (", ".join(data["due_clients"]) or "none"))
-                print("No state was changed.")
-            return 0
+        due = clients_due_for_expiry(clients, now=transaction_now)
+        data = {
+            "dry_run": True,
+            "due_clients": [client["name"] for client in due],
+            "runtime_action": "reload" if due else "none",
+        }
+        if getattr(args, "json", False):
+            print(json.dumps(json_envelope("client expire", data=data), indent=2, sort_keys=True))
+        else:
+            print("Due clients: " + (", ".join(data["due_clients"]) or "none"))
+            print("No state was changed.")
+        return 0
+    with mutation_lock():
+        transaction_now = dt.datetime.now(dt.timezone.utc)
+        clients = load_clients()
+        selected = clients_requiring_expiry_reconciliation(clients, now=transaction_now)
+        due = [client for client in selected if client.get("status", "active") == "active"]
         try:
             generated = GENERATED_CONFIG.read_bytes()
             runtime = RUNTIME_CONFIG.read_bytes()
@@ -2104,7 +2151,7 @@ def cmd_expire_clients(args: argparse.Namespace) -> int:
         if runtime != generated:
             raise AwgctlError("manual runtime drift detected before client expiry")
         config = load_config()
-        if not due:
+        if not selected:
             data = {"expired_clients": [], "runtime_action": "none", "changed": False}
             if getattr(args, "json", False):
                 print(json.dumps(json_envelope("client expire", data=data), indent=2, sort_keys=True))
@@ -2112,15 +2159,18 @@ def cmd_expire_clients(args: argparse.Namespace) -> int:
                 print("No clients are due for expiry.")
             return 0
         clients = load_clients(include_secrets=True)
-        due = clients_due_for_expiry(clients)
-        ensure_expiry_reconcilable(generated.decode("utf-8"), config, clients, due)
-        backup = create_backup()
+        selected = bind_expiry_records(selected, clients)
+        due = [client for client in selected if client.get("status", "active") == "active"]
+        ensure_expiry_reconcilable(
+            generated.decode("utf-8"), config, clients, selected, now=transaction_now
+        )
+        backup = create_backup() if due else None
         metadata_snapshots = {
             CLIENTS / client["name"] / "metadata.json":
             (CLIENTS / client["name"] / "metadata.json").read_bytes()
             for client in due
         }
-        timestamp = iso_now()
+        timestamp = transaction_now.isoformat()
         committed = False
         try:
             for client in due:
@@ -2129,16 +2179,38 @@ def cmd_expire_clients(args: argparse.Namespace) -> int:
                 metadata.update(status="expired", expired_at=timestamp, updated_at=timestamp)
                 atomic_json(metadata_path, metadata, 0o600)
                 client.update(status="expired", expired_at=timestamp, updated_at=timestamp)
-            new_server = render_current_server(clients)
+            new_server = render_current_server(clients, now=transaction_now)
             active = commit_server_config(new_server, runtime_action="reload")
             committed = True
             if active:
-                live = live_peers(config["interface"])
-                remaining = [client["name"] for client in due if client["public_key"] in live]
-                if remaining:
-                    raise AwgctlError(
-                        "expired peers remain in the running interface: " + ", ".join(remaining)
-                    )
+                stopped_for_postcondition = False
+                try:
+                    live = live_peers(config["interface"])
+                    remaining = [
+                        client["name"]
+                        for client in selected
+                        if client["public_key"] in live
+                    ]
+                    if remaining:
+                        active = commit_server_config(new_server, runtime_action="reload")
+                        if active:
+                            live = live_peers(config["interface"])
+                            remaining = [
+                                client["name"]
+                                for client in selected
+                                if client["public_key"] in live
+                            ]
+                    if active and remaining:
+                        stopped_for_postcondition = True
+                        service_action("stop", config["interface"])
+                        raise AwgctlError(
+                            "expired peers remain in the running interface: "
+                            + ", ".join(remaining)
+                        )
+                except Exception:
+                    if not stopped_for_postcondition:
+                        service_action("stop", config["interface"])
+                    raise
         except Exception:
             if not committed:
                 for path, content in metadata_snapshots.items():
@@ -2150,14 +2222,16 @@ def cmd_expire_clients(args: argparse.Namespace) -> int:
         data = {
             "expired_clients": names,
             "runtime_action": "reload" if active else "none-service-stopped",
-            "changed": True,
-            "backup": str(backup),
+            "changed": bool(due),
         }
+        if backup is not None:
+            data["backup"] = str(backup)
         if getattr(args, "json", False):
             print(json.dumps(json_envelope("client expire", data=data), indent=2, sort_keys=True))
         else:
             print("Expired clients: " + ", ".join(names))
-            print(f"Pre-change backup: {backup}")
+            if backup is not None:
+                print(f"Pre-change backup: {backup}")
             print(
                 "Expired peers removed from the running server."
                 if active else "Expired peers removed from managed configuration; service is stopped."

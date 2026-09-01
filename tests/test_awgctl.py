@@ -364,6 +364,42 @@ class RenderingTests(unittest.TestCase):
         self.assertNotIn("# due\n", rendered)
         self.assertIn("# future\n", rendered)
 
+    def test_server_render_uses_one_utc_instant_for_every_peer(self):
+        real_datetime = dt.datetime
+        boundary = real_datetime(2030, 1, 1, tzinfo=dt.timezone.utc)
+        clients = [
+            {
+                "name": name,
+                "status": "active",
+                "expires": "2030-01-01",
+                "address": f"10.77.42.{index}/32",
+                "public_key": key(index),
+                "psk": key(index + 10),
+            }
+            for index, name in ((2, "first"), (3, "second"))
+        ]
+
+        for instants, expected_names in (
+            ([boundary - dt.timedelta(microseconds=1), boundary], ("first", "second")),
+            ([boundary, boundary - dt.timedelta(microseconds=1)], ()),
+        ):
+            class SteppingDateTime(real_datetime):
+                values = iter(instants)
+
+                @classmethod
+                def now(cls, tz=None):
+                    value = next(cls.values)
+                    return value if tz is None else value.astimezone(tz)
+
+            with self.subTest(instants=instants), mock.patch.object(
+                awgctl.dt, "datetime", SteppingDateTime
+            ):
+                rendered = awgctl.render_server_config(self.config, key(1), clients)
+            actual_names = tuple(
+                name for name in ("first", "second") if f"# {name}\n" in rendered
+            )
+            self.assertEqual(actual_names, expected_names)
+
     def test_client_render_inherits_stable_obfuscation(self):
         rendered = awgctl.render_client_config(self.config, key(2), key(3), key(1), "10.77.42.3/32")
         self.assertIn("Address = 10.77.42.3/32", rendered)
@@ -414,6 +450,30 @@ class OperationalContractTests(unittest.TestCase):
 
         self.assertEqual(result, 0)
         self.assertEqual(json.loads(output.getvalue())["data"]["clients"][0]["status"], "expired")
+
+    def test_client_show_surfaces_due_active_metadata_as_expired(self):
+        today = dt.datetime.now(dt.timezone.utc).date().isoformat()
+        client = {
+            "name": "due",
+            "status": "active",
+            "expires": today,
+            "address": "10.77.42.2/32",
+            "public_key": key(2),
+            "public_key_fingerprint": "SHA256:test",
+            "created_at": "2029-01-01T00:00:00+00:00",
+            "management": "managed",
+        }
+        output = io.StringIO()
+        with (
+            mock.patch.object(awgctl, "load_config", return_value={"interface": "awg0"}),
+            mock.patch.object(awgctl, "load_clients", return_value=[client]),
+            mock.patch.object(awgctl, "is_service_active", return_value=False),
+            mock.patch.object(awgctl.sys, "stdout", output),
+        ):
+            result = awgctl.cmd_client_show(argparse.Namespace(client_name="due", json=True))
+
+        self.assertEqual(result, 0)
+        self.assertEqual(json.loads(output.getvalue())["data"]["status"], "expired")
 
     def test_cli_parser_supports_requested_simple_grammar(self):
         parser = awgctl.build_parser()

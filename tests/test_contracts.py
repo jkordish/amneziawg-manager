@@ -44,6 +44,16 @@ class JsonContractTests(unittest.TestCase):
 
         self.assertEqual(status, "expired")
 
+    def test_expiry_boundary_changes_exactly_at_utc_midnight(self):
+        client = {"status": "active", "expires": "2030-01-01"}
+        boundary = dt.datetime(2030, 1, 1, tzinfo=dt.timezone.utc)
+
+        self.assertEqual(
+            core.effective_client_status(client, now=boundary - dt.timedelta(microseconds=1)),
+            "active",
+        )
+        self.assertEqual(core.effective_client_status(client, now=boundary), "expired")
+
     def test_envelope_has_stable_shape_and_separates_warnings_from_errors(self):
         payload = json_envelope(
             "health",
@@ -88,6 +98,7 @@ class JsonContractTests(unittest.TestCase):
             "address": "10.77.42.2/32",
             "public_key": "RAW_PUBLIC_KEY",
             "status": "active",
+            "expires": dt.datetime.now(dt.timezone.utc).date().isoformat(),
             "management": "managed",
         }
         output = io.StringIO()
@@ -107,6 +118,7 @@ class JsonContractTests(unittest.TestCase):
         payload = json.loads(output.getvalue())
         self.assertEqual(payload["command"], "status")
         self.assertEqual(payload["data"]["clients"][0]["name"], "kat")
+        self.assertEqual(payload["data"]["clients"][0]["status"], "expired")
         self.assertNotIn("RAW_PUBLIC_KEY", output.getvalue())
 
     def test_ingress_rule_json_names_attested_external_boundary_without_lightsail_claim(self):

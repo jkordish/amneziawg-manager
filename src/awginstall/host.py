@@ -70,6 +70,15 @@ class HostConfigurationReport:
     rollback_files: Mapping[pathlib.Path, "_FileSnapshot"] | None = field(
         default=None, repr=False, compare=False
     )
+    expiry_timer_state: "ExpiryTimerState | None" = field(
+        default=None, repr=False, compare=False
+    )
+
+
+@dataclass(frozen=True)
+class ExpiryTimerState:
+    enabled: bool
+    active: bool
 
 
 @dataclass(frozen=True)
@@ -134,9 +143,8 @@ def _render_expiry_timer() -> str:
         "[Unit]\n"
         "Description=Run AmneziaWG client expiry daily\n\n"
         "[Timer]\n"
-        "OnCalendar=daily\n"
+        "OnCalendar=*-*-* 00:00:00 UTC\n"
         "Persistent=true\n"
-        "RandomizedDelaySec=15m\n"
         "Unit=amneziawg-client-expiry.service\n\n"
         "[Install]\n"
         "WantedBy=timers.target\n"
@@ -157,6 +165,46 @@ def _run_local(argv: Sequence[str]) -> subprocess.CompletedProcess[bytes]:
             f"host command failed: {argv[0]}{': ' + detail[-1] if detail else ''}"
         )
     return result
+
+
+def _run_local_probe(argv: Sequence[str]) -> subprocess.CompletedProcess[bytes]:
+    try:
+        return subprocess.run(
+            list(argv), stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            check=False, timeout=60,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise HostConfigurationError(f"could not query host command: {argv[0]}") from exc
+
+
+def _snapshot_expiry_timer_state(runner: Runner) -> ExpiryTimerState:
+    probe = _run_local_probe if runner is _run_local else runner
+    unit = "amneziawg-client-expiry.timer"
+    enabled_result = probe(("systemctl", "is-enabled", "--quiet", unit))
+    if enabled_result.returncode == 0:
+        enabled = True
+    elif enabled_result.returncode in {1, 4}:
+        enabled = False
+    else:
+        raise HostConfigurationError(
+            f"could not determine expiry timer enabled state (exit {enabled_result.returncode})"
+        )
+    active_result = probe(("systemctl", "is-active", "--quiet", unit))
+    if active_result.returncode == 0:
+        active = True
+    elif active_result.returncode in {3, 4}:
+        active = False
+    else:
+        raise HostConfigurationError(
+            f"could not determine expiry timer active state (exit {active_result.returncode})"
+        )
+    return ExpiryTimerState(enabled=enabled, active=active)
+
+
+def _restore_expiry_timer_state(state: ExpiryTimerState, runner: Runner) -> None:
+    unit = "amneziawg-client-expiry.timer"
+    runner(("systemctl", "enable" if state.enabled else "disable", unit))
+    runner(("systemctl", "start" if state.active else "stop", unit))
 
 
 def _password_locked(name: str, runner: Runner) -> bool:
@@ -294,19 +342,8 @@ def rollback_host_configuration(
     if report.rollback_files is None:
         raise HostConfigurationError("host configuration report has no rollback snapshot")
     errors: list[str] = []
-    expiry_timer_snapshot = next(
-        (
-            previous
-            for path, previous in report.rollback_files.items()
-            if path.name == "amneziawg-client-expiry.timer"
-        ),
-        None,
-    )
-    if expiry_timer_snapshot is not None and not expiry_timer_snapshot.exists:
-        try:
-            runner(("systemctl", "disable", "--now", "amneziawg-client-expiry.timer"))
-        except Exception as exc:
-            errors.append(f"disable expiry timer: {exc}")
+    if report.expiry_timer_state is None:
+        raise HostConfigurationError("host configuration report has no expiry timer snapshot")
     for path, previous in report.rollback_files.items():
         try:
             _restore_file(path, previous)
@@ -316,6 +353,10 @@ def rollback_host_configuration(
         runner(("systemctl", "daemon-reload"))
     except Exception as exc:
         errors.append(f"daemon-reload: {exc}")
+    try:
+        _restore_expiry_timer_state(report.expiry_timer_state, runner)
+    except Exception as exc:
+        errors.append(f"restore expiry timer state: {exc}")
     _rollback_identities(report.identity, runner)
     if errors:
         raise HostConfigurationError("host rollback was incomplete: " + "; ".join(errors))
@@ -361,7 +402,12 @@ def configure_host(
         installation_path,
     )
     file_snapshots = {path: _file_snapshot(path) for path in managed_paths}
-    report = replace(report, rollback_files=file_snapshots)
+    expiry_timer_state = _snapshot_expiry_timer_state(runner)
+    report = replace(
+        report,
+        rollback_files=file_snapshots,
+        expiry_timer_state=expiry_timer_state,
+    )
     commands_started = False
     try:
         for command in identity_plan.commands:
@@ -403,11 +449,6 @@ def configure_host(
         runner(("systemctl", "enable", "--now", "amneziawg-client-expiry.timer"))
         return report
     except Exception as exc:
-        if not file_snapshots[paths.expiry_timer].exists:
-            try:
-                runner(("systemctl", "disable", "--now", "amneziawg-client-expiry.timer"))
-            except Exception:
-                pass
         for path, previous in file_snapshots.items():
             try:
                 _restore_file(path, previous)
@@ -415,6 +456,10 @@ def configure_host(
                 pass
         try:
             runner(("systemctl", "daemon-reload"))
+        except Exception:
+            pass
+        try:
+            _restore_expiry_timer_state(expiry_timer_state, runner)
         except Exception:
             pass
         if commands_started:
