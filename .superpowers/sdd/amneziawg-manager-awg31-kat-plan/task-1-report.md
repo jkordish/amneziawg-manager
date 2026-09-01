@@ -243,3 +243,110 @@ OK
 ### Fix Round 1 concerns
 
 - No new blocker. The workflow policy intentionally rejects quoted/structured `uses` scalar forms rather than attempting a dependency-free general YAML parser; repository workflows use ordinary scalar mappings.
+
+## Fix Round 2
+
+### Finding addressed
+
+The Round 1 line-anchored block-mapping parser could still skip a YAML flow mapping when another valid block action made the global mapping count nonzero. A dependency-free lexical flow-map detector now identifies `uses` keys inside `{...}` collections and rejects the entire representation as unsupported. It tracks nested flow maps/sequences and YAML single/double quoted scalars, stops at comments, and ignores literal/folded block-scalar bodies so examples or shell strings do not become false mapping claims.
+
+The self-review also added fail-closed handling for compact, quoted-key, comma-separated, nested-sequence, explicit-key, anchored-key, and tagged-key `uses` spellings. Only ordinary block `uses:` mappings proceed to the separate local-reference or immutable-SHA and human-version-comment validations.
+
+### Required RED evidence
+
+The regression fixture contained one valid pinned ordinary action plus one mutable flow action, with a commented flow example and a quoted command string alongside them.
+
+Command:
+
+```text
+python3 -m unittest -v tests.test_workflows.WorkflowSecurityTests.test_flow_mapping_cannot_hide_beside_a_valid_block_action
+```
+
+Observed before the lexical flow detector:
+
+```text
+Ran 1 test in 0.001s
+FAILED (failures=1)
+```
+
+The violation list was empty: the pinned block action satisfied the global count and `- { uses: actions/checkout@v7 }` was silently skipped.
+
+### False-claim and spelling RED evidence
+
+Adding a literal block-scalar body containing `{ uses: ... }` initially exposed an obvious false claim in the first lexical implementation:
+
+```text
+Ran 1 test in 0.010s
+FAILED (failures=1)
+```
+
+It reported two unsupported mappings instead of only the real flow mapping. Tracking block-scalar indentation corrected that behavior.
+
+Further self-review fixtures exposed skipped explicit/property key forms:
+
+```text
+python3 -m unittest -v tests.test_workflows.WorkflowSecurityTests.test_flow_mapping_uses_key_variants_fail_closed
+Ran 1 test in 0.005s
+FAILED (failures=3)
+
+python3 -m unittest -v tests.test_workflows.WorkflowSecurityTests.test_unsupported_block_uses_key_variants_fail_closed
+Ran 1 test in 0.003s
+FAILED (failures=3)
+```
+
+The amended detector now rejects explicit `? uses`, anchored `&name uses`, tagged `!!str uses`, quoted flow keys, nested sequence maps, compact maps, and maps where `uses` follows another key.
+
+A final comment-state mutation showed that recognizing a commented `# run: |` as a real block-scalar header could suppress a following flow action:
+
+```text
+python3 -m unittest -v tests.test_workflows.WorkflowSecurityTests.test_flow_mapping_cannot_hide_beside_a_valid_block_action
+Ran 1 test in 0.002s
+FAILED (failures=1)
+```
+
+Only one of two real flow mappings was reported. Comment exclusion now occurs before block-scalar header recognition, while actual block-scalar content remains excluded.
+
+### GREEN evidence
+
+Workflow-only command:
+
+```text
+python3 -m unittest -v tests.test_workflows
+```
+
+Output:
+
+```text
+Ran 7 tests in 0.006s
+OK
+```
+
+Existing Task 1 validator set, run serially:
+
+```text
+python3 -m unittest -v tests.test_workflows tests.test_releases tests.test_release_build tests.test_packaging
+```
+
+Output:
+
+```text
+Ran 18 tests in 0.745s
+OK
+```
+
+### Fix Round 2 self-review
+
+- A real flow map is detected even when a valid pinned block action exists in the same file; mapping counts can no longer mask an unmatched flow representation.
+- Compact `{uses: ...}`, quoted `{'uses': ...}`, later-key `{name: ..., uses: ...}`, nested `[{uses: ...}]`, explicit `? uses`, anchored `&key uses`, and tagged `!!str uses` forms all fail closed as unsupported.
+- `# { uses: ... }`, commented block-scalar headers, quoted command contents, escaped quotes, and literal/folded block scalar bodies are excluded before mapping detection to avoid false positives or comment-driven suppression.
+- Both `.yml` and `.yaml` continue through the same policy. Ordinary block external actions still receive independent full-SHA and version-comment validation; local `./...` actions retain their separate grammar.
+- The SemVer implementation and tests from Fix Round 1 were untouched and remained green in the 18-test validator run.
+
+### Fix Round 2 concerns
+
+- No blocker. The detector remains deliberately workflow-specific and dependency-free: unsupported YAML key properties/flow collections fail closed rather than being normalized into an executable action reference.
+- No workflow parser dependency or unrelated workflow behavior was introduced.
+
+### Fix Round 2 commit
+
+- Subject: `fix: reject flow-mapped workflow actions`
