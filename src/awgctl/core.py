@@ -2440,6 +2440,258 @@ def apply_firewall() -> None:
             integration_path.unlink()
 
 
+def _nft_prefix(network: str) -> dict[str, Any]:
+    value = ipaddress.ip_network(network, strict=True)
+    if value.version != 4:
+        raise AwgctlError("cannot verify firewall lifecycle state")
+    return {
+        "prefix": {
+            "addr": str(value.network_address),
+            "len": value.prefixlen,
+        }
+    }
+
+
+def _nft_match(left: dict[str, Any], right: Any, op: str = "==") -> dict[str, Any]:
+    return {"match": {"op": op, "left": left, "right": right}}
+
+
+def _expected_managed_firewall_entities(
+    config: dict[str, Any],
+    *,
+    docker_chain: bool,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    config = normalize_server_config(config)
+    interface = config["interface"]
+    external = config["external_interface"]
+    subnet = _nft_prefix(config["subnet"])
+    meta = lambda key: {"meta": {"key": key}}
+    payload = lambda field: {"payload": {"protocol": "ip", "field": field}}
+    counter = {"counter": {}}
+
+    def rule(table: str, chain: str, comment: str, expressions: list[dict[str, Any]]) -> dict[str, Any]:
+        return {
+            "rule": {
+                "family": "ip",
+                "table": table,
+                "chain": chain,
+                "expr": expressions,
+                "comment": comment,
+            }
+        }
+
+    managed = [
+        {"table": {"family": "ip", "name": "amneziawg_forward"}},
+        {
+            "chain": {
+                "family": "ip",
+                "table": "amneziawg_forward",
+                "name": "forward",
+                "type": "filter",
+                "hook": "forward",
+                "prio": -10,
+                "policy": "accept",
+            }
+        },
+        rule(
+            "amneziawg_forward",
+            "forward",
+            "awgctl-return-is-established-only",
+            [
+                _nft_match(meta("iifname"), external),
+                _nft_match(meta("oifname"), interface),
+                _nft_match(payload("daddr"), subnet),
+                _nft_match(
+                    {"ct": {"key": "state"}},
+                    ["established", "related"],
+                    "in",
+                ),
+                counter,
+                {"accept": None},
+            ],
+        ),
+        rule(
+            "amneziawg_forward",
+            "forward",
+            "awgctl-block-non-return-to-tunnel",
+            [_nft_match(meta("oifname"), interface), counter, {"drop": None}],
+        ),
+        rule(
+            "amneziawg_forward",
+            "forward",
+            "awgctl-block-spoofed-tunnel-source",
+            [
+                _nft_match(meta("iifname"), interface),
+                _nft_match(payload("saddr"), subnet, "!="),
+                counter,
+                {"drop": None},
+            ],
+        ),
+        rule(
+            "amneziawg_forward",
+            "forward",
+            "awgctl-block-private-reserved-destinations",
+            [
+                _nft_match(meta("iifname"), interface),
+                _nft_match(
+                    payload("daddr"),
+                    {"set": [_nft_prefix(value) for value in config["blocked_forward_ipv4"]]},
+                    "in",
+                ),
+                counter,
+                {"drop": None},
+            ],
+        ),
+        rule(
+            "amneziawg_forward",
+            "forward",
+            "awgctl-block-lateral-forwarding",
+            [
+                _nft_match(meta("iifname"), interface),
+                _nft_match(meta("oifname"), external, "!="),
+                counter,
+                {"drop": None},
+            ],
+        ),
+        rule(
+            "amneziawg_forward",
+            "forward",
+            "awgctl-allow-public-internet",
+            [
+                _nft_match(meta("iifname"), interface),
+                _nft_match(payload("saddr"), subnet),
+                _nft_match(meta("oifname"), external),
+                counter,
+                {"accept": None},
+            ],
+        ),
+        rule(
+            "amneziawg_forward",
+            "forward",
+            "awgctl-default-tunnel-forward-drop",
+            [_nft_match(meta("iifname"), interface), counter, {"drop": None}],
+        ),
+        {"table": {"family": "ip", "name": "amneziawg_nat"}},
+        {
+            "chain": {
+                "family": "ip",
+                "table": "amneziawg_nat",
+                "name": "postrouting",
+                "type": "nat",
+                "hook": "postrouting",
+                "prio": 110,
+                "policy": "accept",
+            }
+        },
+        rule(
+            "amneziawg_nat",
+            "postrouting",
+            "awgctl-tunnel-masquerade",
+            [
+                _nft_match(payload("saddr"), subnet),
+                _nft_match(meta("oifname"), external),
+                counter,
+                {"masquerade": None},
+            ],
+        ),
+    ]
+    docker = []
+    if docker_chain:
+        docker = [
+            rule(
+                "filter",
+                "DOCKER-USER",
+                "awgctl-public-egress",
+                [
+                    _nft_match(meta("iifname"), interface),
+                    _nft_match(meta("oifname"), external),
+                    _nft_match(payload("saddr"), subnet),
+                    counter,
+                    {"accept": None},
+                ],
+            ),
+            rule(
+                "filter",
+                "DOCKER-USER",
+                "awgctl-established-return",
+                [
+                    _nft_match(meta("iifname"), external),
+                    _nft_match(meta("oifname"), interface),
+                    _nft_match(payload("daddr"), subnet),
+                    _nft_match(
+                        {"ct": {"key": "state"}},
+                        ["established", "related"],
+                        "in",
+                    ),
+                    counter,
+                    {"accept": None},
+                ],
+            ),
+            rule(
+                "filter",
+                "DOCKER-USER",
+                "awgctl-default-tunnel-forward-drop",
+                [_nft_match(meta("iifname"), interface), counter, {"drop": None}],
+            ),
+        ]
+    return managed, docker
+
+
+def _normalize_nft_entity(value: Any) -> tuple[str, dict[str, Any]]:
+    if not isinstance(value, dict) or len(value) != 1:
+        raise AwgctlError("cannot verify firewall lifecycle state")
+    kind, supplied = next(iter(value.items()))
+    if not isinstance(kind, str) or not isinstance(supplied, dict):
+        raise AwgctlError("cannot verify firewall lifecycle state")
+    if kind not in {
+        "table",
+        "chain",
+        "rule",
+        "set",
+        "map",
+        "element",
+        "flowtable",
+        "counter",
+        "quota",
+        "ct helper",
+        "limit",
+        "ct timeout",
+        "ct expectation",
+        "metainfo",
+    }:
+        raise AwgctlError("cannot verify firewall lifecycle state")
+    entity = copy.deepcopy(supplied)
+    handle = entity.pop("handle", None)
+    if handle is not None and (
+        not isinstance(handle, int) or isinstance(handle, bool) or handle < 0
+    ):
+        raise AwgctlError("cannot verify firewall lifecycle state")
+    if kind == "rule":
+        expressions = entity.get("expr")
+        if not isinstance(expressions, list):
+            raise AwgctlError("cannot verify firewall lifecycle state")
+        normalized_expressions = []
+        for expression in expressions:
+            if not isinstance(expression, dict) or len(expression) != 1:
+                raise AwgctlError("cannot verify firewall lifecycle state")
+            if "counter" in expression:
+                counter = expression["counter"]
+                if not isinstance(counter, dict) or set(counter) != {"packets", "bytes"}:
+                    raise AwgctlError("cannot verify firewall lifecycle state")
+                if any(
+                    not isinstance(counter[field], int)
+                    or isinstance(counter[field], bool)
+                    or counter[field] < 0
+                    for field in ("packets", "bytes")
+                ):
+                    raise AwgctlError("cannot verify firewall lifecycle state")
+                normalized_expressions.append({"counter": {}})
+            else:
+                normalized_expressions.append(expression)
+        entity["expr"] = normalized_expressions
+    return kind, entity
+
+
 def firewall_action_postcondition(action: str) -> bool:
     if action not in {"up", "down"}:
         raise AwgctlError("invalid firewall hook action")
@@ -2447,48 +2699,67 @@ def firewall_action_postcondition(action: str) -> bool:
     if result.returncode != 0:
         raise AwgctlError("cannot verify firewall lifecycle state")
     try:
-        values = json.loads(result.stdout).get("nftables", [])
-    except (AttributeError, json.JSONDecodeError) as exc:
-        raise AwgctlError("cannot verify firewall lifecycle state") from exc
-    if not isinstance(values, list):
-        raise AwgctlError("cannot verify firewall lifecycle state")
-    tables: set[tuple[str, str]] = set()
-    docker_chain = False
-    managed_docker_rules = 0
-    try:
+        document = json.loads(result.stdout)
+        if not isinstance(document, dict) or set(document) != {"nftables"}:
+            raise ValueError
+        values = document["nftables"]
+        if not isinstance(values, list):
+            raise ValueError
+        managed: list[dict[str, Any]] = []
+        docker: list[dict[str, Any]] = []
+        docker_chains = 0
         for value in values:
-            if not isinstance(value, dict):
-                raise ValueError
-            table = value.get("table")
-            if table is not None:
-                tables.add((str(table["family"]), str(table["name"])))
-            chain = value.get("chain")
-            if chain is not None and (
-                chain.get("family"), chain.get("table"), chain.get("name")
+            kind, entity = _normalize_nft_entity(value)
+            if kind == "metainfo":
+                continue
+            family = entity.get("family")
+            table = entity.get("table")
+            name = entity.get("name")
+            if kind == "table" and name in {
+                "amneziawg_forward",
+                "amneziawg_nat",
+            }:
+                managed.append({kind: entity})
+                continue
+            if table in {"amneziawg_forward", "amneziawg_nat"}:
+                managed.append({kind: entity})
+                continue
+            if kind == "chain" and (family, table, name) == (
+                "ip",
+                "filter",
+                "DOCKER-USER",
+            ):
+                docker_chains += 1
+                continue
+            if kind == "rule" and (
+                family,
+                table,
+                entity.get("chain"),
             ) == ("ip", "filter", "DOCKER-USER"):
-                docker_chain = True
-            rule = value.get("rule")
-            if rule is not None and (
-                rule.get("family"), rule.get("table"), rule.get("chain")
-            ) == ("ip", "filter", "DOCKER-USER"):
-                comment = rule.get("comment")
+                comment = entity.get("comment")
                 if isinstance(comment, str) and (
                     comment.startswith(FIREWALL_MARKER_PREFIX)
                     or comment in LEGACY_FIREWALL_MARKERS
                 ):
-                    managed_docker_rules += 1
-    except (AttributeError, KeyError, TypeError, ValueError) as exc:
+                    docker.append({kind: entity})
+    except (
+        AttributeError,
+        KeyError,
+        TypeError,
+        UnicodeError,
+        ValueError,
+        json.JSONDecodeError,
+    ) as exc:
         raise AwgctlError("cannot verify firewall lifecycle state") from exc
-    managed_tables = {
-        ("ip", "amneziawg_forward"),
-        ("ip", "amneziawg_nat"),
-    }
-    if action == "down":
-        return managed_tables.isdisjoint(tables) and managed_docker_rules == 0
-    if not managed_tables.issubset(tables):
+    if docker_chains > 1:
         return False
-    expected_docker_rules = 3 if docker_chain else 0
-    return managed_docker_rules == expected_docker_rules
+    if action == "down":
+        return not managed and not docker
+    expected_managed, expected_docker = _expected_managed_firewall_entities(
+        load_config(),
+        docker_chain=docker_chains == 1,
+    )
+    return managed == expected_managed and docker == expected_docker
 
 
 def run_firewall_action_locked(action: str) -> None:
@@ -2498,6 +2769,8 @@ def run_firewall_action_locked(action: str) -> None:
         raise AwgctlError("invalid firewall hook action")
     intent = load_service_operation_intent(required=False)
     if intent is None:
+        if action == "down" and service_is_active_exact(load_config()["interface"]):
+            raise AwgctlError("firewall down is unsafe while the service is active")
         apply_firewall() if action == "up" else firewall_cleanup()
         if not firewall_action_postcondition(action):
             raise AwgctlError("firewall lifecycle postcondition was not proven")
@@ -2518,6 +2791,8 @@ def run_firewall_action_locked(action: str) -> None:
     is_duplicate = position > 0 and action == expected[position - 1]
     if not is_current and not is_duplicate:
         raise AwgctlError("expected firewall action does not match service operation")
+    if action == "down" and service_is_active_exact(intent["interface"]):
+        raise AwgctlError("firewall down is unsafe while the service is active")
     if is_current:
         apply_firewall() if action == "up" else firewall_cleanup()
     if not firewall_action_postcondition(action):
@@ -2636,29 +2911,25 @@ def compensate_service_operation_locked(intent: dict[str, Any]) -> None:
         raise AwgctlError("service compensation requires the mutation lock")
     operation_id = intent["operation_id"]
     try:
-        if intent["phase"] != "compensating":
-            current_transition = load_transition_document(required=False)
-            compensating = _service_intent_with(
-                intent,
-                phase="compensating",
-                goal="stopped",
-            )
-            compensating["next_action"] = 0
-            compensating["transition_id"] = (
-                current_transition["transaction_id"]
-                if current_transition is not None
-                else None
-            )
-            compensating["generation_sha256"] = managed_transition_prestate_digest()
-            compare_and_swap_service_operation_intent(
-                compensating,
-                expected_operation_id=operation_id,
-                expected_phase=intent["phase"],
-            )
-            intent = compensating
-        if intent["next_action"] == 0:
-            run_firewall_action_locked("down")
-            intent = load_service_operation_intent()
+        current_transition = load_transition_document(required=False)
+        compensating = _service_intent_with(
+            intent,
+            phase="compensating",
+            goal="stopped",
+        )
+        compensating["next_action"] = 0
+        compensating["transition_id"] = (
+            current_transition["transaction_id"]
+            if current_transition is not None
+            else None
+        )
+        compensating["generation_sha256"] = managed_transition_prestate_digest()
+        compare_and_swap_service_operation_intent(
+            compensating,
+            expected_operation_id=operation_id,
+            expected_phase=intent["phase"],
+        )
+        intent = compensating
         if service_is_active_exact(intent["interface"]):
             with temporarily_release_mutation_lock():
                 run(
@@ -2669,6 +2940,11 @@ def compensate_service_operation_locked(intent: dict[str, Any]) -> None:
                     ],
                     timeout=45,
                 )
+            intent = load_service_operation_intent()
+        if service_is_active_exact(intent["interface"]):
+            raise AwgctlError("service remained active during fail-safe compensation")
+        if intent["next_action"] == 0:
+            run_firewall_action_locked("down")
             intent = load_service_operation_intent()
         if not _service_stopped_postcondition(intent):
             raise AwgctlError("stopped service postcondition was not proven")
