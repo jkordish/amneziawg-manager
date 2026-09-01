@@ -5661,12 +5661,27 @@ def _verify_transition_timer(
             r"@(?P<seconds>[0-9]{1,20})(?:\.(?P<fraction>[0-9]{1,6}))?",
             properties["NextElapseUSecRealtime"],
         )
+        human_timestamp = re.fullmatch(
+            r"(?P<weekday>Mon|Tue|Wed|Thu|Fri|Sat|Sun) "
+            r"(?P<date>[0-9]{4}-[0-9]{2}-[0-9]{2}) "
+            r"(?P<time>[0-9]{2}:[0-9]{2}:[0-9]{2}) UTC",
+            properties["NextElapseUSecRealtime"],
+        )
+        observed_seconds: int | None = None
+        if timestamp is not None and not (timestamp.group("fraction") or "").strip("0"):
+            observed_seconds = int(timestamp.group("seconds"))
+        elif human_timestamp is not None:
+            observed = dt.datetime.strptime(
+                f"{human_timestamp.group('date')} {human_timestamp.group('time')}",
+                "%Y-%m-%d %H:%M:%S",
+            ).replace(tzinfo=dt.timezone.utc)
+            weekdays = ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
+            if weekdays[observed.weekday()] == human_timestamp.group("weekday"):
+                observed_seconds = int(observed.timestamp())
         if (
             properties["ActiveState"] != "active"
             or properties["UnitFileState"] != "enabled"
-            or timestamp is None
-            or (timestamp.group("fraction") or "").strip("0")
-            or int(timestamp.group("seconds")) != int(deadline.timestamp())
+            or observed_seconds != int(deadline.timestamp())
         ):
             raise AwgctlError(f"{label} could not be verified")
     except AwgctlError as exc:
