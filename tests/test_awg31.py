@@ -1142,6 +1142,43 @@ class CpsDisclosureTests(unittest.TestCase):
                 self.assertIn("native parser", public)
                 self.assertIn("[redacted]", public)
 
+    def test_native_selftest_and_public_errors_redact_all_awg_key_directives(self):
+        directives = ("PrivateKey", "PresharedKey", "HeaderProtectionKey")
+        for index, directive in enumerate(directives, start=1):
+            secret = key(20 + index)
+            native_error = f"native parser rejected {directive} = {secret} at line 9"
+            failed = subprocess.CompletedProcess(
+                ["awg", "setconf"], 1, b"", native_error.encode("utf-8")
+            )
+            with self.subTest(boundary="selftest", directive=directive), mock.patch.object(
+                selftest_module.subprocess, "run", return_value=failed
+            ):
+                with self.assertRaises(selftest_module.SelfTestError) as raised:
+                    selftest_module._run(["awg", "setconf", "awg0", "config"])
+            safe_error = str(raised.exception)
+            self.assertNotIn(secret, safe_error)
+            self.assertIn(f"{directive} = [redacted", safe_error)
+
+            for as_json in (False, True):
+                output = io.StringIO()
+                errors = io.StringIO()
+                argv = ["--json", "self-test", "--experimental"] if as_json else [
+                    "self-test", "--experimental"
+                ]
+                with (
+                    self.subTest(boundary="public", directive=directive, json=as_json),
+                    mock.patch.object(
+                        core, "dispatch", side_effect=selftest_module.SelfTestError(native_error)
+                    ),
+                    mock.patch.object(core, "audit"),
+                    contextlib.redirect_stdout(output),
+                    contextlib.redirect_stderr(errors),
+                ):
+                    self.assertEqual(core.main(argv), 1)
+                public = output.getvalue() + errors.getvalue()
+                self.assertNotIn(secret, public)
+                self.assertIn(f"{directive} = [redacted", public)
+
     def test_cps_sanitizer_handles_multiple_wrappers_and_bounded_malformed_text(self):
         source = (
             "prefix "

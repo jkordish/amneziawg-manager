@@ -208,5 +208,9 @@ acceptance. `sudo awgctl status --json` and
 Secret directories are `0700`; keys, profiles, QR images, metadata, generated
 configuration, transitions, backups, and diagnostics are `0600`. Product code
 and public documentation contain no credentials. Obfuscation rollback and
-crash-recovery timers are transient units created per transaction with the
-root-only internal entrypoint; there is no static reusable timeout service.
+crash-recovery timers are persistent root-owned units created per transaction
+with an exact absolute deadline and a transaction/origin-bound root-only
+internal entrypoint; there is no static reusable timeout service. Installer
+compensation reports every failed membership, user, or group rollback in
+reverse order so residual sudo or group authority cannot be mistaken for a
+successful rollback.

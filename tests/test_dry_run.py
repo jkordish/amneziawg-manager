@@ -19,6 +19,247 @@ from awgctl import core
 
 
 class DryRunTests(unittest.TestCase):
+    def test_public_and_internal_expiry_routes_reach_prepared_aware_handler(self):
+        cases = (
+            ("public", ["client", "expire", "--json"], "cmd_client_expire"),
+            ("internal", ["_expire-clients", "--json"], "cmd_expire_clients"),
+        )
+        for entrypoint, argv, handler_name in cases:
+            args = core.build_parser(entrypoint=entrypoint).parse_args(argv)
+            with (
+                self.subTest(entrypoint=entrypoint),
+                mock.patch.object(core, "require_root"),
+                mock.patch.object(
+                    core,
+                    "load_transition_document",
+                    return_value={"state": "prepared"},
+                ),
+                mock.patch.object(
+                    core,
+                    "mutation_lock",
+                    side_effect=AssertionError("dispatch must defer to expiry handler lock"),
+                ),
+                mock.patch.object(core, handler_name, return_value=0) as handler,
+            ):
+                self.assertEqual(core.dispatch(args), 0)
+            handler.assert_called_once_with(args)
+
+    def test_internal_expiry_rejects_active_transition_before_expiry_work(self):
+        args = argparse.Namespace(dry_run=False, json=True)
+        with (
+            mock.patch.object(core, "mutation_lock", return_value=contextlib.nullcontext()),
+            mock.patch.object(
+                core,
+                "load_transition_document",
+                return_value={"state": "active", "transaction_id": "a" * 32},
+            ),
+            mock.patch.object(
+                core, "load_clients", side_effect=AssertionError("expiry work must not begin")
+            ),
+            self.assertRaisesRegex(core.AwgctlError, "active.*transition"),
+        ):
+            core.cmd_expire_clients(args)
+
+    def test_due_expiry_terminally_cancels_prepared_transition_before_mutation(self):
+        today = dt.datetime.now(dt.timezone.utc).date().isoformat()
+        due = {
+            "name": "due",
+            "status": "active",
+            "expires": today,
+            "public_key": "due-public",
+            "address": "10.77.42.2/32",
+            "psk": "due-psk",
+        }
+        prepared = {"state": "prepared", "transaction_id": "a" * 32}
+        args = argparse.Namespace(dry_run=False, json=True)
+        events = []
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            clients_root = root / "clients"
+            metadata_path = clients_root / "due/metadata.json"
+            metadata_path.parent.mkdir(parents=True)
+            metadata_path.write_text(json.dumps(due))
+            generated = root / "generated.conf"
+            runtime = root / "runtime.conf"
+            generated.write_text("server\n")
+            runtime.write_text("server\n")
+            original_atomic_json = core.atomic_json
+            original_read_bytes = pathlib.Path.read_bytes
+
+            def record_metadata(path, value, mode):
+                events.append("metadata")
+                return original_atomic_json(path, value, mode)
+
+            def record_read_bytes(path):
+                if path == metadata_path:
+                    events.append("snapshot")
+                return original_read_bytes(path)
+
+            with (
+                mock.patch.object(core, "CLIENTS", clients_root),
+                mock.patch.object(core, "GENERATED_CONFIG", generated),
+                mock.patch.object(core, "RUNTIME_CONFIG", runtime),
+                mock.patch.object(core, "mutation_lock", return_value=contextlib.nullcontext()),
+                mock.patch.object(core, "load_transition_document", return_value=prepared),
+                mock.patch.object(core, "load_clients", side_effect=[[due], [due]]),
+                mock.patch.object(core, "load_config", return_value={"interface": "awg0"}),
+                mock.patch.object(
+                    core,
+                    "ensure_expiry_reconcilable",
+                    side_effect=lambda *a, **k: events.append("preflight"),
+                ),
+                mock.patch.object(
+                    core,
+                    "complete_transition_document",
+                    side_effect=lambda *a, **k: events.append("cancel"),
+                ) as complete,
+                mock.patch.object(
+                    core,
+                    "create_backup",
+                    side_effect=lambda: events.append("backup") or root / "backup",
+                ),
+                mock.patch.object(core, "atomic_json", side_effect=record_metadata),
+                mock.patch.object(
+                    pathlib.Path,
+                    "read_bytes",
+                    autospec=True,
+                    side_effect=record_read_bytes,
+                ),
+                mock.patch.object(core, "render_current_server", return_value="filtered\n"),
+                mock.patch.object(
+                    core,
+                    "commit_server_config",
+                    side_effect=lambda *a, **k: events.append("commit") or True,
+                ),
+                mock.patch.object(core, "live_peers", return_value=set()),
+                mock.patch.object(core, "audit"),
+                redirect_stdout(io.StringIO()),
+            ):
+                self.assertEqual(core.cmd_expire_clients(args), 0)
+
+        self.assertEqual(
+            events[:6],
+            ["preflight", "backup", "snapshot", "cancel", "metadata", "commit"],
+        )
+        self.assertEqual(complete.call_args.kwargs["outcome"], "rolled_back")
+        self.assertEqual(complete.call_args.kwargs["reason"], "expiry")
+
+    def test_prepared_cancellation_failure_prevents_expiry_mutation(self):
+        due = {
+            "name": "due",
+            "status": "active",
+            "expires": "2000-01-01",
+            "public_key": "due-public",
+            "address": "10.77.42.2/32",
+            "psk": "due-psk",
+        }
+        args = argparse.Namespace(dry_run=False, json=True)
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            clients_root = root / "clients"
+            metadata_path = clients_root / "due/metadata.json"
+            metadata_path.parent.mkdir(parents=True)
+            metadata_path.write_text(json.dumps(due))
+            generated = root / "generated.conf"
+            runtime = root / "runtime.conf"
+            generated.write_text("server\n")
+            runtime.write_text("server\n")
+            with (
+                mock.patch.object(core, "CLIENTS", clients_root),
+                mock.patch.object(core, "GENERATED_CONFIG", generated),
+                mock.patch.object(core, "RUNTIME_CONFIG", runtime),
+                mock.patch.object(core, "mutation_lock", return_value=contextlib.nullcontext()),
+                mock.patch.object(
+                    core,
+                    "load_transition_document",
+                    return_value={"state": "prepared", "transaction_id": "a" * 32},
+                ),
+                mock.patch.object(core, "load_clients", side_effect=[[due], [due]]),
+                mock.patch.object(core, "load_config", return_value={"interface": "awg0"}),
+                mock.patch.object(core, "ensure_expiry_reconcilable"),
+                mock.patch.object(core, "create_backup", return_value=root / "backup") as backup,
+                mock.patch.object(
+                    core,
+                    "complete_transition_document",
+                    side_effect=core.AwgctlError("injected terminal cleanup failure"),
+                ),
+                mock.patch.object(
+                    core, "atomic_json", side_effect=AssertionError("must not mutate")
+                ),
+                self.assertRaisesRegex(core.AwgctlError, "terminal cleanup failure"),
+            ):
+                core.cmd_expire_clients(args)
+            backup.assert_called_once_with()
+
+    def test_expiry_preflight_failure_preserves_prepared_transition(self):
+        due = {
+            "name": "due",
+            "status": "active",
+            "expires": "2000-01-01",
+            "public_key": "due-public",
+            "address": "10.77.42.2/32",
+            "psk": "due-psk",
+        }
+        args = argparse.Namespace(dry_run=False, json=True)
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            generated = root / "generated.conf"
+            runtime = root / "runtime.conf"
+            generated.write_text("server\n")
+            runtime.write_text("server\n")
+            with (
+                mock.patch.object(core, "GENERATED_CONFIG", generated),
+                mock.patch.object(core, "RUNTIME_CONFIG", runtime),
+                mock.patch.object(core, "mutation_lock", return_value=contextlib.nullcontext()),
+                mock.patch.object(
+                    core,
+                    "load_transition_document",
+                    return_value={"state": "prepared", "transaction_id": "a" * 32},
+                ),
+                mock.patch.object(core, "load_clients", side_effect=[[due], [due]]),
+                mock.patch.object(core, "load_config", return_value={"interface": "awg0"}),
+                mock.patch.object(
+                    core,
+                    "ensure_expiry_reconcilable",
+                    side_effect=core.AwgctlError("injected expiry preflight failure"),
+                ),
+                mock.patch.object(
+                    core,
+                    "complete_transition_document",
+                    side_effect=AssertionError("prepared transition must survive preflight"),
+                ),
+                self.assertRaisesRegex(core.AwgctlError, "preflight failure"),
+            ):
+                core.cmd_expire_clients(args)
+
+    def test_no_due_expiry_preserves_prepared_transition(self):
+        future = {"name": "future", "status": "active", "expires": "2099-01-01"}
+        args = argparse.Namespace(dry_run=False, json=True)
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            generated = root / "generated.conf"
+            runtime = root / "runtime.conf"
+            generated.write_text("server\n")
+            runtime.write_text("server\n")
+            with (
+                mock.patch.object(core, "GENERATED_CONFIG", generated),
+                mock.patch.object(core, "RUNTIME_CONFIG", runtime),
+                mock.patch.object(core, "mutation_lock", return_value=contextlib.nullcontext()),
+                mock.patch.object(
+                    core,
+                    "load_transition_document",
+                    return_value={"state": "prepared", "transaction_id": "a" * 32},
+                ),
+                mock.patch.object(core, "load_clients", return_value=[future]),
+                mock.patch.object(
+                    core,
+                    "complete_transition_document",
+                    side_effect=AssertionError("prepared transition must be preserved"),
+                ),
+                redirect_stdout(io.StringIO()),
+            ):
+                self.assertEqual(core.cmd_expire_clients(args), 0)
+
     def test_public_client_expire_wraps_root_only_internal_entrypoint(self):
         args = core.build_parser().parse_args(["client", "expire", "--dry-run", "--json"])
         output = io.StringIO()

@@ -1140,6 +1140,140 @@ class HostConfigurationTests(unittest.TestCase):
         self.assertIn(("groupdel", "awgctl-admin"), commands)
         self.assertIn(("groupdel", "awgctl"), commands)
 
+    def test_configure_failure_aggregates_reverse_identity_rollback_failures(self):
+        from awginstall import host
+        from awginstall.host import HostConfigurationError, HostPaths, configure_host
+        from awginstall.identity import IdentityPlan, IdentitySnapshot, UserRecord
+        from awginstall.settings import resolve_installation_settings
+
+        settings = resolve_installation_settings(sudo_user=None)
+        plan = IdentityPlan(
+            commands=(
+                ("groupadd", "--system", "awgctl"),
+                ("useradd", "awgctl"),
+                ("groupadd", "--system", "awgctl-admin"),
+                ("usermod", "--append", "--groups", "awgctl-admin", "alice"),
+            ),
+            created_users=("awgctl",),
+            created_groups=("awgctl", "awgctl-admin"),
+            added_memberships=(("alice", "awgctl-admin"),),
+        )
+        rollback_commands = []
+
+        def runner(argv):
+            command = tuple(argv)
+            if command[:2] == ("systemctl", "is-enabled"):
+                return subprocess.CompletedProcess(argv, 1, b"disabled\n", b"")
+            if command[:2] == ("systemctl", "is-active"):
+                return subprocess.CompletedProcess(argv, 3, b"inactive\n", b"")
+            if command and command[0] in {"gpasswd", "userdel", "groupdel"}:
+                rollback_commands.append(command)
+                if command[0] != "groupdel" or command[-1] == "awgctl-admin":
+                    raise HostConfigurationError(f"injected {command[0]} rollback failure")
+            if command and command[0] == "visudo":
+                raise HostConfigurationError("invalid sudoers")
+            return subprocess.CompletedProcess(argv, 0, b"", b"")
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            with (
+                mock.patch.object(host, "build_identity_plan", return_value=plan),
+                mock.patch.object(
+                    host,
+                    "_resolve_created_user",
+                    return_value=UserRecord(
+                        "awgctl",
+                        os.getuid(),
+                        os.getgid(),
+                        str(settings.staging_root),
+                        "/usr/sbin/nologin",
+                    ),
+                ),
+                mock.patch.object(host, "_prepare_staging_root"),
+            ):
+                with self.assertRaises(HostConfigurationError) as raised:
+                    configure_host(
+                        settings,
+                        product_root=root / "opt/amneziawg",
+                        paths=HostPaths.under(root),
+                        allow_existing=False,
+                        dry_run=False,
+                        snapshot=IdentitySnapshot(
+                            users={},
+                            groups={},
+                            locked_users=set(),
+                            supplementary_groups={},
+                        ),
+                        runner=runner,
+                    )
+
+        message = str(raised.exception)
+        self.assertIn("invalid sudoers", message)
+        self.assertIn("gpasswd rollback failure", message)
+        self.assertIn("userdel rollback failure", message)
+        self.assertIn("groupdel rollback failure", message)
+        self.assertEqual(
+            rollback_commands,
+            [
+                ("gpasswd", "--delete", "alice", "awgctl-admin"),
+                ("userdel", "--remove", "awgctl"),
+                ("groupdel", "awgctl-admin"),
+                ("groupdel", "awgctl"),
+            ],
+        )
+
+    def test_outer_host_rollback_propagates_all_identity_cleanup_failures(self):
+        from awginstall import host
+        from awginstall.host import (
+            ExpiryTimerState,
+            HostConfigurationError,
+            HostConfigurationReport,
+            rollback_host_configuration,
+        )
+        from awginstall.identity import IdentityPlan
+
+        plan = IdentityPlan(
+            commands=(),
+            created_users=("awgctl",),
+            created_groups=("awgctl", "awgctl-admin"),
+            added_memberships=(("alice", "awgctl-admin"),),
+        )
+        report = HostConfigurationReport(
+            identity=plan,
+            sudoers="",
+            service_hardening="",
+            module_load="",
+            settings={},
+            dry_run=False,
+            rollback_files={},
+            expiry_timer_state=ExpiryTimerState("disabled", "inactive"),
+        )
+        observed = []
+
+        def runner(argv):
+            command = tuple(argv)
+            observed.append(command)
+            raise HostConfigurationError(f"injected {command[0]} rollback failure")
+
+        with (
+            mock.patch.object(host, "_restore_managed_host_state", return_value=[]),
+            self.assertRaises(HostConfigurationError) as raised,
+        ):
+            rollback_host_configuration(report, runner=runner)
+
+        self.assertEqual(
+            observed,
+            [
+                ("gpasswd", "--delete", "alice", "awgctl-admin"),
+                ("userdel", "--remove", "awgctl"),
+                ("groupdel", "awgctl-admin"),
+                ("groupdel", "awgctl"),
+            ],
+        )
+        message = str(raised.exception)
+        for command in ("gpasswd", "userdel", "groupdel"):
+            self.assertIn(f"{command} rollback failure", message)
+
 
 class ConfinedBuildTests(unittest.TestCase):
     def test_source_build_runs_without_network_and_returns_root_staged_artifact(self):

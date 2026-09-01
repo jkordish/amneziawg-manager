@@ -435,22 +435,27 @@ def _install_validated_sudoers(path: pathlib.Path, content: str, runner: Runner)
         raise
 
 
-def _rollback_identities(plan: IdentityPlan, runner: Runner) -> None:
+def _rollback_identities(plan: IdentityPlan, runner: Runner) -> list[str]:
+    errors: list[str] = []
     for user, group in reversed(plan.added_memberships):
+        command = ("gpasswd", "--delete", user, group)
         try:
-            runner(("gpasswd", "--delete", user, group))
-        except Exception:
-            pass
+            runner(command)
+        except Exception as exc:
+            errors.append(f"{' '.join(command)}: {exc}")
     for user in reversed(plan.created_users):
+        command = ("userdel", "--remove", user)
         try:
-            runner(("userdel", "--remove", user))
-        except Exception:
-            pass
+            runner(command)
+        except Exception as exc:
+            errors.append(f"{' '.join(command)}: {exc}")
     for group in reversed(plan.created_groups):
+        command = ("groupdel", group)
         try:
-            runner(("groupdel", group))
-        except Exception:
-            pass
+            runner(command)
+        except Exception as exc:
+            errors.append(f"{' '.join(command)}: {exc}")
+    return errors
 
 
 def _restore_managed_host_state(
@@ -496,7 +501,7 @@ def rollback_host_configuration(
         report.expiry_timer_state,
         runner,
     )
-    _rollback_identities(report.identity, runner)
+    errors.extend(_rollback_identities(report.identity, runner))
     if errors:
         raise HostConfigurationError("host rollback was incomplete: " + "; ".join(errors))
 
@@ -598,12 +603,14 @@ def configure_host(
             expiry_timer_state,
             runner,
         )
-        if commands_started:
-            _rollback_identities(identity_plan, runner)
-        if restoration_errors:
+        identity_errors = (
+            _rollback_identities(identity_plan, runner) if commands_started else []
+        )
+        compensation_errors = [*restoration_errors, *identity_errors]
+        if compensation_errors:
             raise HostConfigurationError(
                 f"{exc}; host compensation was incomplete: "
-                + "; ".join(restoration_errors)
+                + "; ".join(compensation_errors)
             ) from exc
         if isinstance(exc, HostConfigurationError):
             raise

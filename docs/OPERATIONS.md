@@ -134,6 +134,12 @@ sudo awgctl client expire
 systemctl status amneziawg-client-expiry.timer
 ```
 
+An active obfuscation transition still blocks expiry. If reconciliation is
+actually due while a non-serving prepared transition exists, awgctl completes
+all drift, secret-binding, backup, and metadata-snapshot preflight first, then
+terminally cancels the prepared transition before the first expiry write. With
+no due reconciliation, prepared state is left intact.
+
 ## Configuration
 
 ```bash
@@ -215,7 +221,8 @@ tools/module pair; today `prepare` must fail closed at the capability gate.
 Use `sudo awgctl obfuscation rollback TRANSACTION_ID` for an operator rollback.
 A failed activation rolls back synchronously. An active transaction that is not
 confirmed by the exact deadline invokes the root-only internal timeout through
-a transient systemd timer. Classic and AWG 3.1 never run concurrently.
+a root-owned, persistent, transaction-specific systemd timer. Its absolute
+deadline survives reboot. Classic and AWG 3.1 never run concurrently.
 
 ## Kat manual acceptance checklist
 
@@ -277,6 +284,10 @@ sudo awgctl update check
 sudo awgctl update apply --dry-run
 sudo awgctl update apply
 ```
+
+The requested update channel must match the signed manifest and the tag's
+SemVer prerelease form. In particular, `stable` never accepts a prerelease tag,
+even if release-host metadata incorrectly labels it as stable.
 
 `update apply` is code-only. It installs a verified immutable executable and
 runs that executable's health check; it does not install or repair host-managed

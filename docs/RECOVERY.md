@@ -72,13 +72,15 @@ sudo awgctl health
 Activation arms crash recovery before installing AWG 3.1 artifacts and then
 replaces it with an absolute-deadline ten-minute rollback timer. A reload,
 verification, or timer-construction failure restores classic state
-synchronously. If activation succeeds but is not confirmed, the transient
-root-only `_obfuscation-timeout TRANSACTION_ID` unit performs the same verified
-restore. Repeating rollback for the matching completed transaction is
-idempotent; another or stale ID is rejected.
+synchronously. Both recovery and final rollback are root-owned, enabled,
+transaction-specific service/timer pairs under `/etc/systemd/system`; their
+absolute `OnCalendar` deadline and `Persistent=true` behavior survive reboot.
+Each service binds both the transaction ID and its recovery/final origin to the
+root-only internal timeout command. Repeating rollback for the matching
+completed transaction is idempotent; another or stale ID is rejected.
 
 Do not edit transition JSON, copy a pending profile around the manager, cancel
-the transient timer manually, or remove the classic backup during an active
+the persistent timer manually, or remove the classic backup during an active
 window. The next lock-protected lifecycle command reconciles an interrupted
 cleanup from its durable checkpoint. If recovery cannot prove classic state,
 the manager stops the interface rather than serving an uncertain configuration.

@@ -13,10 +13,9 @@ import stat
 from collections.abc import Mapping
 
 
-_KEY_LINE = re.compile(
-    r"^(\s*(?P<name>PrivateKey|PublicKey|PresharedKey|HeaderProtectionKey)\s*=\s*)"
-    r"(?P<value>\S+)(\s*)$",
-    re.MULTILINE,
+_KEY_ASSIGNMENT = re.compile(
+    r"(\b(?P<name>PrivateKey|PublicKey|PresharedKey|HeaderProtectionKey)\s*=\s*)"
+    r"(?P<value>[^\s,;]+)",
 )
 _CPS_ASSIGNMENT_START = re.compile(r"\bI[1-5][ \t]*=[ \t]*")
 _CPS_TAG = re.compile(
@@ -117,9 +116,9 @@ def redact_awg_config(text: str) -> str:
             if len(decoded) == 32:
                 value = decoded
         digest = hashlib.sha256(value).hexdigest()[:length]
-        return f"{match.group(1)}[redacted sha256:{digest}]{match.group(4)}"
+        return f"{match.group(1)}[redacted sha256:{digest}]"
 
-    return sanitize_cps_text(_KEY_LINE.sub(replace, text))
+    return sanitize_cps_text(_KEY_ASSIGNMENT.sub(replace, text))
 
 
 def _safe_relative(name: str) -> pathlib.PurePosixPath:

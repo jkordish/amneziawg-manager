@@ -524,6 +524,55 @@ class UpgradeTests(unittest.TestCase):
         )
         self.assertIn("health failed", errors.getvalue())
 
+    def test_upgrade_aggregates_original_and_reverse_outer_identity_rollback_failures(self):
+        from awginstall import cli
+        from awginstall.host import HostConfigurationError
+
+        bootstrap_report = object()
+        final_report = object()
+        errors = io.StringIO()
+
+        def rollback(report):
+            label = "final" if report is final_report else "bootstrap"
+            raise HostConfigurationError(f"{label} identity authority remains")
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory) / "opt/amneziawg"
+            with (
+                mock.patch.object(
+                    cli,
+                    "_configure_host_for_command",
+                    side_effect=[bootstrap_report, final_report],
+                ),
+                mock.patch.object(
+                    cli,
+                    "_deploy_source_release",
+                    side_effect=InstallerError("health failed"),
+                ),
+                mock.patch.object(
+                    cli,
+                    "rollback_host_configuration",
+                    side_effect=rollback,
+                ) as rollback_call,
+                mock.patch("sys.stderr", errors),
+            ):
+                result = installer_main(
+                    ["upgrade", "--yes", "--ingress-boundary", "lightsail"],
+                    root=root,
+                    repo_root=REPO_ROOT,
+                    output=io.StringIO(),
+                )
+
+        self.assertEqual(result, 1)
+        self.assertEqual(
+            rollback_call.call_args_list,
+            [mock.call(final_report), mock.call(bootstrap_report)],
+        )
+        message = errors.getvalue()
+        self.assertIn("health failed", message)
+        self.assertIn("final identity authority remains", message)
+        self.assertIn("bootstrap identity authority remains", message)
+
     def test_first_upgrade_rolls_back_bootstrap_when_final_host_configuration_fails(self):
         from awginstall import cli
         from awginstall.host import HostConfigurationError
