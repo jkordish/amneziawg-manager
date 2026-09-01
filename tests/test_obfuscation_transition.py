@@ -411,6 +411,111 @@ class FakeServiceRuntime:
         self.firewall_up = True
 
 
+def nft_match(left, right, op="=="):
+    return {"match": {"op": op, "left": left, "right": right}}
+
+
+def nft_prefix(value):
+    network = value.split("/")
+    return {"prefix": {"addr": network[0], "len": int(network[1])}}
+
+
+def managed_nft_json(config, *, docker_chain):
+    meta = lambda key: {"meta": {"key": key}}
+    payload = lambda field: {"payload": {"protocol": "ip", "field": field}}
+    counter = {"counter": {"packets": 41, "bytes": 9001}}
+
+    def rule(table, chain, handle, comment, expressions):
+        return {
+            "rule": {
+                "family": "ip",
+                "table": table,
+                "chain": chain,
+                "handle": handle,
+                "expr": expressions,
+                "comment": comment,
+            }
+        }
+
+    values = [
+        {"metainfo": {"version": "1.0.9", "release_name": "Old Doc Yak", "json_schema_version": 1}},
+        {"table": {"family": "ip", "name": "amneziawg_forward", "handle": 10}},
+        {"chain": {"family": "ip", "table": "amneziawg_forward", "name": "forward", "handle": 11, "type": "filter", "hook": "forward", "prio": -10, "policy": "accept"}},
+        rule("amneziawg_forward", "forward", 12, "awgctl-return-is-established-only", [
+            nft_match(meta("iifname"), config["external_interface"]),
+            nft_match(meta("oifname"), config["interface"]),
+            nft_match(payload("daddr"), nft_prefix(config["subnet"])),
+            nft_match({"ct": {"key": "state"}}, ["established", "related"], "in"),
+            counter,
+            {"accept": None},
+        ]),
+        rule("amneziawg_forward", "forward", 13, "awgctl-block-non-return-to-tunnel", [
+            nft_match(meta("oifname"), config["interface"]), counter, {"drop": None},
+        ]),
+        rule("amneziawg_forward", "forward", 14, "awgctl-block-spoofed-tunnel-source", [
+            nft_match(meta("iifname"), config["interface"]),
+            nft_match(payload("saddr"), nft_prefix(config["subnet"]), "!="),
+            counter,
+            {"drop": None},
+        ]),
+        rule("amneziawg_forward", "forward", 15, "awgctl-block-private-reserved-destinations", [
+            nft_match(meta("iifname"), config["interface"]),
+            nft_match(payload("daddr"), {"set": [nft_prefix(value) for value in config["blocked_forward_ipv4"]]}, "in"),
+            counter,
+            {"drop": None},
+        ]),
+        rule("amneziawg_forward", "forward", 16, "awgctl-block-lateral-forwarding", [
+            nft_match(meta("iifname"), config["interface"]),
+            nft_match(meta("oifname"), config["external_interface"], "!="),
+            counter,
+            {"drop": None},
+        ]),
+        rule("amneziawg_forward", "forward", 17, "awgctl-allow-public-internet", [
+            nft_match(meta("iifname"), config["interface"]),
+            nft_match(payload("saddr"), nft_prefix(config["subnet"])),
+            nft_match(meta("oifname"), config["external_interface"]),
+            counter,
+            {"accept": None},
+        ]),
+        rule("amneziawg_forward", "forward", 18, "awgctl-default-tunnel-forward-drop", [
+            nft_match(meta("iifname"), config["interface"]), counter, {"drop": None},
+        ]),
+        {"table": {"family": "ip", "name": "amneziawg_nat", "handle": 20}},
+        {"chain": {"family": "ip", "table": "amneziawg_nat", "name": "postrouting", "handle": 21, "type": "nat", "hook": "postrouting", "prio": 110, "policy": "accept"}},
+        rule("amneziawg_nat", "postrouting", 22, "awgctl-tunnel-masquerade", [
+            nft_match(payload("saddr"), nft_prefix(config["subnet"])),
+            nft_match(meta("oifname"), config["external_interface"]),
+            counter,
+            {"masquerade": None},
+        ]),
+    ]
+    if docker_chain:
+        values.extend([
+            {"table": {"family": "ip", "name": "filter", "handle": 30}},
+            {"chain": {"family": "ip", "table": "filter", "name": "DOCKER-USER", "handle": 31}},
+            rule("filter", "DOCKER-USER", 32, "unrelated-docker-rule", [{"return": None}]),
+            rule("filter", "DOCKER-USER", 33, "awgctl-public-egress", [
+                nft_match(meta("iifname"), config["interface"]),
+                nft_match(meta("oifname"), config["external_interface"]),
+                nft_match(payload("saddr"), nft_prefix(config["subnet"])),
+                counter,
+                {"accept": None},
+            ]),
+            rule("filter", "DOCKER-USER", 34, "awgctl-established-return", [
+                nft_match(meta("iifname"), config["external_interface"]),
+                nft_match(meta("oifname"), config["interface"]),
+                nft_match(payload("daddr"), nft_prefix(config["subnet"])),
+                nft_match({"ct": {"key": "state"}}, ["established", "related"], "in"),
+                counter,
+                {"accept": None},
+            ]),
+            rule("filter", "DOCKER-USER", 35, "awgctl-default-tunnel-forward-drop", [
+                nft_match(meta("iifname"), config["interface"]), counter, {"drop": None},
+            ]),
+        ])
+    return {"nftables": values}
+
+
 class ObfuscationGrammarTests(unittest.TestCase):
     def test_public_and_internal_transition_grammars_are_separated(self):
         parser = core.build_parser()
@@ -727,6 +832,95 @@ class ServiceOperationIntentTests(unittest.TestCase):
                     core.process_identity_is_alive(1234, 5678)
 
 
+class FirewallSemanticPostconditionTests(unittest.TestCase):
+    def verify(self, root, value, action="up"):
+        output = subprocess.CompletedProcess(
+            ["nft"],
+            0,
+            json.dumps(value).encode("utf-8"),
+            b"",
+        )
+        with mock.patch.object(core, "run", return_value=output):
+            return core.firewall_action_postcondition(action)
+
+    def test_exact_current_semantics_pass_with_or_without_docker_chain(self):
+        for docker_chain in (False, True):
+            with self.subTest(docker_chain=docker_chain), tempfile.TemporaryDirectory() as directory:
+                root = pathlib.Path(directory)
+                with patched_layout(root):
+                    config, _ = classic_state()
+                    self.assertTrue(
+                        self.verify(
+                            root,
+                            managed_nft_json(config, docker_chain=docker_chain),
+                        )
+                    )
+
+    def test_named_tables_and_fake_markers_are_not_semantic_proof(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            with patched_layout(root):
+                config, _ = classic_state()
+                exact = managed_nft_json(config, docker_chain=True)
+                empty_tables = {
+                    "nftables": [
+                        value
+                        for value in exact["nftables"]
+                        if "table" in value and value["table"]["name"] in {
+                            "amneziawg_forward",
+                            "amneziawg_nat",
+                        }
+                    ]
+                }
+                self.assertFalse(self.verify(root, empty_tables))
+
+                fake = copy.deepcopy(exact)
+                for value in fake["nftables"]:
+                    rule = value.get("rule")
+                    if rule and rule.get("comment", "").startswith("awgctl-"):
+                        rule["expr"] = [{"counter": {"packets": 0, "bytes": 0}}]
+                self.assertFalse(self.verify(root, fake))
+
+    def test_stale_missing_extra_and_malformed_managed_semantics_fail_closed(self):
+        def find(value, kind, **fields):
+            return next(
+                item[kind]
+                for item in value["nftables"]
+                if kind in item and all(item[kind].get(key) == expected for key, expected in fields.items())
+            )
+
+        mutations = {
+            "interface": lambda value: find(value, "rule", comment="awgctl-allow-public-internet")["expr"][0]["match"].update(right="awg9"),
+            "subnet": lambda value: find(value, "rule", comment="awgctl-tunnel-masquerade")["expr"][0]["match"].update(right=nft_prefix("10.99.0.0/24")),
+            "policy": lambda value: find(value, "chain", table="amneziawg_forward", name="forward").update(policy="drop"),
+            "hook": lambda value: find(value, "chain", table="amneziawg_forward", name="forward").update(hook="input"),
+            "nat": lambda value: find(value, "rule", comment="awgctl-tunnel-masquerade")["expr"].__setitem__(-1, {"accept": None}),
+            "docker": lambda value: find(value, "rule", comment="awgctl-public-egress")["expr"][1]["match"].update(right="eth9"),
+            "missing": lambda value: value["nftables"].remove(next(item for item in value["nftables"] if item.get("rule", {}).get("comment") == "awgctl-block-lateral-forwarding")),
+            "extra": lambda value: value["nftables"].append({"chain": {"family": "ip", "table": "amneziawg_forward", "name": "unexpected", "handle": 99}}),
+            "unknown": lambda value: value["nftables"].append({"set": {"family": "ip", "table": "amneziawg_nat", "name": "unexpected", "handle": 100}}),
+            "wrong-family": lambda value: value["nftables"].append({"table": {"family": "ip6", "name": "amneziawg_forward", "handle": 101}}),
+        }
+        for name, mutate in mutations.items():
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as directory:
+                root = pathlib.Path(directory)
+                with patched_layout(root):
+                    config, _ = classic_state()
+                    candidate = managed_nft_json(config, docker_chain=True)
+                    mutate(candidate)
+                    self.assertFalse(self.verify(root, candidate))
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            with patched_layout(root):
+                classic_state()
+                malformed = {"nftables": [{"rule": []}]}
+                with self.assertRaisesRegex(core.AwgctlError, "cannot verify firewall"):
+                    self.verify(root, malformed)
+                with self.assertRaisesRegex(core.AwgctlError, "cannot verify firewall"):
+                    self.verify(root, {"nftables": [{"unknown": {}}]})
+
+
 class TransitionInterlockTests(unittest.TestCase):
     def test_hook_intent_enforces_sequence_and_duplicate_idempotency(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -741,6 +935,7 @@ class TransitionInterlockTests(unittest.TestCase):
                     core.mutation_lock(),
                     mock.patch.object(core, "firewall_cleanup", cleanup),
                     mock.patch.object(core, "apply_firewall", apply),
+                    mock.patch.object(core, "service_is_active_exact", return_value=False),
                     mock.patch.object(
                         core,
                         "firewall_action_postcondition",
@@ -804,6 +999,7 @@ class TransitionInterlockTests(unittest.TestCase):
                             return_value=True,
                             create=True,
                         ),
+                        mock.patch.object(core, "service_is_active_exact", return_value=False),
                     ):
                         args = core.build_parser(entrypoint="internal").parse_args(
                             ["_firewall", action]
@@ -844,12 +1040,281 @@ class TransitionInterlockTests(unittest.TestCase):
                             core.run_firewall_action_locked("down")
                     cleanup.assert_not_called()
 
+    def test_down_rejects_before_mutation_or_progress_while_service_is_active(self):
+        for with_intent in (False, True):
+            with self.subTest(with_intent=with_intent), tempfile.TemporaryDirectory() as directory:
+                with patched_layout(pathlib.Path(directory)), mock.patch.object(core, "require_root"):
+                    classic_state()
+                    cleanup = mock.Mock()
+                    if with_intent:
+                        document = service_intent_document(phase="invoking")
+                        document["generation_sha256"] = core.managed_transition_prestate_digest()
+                        with core.mutation_lock(service_lifecycle=True):
+                            core.compare_and_swap_service_operation_intent(
+                                document,
+                                expected_operation_id=None,
+                                expected_phase=None,
+                            )
+                    with (
+                        core.mutation_lock(service_lifecycle=True),
+                        mock.patch.object(core, "service_is_active_exact", return_value=True),
+                        mock.patch.object(core, "firewall_cleanup", cleanup),
+                        mock.patch.object(core, "firewall_action_postcondition", return_value=True),
+                        self.assertRaisesRegex(core.AwgctlError, "service is active"),
+                    ):
+                        core.run_firewall_action_locked("down")
+                    cleanup.assert_not_called()
+                    if with_intent:
+                        self.assertEqual(
+                            core.load_service_operation_intent()["next_action"],
+                            0,
+                        )
+
+    def test_compensation_stops_before_down_and_missing_or_duplicate_hook_converges(self):
+        for hook_count in (0, 1, 2):
+            with self.subTest(hook_count=hook_count), tempfile.TemporaryDirectory() as directory:
+                with patched_layout(pathlib.Path(directory)), mock.patch.object(core, "require_root"):
+                    classic_state()
+                    runtime = FakeServiceRuntime(active=True, firewall_up=True)
+                    trace = []
+                    document = service_intent_document(phase="invoking")
+                    document["generation_sha256"] = core.managed_transition_prestate_digest()
+                    with core.mutation_lock(service_lifecycle=True):
+                        core.compare_and_swap_service_operation_intent(
+                            document,
+                            expected_operation_id=None,
+                            expected_phase=None,
+                        )
+
+                    def cleanup():
+                        trace.append(("down", runtime.active, runtime.firewall_up))
+                        runtime.cleanup()
+
+                    def systemd_runner(argv, **kwargs):
+                        self.assertEqual(
+                            argv,
+                            ["systemctl", "stop", "awg-quick@awg0.service"],
+                        )
+                        self.assertFalse(core.mutation_lock_is_held())
+                        trace.append(("stop", runtime.active, runtime.firewall_up))
+                        runtime.active = False
+                        for _ in range(hook_count):
+                            with core.mutation_lock(service_lifecycle=True):
+                                core.run_firewall_action_locked("down")
+                        return subprocess.CompletedProcess(argv, 0, b"", b"")
+
+                    with (
+                        mock.patch.object(core, "process_identity_is_alive", return_value=False),
+                        mock.patch.object(core, "service_is_active_exact", side_effect=runtime.service_active),
+                        mock.patch.object(core, "firewall_action_postcondition", side_effect=runtime.firewall_postcondition),
+                        mock.patch.object(core, "firewall_cleanup", side_effect=cleanup) as cleanup_mock,
+                        mock.patch.object(core, "run", side_effect=systemd_runner),
+                    ):
+                        with core.mutation_lock():
+                            pass
+
+                    self.assertFalse(core.SERVICE_OPERATION_FILE.exists())
+                    self.assertFalse(runtime.active)
+                    self.assertFalse(runtime.firewall_up)
+                    self.assertEqual(cleanup_mock.call_count, 1)
+                    self.assertTrue(all(not active for event, active, _ in trace if event == "down"))
+                    self.assertEqual(trace[0][0], "stop")
+
+    def test_compensation_stop_timeout_retains_unadvanced_safe_down_checkpoint(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with patched_layout(pathlib.Path(directory)), mock.patch.object(core, "require_root"):
+                classic_state()
+                document = service_intent_document(phase="invoking")
+                document["generation_sha256"] = core.managed_transition_prestate_digest()
+                with core.mutation_lock(service_lifecycle=True):
+                    core.compare_and_swap_service_operation_intent(
+                        document,
+                        expected_operation_id=None,
+                        expected_phase=None,
+                    )
+                cleanup = mock.Mock()
+                with (
+                    mock.patch.object(core, "process_identity_is_alive", return_value=False),
+                    mock.patch.object(core, "service_is_active_exact", return_value=True),
+                    mock.patch.object(core, "firewall_action_postcondition", return_value=False),
+                    mock.patch.object(core, "firewall_cleanup", cleanup),
+                    mock.patch.object(core, "run", side_effect=core.AwgctlError("command timed out: systemctl")),
+                    self.assertRaisesRegex(core.AwgctlError, "fail-safe service compensation failed"),
+                ):
+                    with core.mutation_lock():
+                        pass
+                retained = core.load_service_operation_intent()
+                self.assertEqual((retained["phase"], retained["goal"], retained["next_action"]), ("compensating", "stopped", 0))
+                cleanup.assert_not_called()
+
+    def test_compensation_always_rebinds_drift_and_resets_down_replay(self):
+        states = (
+            (True, True, 0),
+            (True, False, 1),
+            (False, True, 1),
+            (False, False, 0),
+        )
+        for active, firewall_up, next_action in states:
+            with self.subTest(active=active, firewall_up=firewall_up, next_action=next_action), tempfile.TemporaryDirectory() as directory:
+                with patched_layout(pathlib.Path(directory)), mock.patch.object(core, "require_root"):
+                    classic_state()
+                    runtime = FakeServiceRuntime(active=active, firewall_up=firewall_up)
+                    document = service_intent_document(
+                        phase="compensating",
+                        goal="stopped",
+                        next_action=next_action,
+                    )
+                    document["transition_id"] = "f" * 32
+                    document["generation_sha256"] = "ee" * 32
+                    with core.mutation_lock(service_lifecycle=True):
+                        core.compare_and_swap_service_operation_intent(
+                            document,
+                            expected_operation_id=None,
+                            expected_phase=None,
+                        )
+
+                    def assert_rebound():
+                        rebound = core.load_service_operation_intent()
+                        self.assertEqual(rebound["phase"], "compensating")
+                        self.assertEqual(rebound["transition_id"], "a" * 32)
+                        self.assertEqual(rebound["generation_sha256"], "bb" * 32)
+                        self.assertEqual(rebound["next_action"], 0)
+
+                    def systemd_runner(argv, **kwargs):
+                        assert_rebound()
+                        runtime.active = False
+                        return subprocess.CompletedProcess(argv, 0, b"", b"")
+
+                    def cleanup():
+                        assert_rebound()
+                        self.assertFalse(runtime.active)
+                        runtime.cleanup()
+
+                    with (
+                        core.mutation_lock(service_lifecycle=True),
+                        mock.patch.object(core, "load_transition_document", return_value={"transaction_id": "a" * 32}),
+                        mock.patch.object(core, "managed_transition_prestate_digest", return_value="bb" * 32),
+                        mock.patch.object(core, "service_is_active_exact", side_effect=runtime.service_active),
+                        mock.patch.object(core, "firewall_action_postcondition", side_effect=runtime.firewall_postcondition),
+                        mock.patch.object(core, "firewall_cleanup", side_effect=cleanup),
+                        mock.patch.object(core, "run", side_effect=systemd_runner),
+                    ):
+                        core.compensate_service_operation_locked(document)
+                    self.assertFalse(core.SERVICE_OPERATION_FILE.exists())
+
+    def test_failed_compensation_rebinds_again_on_retry_instead_of_looping_on_old_digest(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with patched_layout(pathlib.Path(directory)), mock.patch.object(core, "require_root"):
+                classic_state()
+                runtime = FakeServiceRuntime(active=False, firewall_up=True)
+                document = service_intent_document(
+                    phase="compensating",
+                    goal="stopped",
+                    next_action=1,
+                )
+                document["transition_id"] = "f" * 32
+                document["generation_sha256"] = "ee" * 32
+                with core.mutation_lock(service_lifecycle=True):
+                    core.compare_and_swap_service_operation_intent(
+                        document,
+                        expected_operation_id=None,
+                        expected_phase=None,
+                    )
+                current = {"transition": "a" * 32, "generation": "bb" * 32}
+                fail_once = mock.Mock(side_effect=[core.AwgctlError("injected cleanup failure"), None])
+
+                def cleanup():
+                    fail_once()
+                    runtime.cleanup()
+
+                common = (
+                    mock.patch.object(core, "load_transition_document", side_effect=lambda **kwargs: {"transaction_id": current["transition"]}),
+                    mock.patch.object(core, "managed_transition_prestate_digest", side_effect=lambda: current["generation"]),
+                    mock.patch.object(core, "service_is_active_exact", side_effect=runtime.service_active),
+                    mock.patch.object(core, "firewall_action_postcondition", side_effect=runtime.firewall_postcondition),
+                    mock.patch.object(core, "firewall_cleanup", side_effect=cleanup),
+                )
+                with core.mutation_lock(service_lifecycle=True), common[0], common[1], common[2], common[3], common[4]:
+                    with self.assertRaisesRegex(core.AwgctlError, "fail-safe service compensation failed"):
+                        core.compensate_service_operation_locked(document)
+                retained = core.load_service_operation_intent()
+                self.assertEqual((retained["transition_id"], retained["generation_sha256"], retained["next_action"]), ("a" * 32, "bb" * 32, 0))
+
+                current.update(transition="c" * 32, generation="dd" * 32)
+                patches = (
+                    mock.patch.object(core, "load_transition_document", side_effect=lambda **kwargs: {"transaction_id": current["transition"]}),
+                    mock.patch.object(core, "managed_transition_prestate_digest", side_effect=lambda: current["generation"]),
+                    mock.patch.object(core, "service_is_active_exact", side_effect=runtime.service_active),
+                    mock.patch.object(core, "firewall_action_postcondition", side_effect=runtime.firewall_postcondition),
+                    mock.patch.object(core, "firewall_cleanup", side_effect=cleanup),
+                )
+                with core.mutation_lock(service_lifecycle=True), patches[0], patches[1], patches[2], patches[3], patches[4]:
+                    core.compensate_service_operation_locked(retained)
+                self.assertFalse(core.SERVICE_OPERATION_FILE.exists())
+                self.assertEqual(fail_once.call_count, 2)
+
+    def test_compensation_rebinds_each_real_managed_file_and_transition_drift(self):
+        drift_targets = ("config", "generated", "runtime", "transition")
+        for target in drift_targets:
+            with self.subTest(target=target), tempfile.TemporaryDirectory() as directory:
+                with patched_layout(pathlib.Path(directory)), mock.patch.object(core, "require_root"):
+                    classic_state()
+                    transition = transition_document("prepared", pending_base=core.PENDING_TRANSITIONS)
+                    document = service_intent_document(
+                        phase="compensating",
+                        goal="stopped",
+                        next_action=1,
+                    )
+                    if target == "transition":
+                        document["transition_id"] = transition["transaction_id"]
+                    document["generation_sha256"] = core.managed_transition_prestate_digest()
+                    with core.mutation_lock(transition_lifecycle=True):
+                        if target == "transition":
+                            core.compare_and_swap_transition(
+                                transition,
+                                expected_transaction_id=None,
+                                expected_state=None,
+                            )
+                        core.compare_and_swap_service_operation_intent(
+                            document,
+                            expected_operation_id=None,
+                            expected_phase=None,
+                        )
+                    if target == "transition":
+                        core.TRANSITION_FILE.unlink()
+                    else:
+                        path = {
+                            "config": core.CONFIG_FILE,
+                            "generated": core.GENERATED_CONFIG,
+                            "runtime": core.RUNTIME_CONFIG,
+                        }[target]
+                        core.atomic_write(path, path.read_bytes() + b"\n", 0o600)
+                    expected_generation = core.managed_transition_prestate_digest()
+                    runtime = FakeServiceRuntime(active=False, firewall_up=False)
+
+                    def cleanup():
+                        rebound = core.load_service_operation_intent()
+                        self.assertIsNone(rebound["transition_id"])
+                        self.assertEqual(rebound["generation_sha256"], expected_generation)
+                        self.assertEqual(rebound["next_action"], 0)
+                        runtime.cleanup()
+
+                    with (
+                        core.mutation_lock(service_lifecycle=True),
+                        mock.patch.object(core, "service_is_active_exact", side_effect=runtime.service_active),
+                        mock.patch.object(core, "firewall_action_postcondition", side_effect=runtime.firewall_postcondition),
+                        mock.patch.object(core, "firewall_cleanup", side_effect=cleanup),
+                    ):
+                        core.compensate_service_operation_locked(document)
+                    self.assertFalse(core.SERVICE_OPERATION_FILE.exists())
+
 
     def test_service_action_uses_durable_intent_and_lock_handoff_without_context_bearer(self):
         with tempfile.TemporaryDirectory() as directory:
             with patched_layout(pathlib.Path(directory)), mock.patch.object(core, "require_root"):
                 classic_state()
                 firewall_calls = []
+                service_active = {"value": True}
                 direct_args = core.build_parser(entrypoint="internal").parse_args(
                     ["_firewall", "down"]
                 )
@@ -867,11 +1332,14 @@ class TransitionInterlockTests(unittest.TestCase):
                     )
                     self.assertFalse(core.mutation_lock_is_held())
                     self.assertNotIn("environment", kwargs)
-                    core.dispatch(direct_args)
+                    with self.assertRaisesRegex(core.AwgctlError, "service is active"):
+                        core.dispatch(direct_args)
+                    service_active["value"] = False
                     with core.mutation_lock(service_lifecycle=True):
                         core.run_firewall_action_locked("down")
                     with core.mutation_lock(service_lifecycle=True):
                         core.run_firewall_action_locked("up")
+                    service_active["value"] = True
                     return subprocess.CompletedProcess(argv, 0, b"", b"")
 
                 with (
@@ -885,7 +1353,7 @@ class TransitionInterlockTests(unittest.TestCase):
                     mock.patch.object(
                         core,
                         "service_is_active_exact",
-                        return_value=True,
+                        side_effect=lambda unused_interface: service_active["value"],
                         create=True,
                     ),
                 ):
@@ -914,9 +1382,12 @@ class TransitionInterlockTests(unittest.TestCase):
                     def systemd_runner(argv, **kwargs):
                         self.assertFalse(core.mutation_lock_is_held())
                         for hook in hooks:
+                            if hook == "down":
+                                runtime.active = False
                             with core.mutation_lock(service_lifecycle=True):
                                 core.run_firewall_action_locked(hook)
-                            runtime.active = hook == "up"
+                            if hook == "up":
+                                runtime.active = True
                         return subprocess.CompletedProcess(argv, 0, b"", b"")
 
                     with (
@@ -1009,6 +1480,7 @@ class TransitionInterlockTests(unittest.TestCase):
                     ),
                     mock.patch.object(core, "service_is_active_exact", side_effect=runtime.service_active),
                     mock.patch.object(core, "firewall_action_postcondition", side_effect=runtime.firewall_postcondition),
+                    mock.patch.object(core, "firewall_cleanup", side_effect=runtime.cleanup),
                     mock.patch.object(core, "run", side_effect=systemd_runner),
                 ):
                     with core.mutation_lock():
@@ -1022,7 +1494,7 @@ class TransitionInterlockTests(unittest.TestCase):
             ("prepared", 0, True, True, "cancel"),
             ("invoking", 2, True, True, "complete"),
             ("invoking", 0, True, True, "compensate"),
-            ("compensating", 1, False, False, "complete-stopped"),
+            ("compensating", 1, False, False, "replay-stopped"),
             ("verified", 1, False, False, "terminalize"),
         )
         for phase, next_action, active_before, firewall_before, expected in cases:
@@ -1071,6 +1543,9 @@ class TransitionInterlockTests(unittest.TestCase):
                         self.assertFalse(runtime.active)
                         clean.assert_called_once_with()
                         runner.assert_called_once()
+                    elif expected == "replay-stopped":
+                        clean.assert_called_once_with()
+                        runner.assert_not_called()
                     else:
                         clean.assert_not_called()
                         runner.assert_not_called()
@@ -1243,7 +1718,9 @@ class TransitionInterlockTests(unittest.TestCase):
                 mock.patch.object(core, "require_root"),
                 mock.patch.object(core, "firewall_cleanup", side_effect=cleanup),
                 mock.patch.object(core, "firewall_action_postcondition", return_value=True),
+                mock.patch.object(core, "service_is_active_exact", return_value=False),
             ):
+                classic_state()
                 args = core.build_parser(entrypoint="internal").parse_args(
                     ["_firewall", "down"]
                 )
