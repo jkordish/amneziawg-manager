@@ -4511,19 +4511,21 @@ def expiry_host_asset_checks(
     timer_unit = "amneziawg-client-expiry.timer"
     probes = (
         (
-            ("systemctl", "is-enabled", "--quiet", timer_unit),
+            ("systemctl", "is-enabled", timer_unit),
             "client expiry timer enablement",
+            b"enabled\n",
             "enabled",
-            "disabled or unavailable",
+            "expected persistent enabled state",
         ),
         (
-            ("systemctl", "is-active", "--quiet", timer_unit),
+            ("systemctl", "is-active", timer_unit),
             "client expiry timer activity",
+            b"active\n",
             "active",
-            "inactive or unavailable",
+            "expected active state",
         ),
     )
-    for argv, name, passing_detail, failing_detail in probes:
+    for argv, name, expected_stdout, passing_detail, failing_detail in probes:
         try:
             result = command_runner(argv, check=False)
         except (AwgctlError, OSError, subprocess.SubprocessError) as exc:
@@ -4531,11 +4533,13 @@ def expiry_host_asset_checks(
             continue
         checks.append(
             (
-                "PASS" if result.returncode == 0 else "FAIL",
+                "PASS"
+                if result.returncode == 0 and result.stdout == expected_stdout
+                else "FAIL",
                 name,
                 passing_detail
-                if result.returncode == 0
-                else f"{failing_detail} (exit {result.returncode})",
+                if result.returncode == 0 and result.stdout == expected_stdout
+                else f"{failing_detail}; textual state did not match (exit {result.returncode})",
             )
         )
     return checks

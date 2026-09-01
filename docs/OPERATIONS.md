@@ -281,9 +281,11 @@ sudo awgctl update apply
 `update apply` is code-only. It installs a verified immutable executable and
 runs that executable's health check; it does not install or repair host-managed
 systemd units. Health requires the canonical client-expiry service and timer to
-be root-owned mode `0644`, and requires the timer to be enabled and active. If
-either unit is missing, stale, incorrectly permissioned, disabled, or inactive,
-the update fails and restores the previous release selector.
+be root-owned mode `0644`. Textual systemd state must be exactly persistent
+`enabled` and exactly `active`; `enabled-runtime`, aliases, static/indirect,
+generated/transient, masked, unknown, or malformed states fail health. If
+either unit or state is unhealthy, the update restores the previous release
+selector.
 
 Beta.4 does not have the complete beta.5 host-asset contract. Upgrade a beta.4
 host from a verified beta.5 source checkout with the installer so the expiry
@@ -300,6 +302,14 @@ host's real attested boundary. A direct beta.4 `awgctl update apply` to beta.5
 is expected to refuse the cutover and roll back when those assets are absent or
 stale. After the host contract has been installed, signed code-only updates may
 use the normal commands above.
+
+Source upgrade builds the artifact before touching README, internal/public
+entrypoints, or completion. Those owned paths are snapshotted exactly. A
+mid-install, deploy, selector, or health failure restores their prior absent,
+file, or symlink state, content/target, ownership, and mode. Runtime DNS/profile
+changes and service restart are deliberately separate after a successful
+upgrade; upgrade rejects `--apply-default-dns` and `--apply-live` before
+mutation.
 
 Updates are operator-triggered. The CLI verifies the Ed25519 signature,
 platform, tag/version, artifact size, and SHA-256 before activating an immutable

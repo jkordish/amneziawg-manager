@@ -56,7 +56,115 @@ class UpgradeTests(unittest.TestCase):
                     health=True,
                     settings=resolve_installation_settings(sudo_user=None),
                 )
-        self.assertEqual(events, ["entrypoints", "build", "upgrade"])
+        self.assertEqual(events, ["build", "entrypoints", "upgrade"])
+
+    def test_release_build_failure_leaves_existing_entrypoints_untouched(self):
+        from awginstall import cli
+        from awginstall.settings import resolve_installation_settings
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory) / "opt/amneziawg"
+            libexec = root / "libexec"
+            libexec.mkdir(parents=True)
+            readme = root / "README.md"
+            readme.write_bytes(b"prior readme\n")
+            readme.chmod(0o640)
+            internal = libexec / "awgctl-internal"
+            internal.symlink_to("prior-internal")
+
+            with (
+                mock.patch.object(
+                    cli,
+                    "_build_artifact",
+                    side_effect=InstallerError("injected build failure"),
+                ),
+                self.assertRaisesRegex(InstallerError, "injected build failure"),
+            ):
+                cli._deploy_source_release(
+                    root,
+                    REPO_ROOT,
+                    health=True,
+                    settings=resolve_installation_settings(sudo_user=None),
+                )
+
+            self.assertEqual(readme.read_bytes(), b"prior readme\n")
+            self.assertEqual(readme.stat().st_mode & 0o777, 0o640)
+            self.assertEqual(os.readlink(internal), "prior-internal")
+
+    def test_entrypoint_mid_install_failure_restores_exact_prior_paths(self):
+        from awginstall import cli
+
+        with tempfile.TemporaryDirectory() as directory:
+            test_root = pathlib.Path(directory)
+            root = test_root / "opt/amneziawg"
+            libexec = root / "libexec"
+            libexec.mkdir(parents=True)
+            libexec.chmod(0o700)
+            readme = root / "README.md"
+            readme.write_bytes(b"prior readme\n")
+            readme.chmod(0o640)
+            internal = libexec / "awgctl-internal"
+            internal.symlink_to("prior-internal")
+            public = test_root / "usr/local/sbin/awgctl"
+            public.parent.mkdir(parents=True)
+            public.symlink_to("prior-public")
+            completion = test_root / "etc/bash_completion.d/awgctl"
+            completion.parent.mkdir(parents=True)
+            completion.write_bytes(b"prior completion\n")
+            completion.chmod(0o640)
+            prior_owners = {
+                path: (path.lstat().st_uid, path.lstat().st_gid)
+                for path in (readme, libexec, internal, public, completion)
+            }
+            original_replace = cli.os.replace
+            failed = {"value": False}
+
+            def replace(source, destination):
+                if pathlib.Path(destination) == completion and not failed["value"]:
+                    failed["value"] = True
+                    raise OSError("injected entrypoint replacement failure")
+                original_replace(source, destination)
+
+            with (
+                mock.patch.object(cli, "DEFAULT_ROOT", root),
+                mock.patch.object(cli, "PUBLIC_ENTRYPOINT_PATH", public),
+                mock.patch.object(cli, "COMPLETION_PATH", completion),
+                mock.patch.object(cli.os, "replace", side_effect=replace),
+                self.assertRaisesRegex(
+                    InstallerError, "injected entrypoint replacement failure"
+                ),
+            ):
+                cli._install_entrypoints(root, REPO_ROOT)
+
+            self.assertTrue(failed["value"])
+            self.assertEqual(readme.read_bytes(), b"prior readme\n")
+            self.assertEqual(readme.stat().st_mode & 0o777, 0o640)
+            self.assertEqual(os.readlink(internal), "prior-internal")
+            self.assertEqual(libexec.stat().st_mode & 0o777, 0o700)
+            self.assertEqual(os.readlink(public), "prior-public")
+            self.assertEqual(completion.read_bytes(), b"prior completion\n")
+            self.assertEqual(completion.stat().st_mode & 0o777, 0o640)
+            self.assertEqual(
+                {
+                    path: (path.lstat().st_uid, path.lstat().st_gid)
+                    for path in prior_owners
+                },
+                prior_owners,
+            )
+
+    def test_successful_entrypoint_install_returns_exact_rollback_report(self):
+        from awginstall import cli
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory) / "opt/amneziawg"
+            root.mkdir(parents=True)
+            report = cli._install_entrypoints(root, REPO_ROOT)
+
+            self.assertIsNotNone(report)
+            self.assertEqual((root / "README.md").read_bytes(), (REPO_ROOT / "README.md").read_bytes())
+            self.assertEqual((root / "README.md").stat().st_mode & 0o777, 0o644)
+            self.assertEqual(os.readlink(root / "libexec/awgctl-internal"), "../bin/awgctl")
+            self.assertEqual((root / "libexec").stat().st_mode & 0o777, 0o755)
 
     def make_artifact(self, directory: pathlib.Path, content: bytes = b"new executable\n") -> pathlib.Path:
         artifact = directory / "artifact"
@@ -107,6 +215,7 @@ class UpgradeTests(unittest.TestCase):
             root = directory / "opt/amneziawg"
             beta4 = self.make_artifact(directory, b"beta4 executable\n")
             upgrade_product(root=root, artifact=beta4, version="0.1.0-beta.4")
+
             beta5 = b"beta5 executable\n"
             health_commands = []
 
@@ -180,6 +289,44 @@ class UpgradeTests(unittest.TestCase):
             self.assertEqual(result, 0)
             self.assertFalse(root.exists())
             self.assertIn(f"would install awgctl {VERSION}", output.getvalue())
+
+    def test_upgrade_rejects_post_selector_runtime_flags_before_any_mutation(self):
+        from awginstall import cli
+
+        for flags in (
+            ["--apply-default-dns"],
+            ["--apply-live"],
+            ["--apply-default-dns", "--apply-live"],
+        ):
+            with self.subTest(flags=flags), tempfile.TemporaryDirectory() as directory:
+                root = pathlib.Path(directory) / "opt/amneziawg"
+                errors = io.StringIO()
+                with (
+                    mock.patch.object(cli, "_configure_host_for_command") as configure,
+                    mock.patch.object(cli, "_deploy_source_release") as deploy,
+                    mock.patch.object(cli, "_apply_requested_runtime_settings") as apply_runtime,
+                    mock.patch("sys.stderr", errors),
+                ):
+                    result = installer_main(
+                        [
+                            "upgrade",
+                            "--yes",
+                            "--ingress-boundary",
+                            "lightsail",
+                            *flags,
+                        ],
+                        root=root,
+                        repo_root=REPO_ROOT,
+                        output=io.StringIO(),
+                    )
+
+                self.assertEqual(result, 1)
+                self.assertFalse(root.exists())
+                configure.assert_not_called()
+                deploy.assert_not_called()
+                apply_runtime.assert_not_called()
+                self.assertIn("complete the upgrade first", errors.getvalue())
+                self.assertIn("awgctl", errors.getvalue())
 
     def test_installer_parser_exposes_all_product_workflows(self):
         parser = build_parser()
@@ -304,7 +451,9 @@ class UpgradeTests(unittest.TestCase):
             with (
                 mock.patch.object(cli, "_configure_host_for_command", side_effect=configure),
                 mock.patch.object(cli, "_deploy_source_release", side_effect=deploy),
-                mock.patch.object(cli, "_apply_requested_runtime_settings"),
+                mock.patch.object(
+                    cli, "_apply_requested_runtime_settings"
+                ) as apply_runtime,
             ):
                 result = installer_main(
                     ["upgrade", "--yes", "--ingress-boundary", "lightsail"],
@@ -315,6 +464,7 @@ class UpgradeTests(unittest.TestCase):
 
         self.assertEqual(result, 0)
         self.assertEqual(events, [("configure", "lightsail"), ("deploy", "lightsail")])
+        apply_runtime.assert_not_called()
 
     def test_first_upgrade_applies_no_sudo_bootstrap_before_release_then_final_policy(self):
         from awginstall import cli
@@ -326,7 +476,9 @@ class UpgradeTests(unittest.TestCase):
             with (
                 mock.patch.object(cli, "_configure_host_for_command", side_effect=lambda _args, **kwargs: configured.append(kwargs["settings"])),
                 mock.patch.object(cli, "_deploy_source_release", side_effect=lambda *_args, **kwargs: deployed.append(kwargs["settings"])),
-                mock.patch.object(cli, "_apply_requested_runtime_settings"),
+                mock.patch.object(
+                    cli, "_apply_requested_runtime_settings"
+                ) as apply_runtime,
             ):
                 result = installer_main(
                     ["upgrade", "--yes", "--ingress-boundary", "lightsail"],
@@ -339,6 +491,7 @@ class UpgradeTests(unittest.TestCase):
         self.assertEqual(configured[0].operators, ())
         self.assertEqual(configured[0].systemd_hardening, "off")
         self.assertEqual(deployed, [configured[1]])
+        apply_runtime.assert_not_called()
 
     def test_first_upgrade_rolls_back_bootstrap_when_release_validation_fails(self):
         from awginstall import cli
@@ -454,6 +607,15 @@ class UpgradeTests(unittest.TestCase):
             beta4.write_bytes(b"beta4 executable\n")
             upgrade_product(root=root, artifact=beta4, version="0.1.0-beta.4")
 
+            prior_readme = root / "README.md"
+            prior_readme.write_bytes(b"prior installed readme\n")
+            prior_readme.chmod(0o640)
+            prior_libexec = root / "libexec"
+            prior_libexec.mkdir()
+            prior_libexec.chmod(0o700)
+            prior_internal = prior_libexec / "awgctl-internal"
+            prior_internal.symlink_to("prior-internal")
+
             settings = resolve_installation_settings(
                 sudo_user=None,
                 overrides={"ingress_boundary": "lightsail"},
@@ -480,12 +642,14 @@ class UpgradeTests(unittest.TestCase):
 
             def runner(argv):
                 command = tuple(argv)
-                if command[:3] == ("systemctl", "is-enabled", "--quiet"):
+                if command[:2] == ("systemctl", "is-enabled"):
                     code = 0 if timer_state["enabled"] else 1
-                    return subprocess.CompletedProcess(argv, code, b"", b"")
-                if command[:3] == ("systemctl", "is-active", "--quiet"):
+                    stdout = b"enabled\n" if timer_state["enabled"] else b"disabled\n"
+                    return subprocess.CompletedProcess(argv, code, stdout, b"")
+                if command[:2] == ("systemctl", "is-active"):
                     code = 0 if timer_state["active"] else 3
-                    return subprocess.CompletedProcess(argv, code, b"", b"")
+                    stdout = b"active\n" if timer_state["active"] else b"inactive\n"
+                    return subprocess.CompletedProcess(argv, code, stdout, b"")
                 if command[:2] == ("systemctl", "enable"):
                     timer_state["enabled"] = True
                 elif command[:2] == ("systemctl", "disable"):
@@ -546,6 +710,10 @@ class UpgradeTests(unittest.TestCase):
             self.assertEqual(result, 1)
             self.assertEqual(active_release(root), "0.1.0-beta.4")
             self.assertEqual((root / "bin/awgctl").read_bytes(), b"beta4 executable\n")
+            self.assertEqual(prior_readme.read_bytes(), b"prior installed readme\n")
+            self.assertEqual(prior_readme.stat().st_mode & 0o777, 0o640)
+            self.assertEqual(prior_libexec.stat().st_mode & 0o777, 0o700)
+            self.assertEqual(os.readlink(prior_internal), "prior-internal")
             for path, (data, mode) in prior.items():
                 self.assertEqual(path.read_bytes(), data)
                 self.assertEqual(path.stat().st_mode & 0o777, mode)

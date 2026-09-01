@@ -77,8 +77,8 @@ class HostConfigurationReport:
 
 @dataclass(frozen=True)
 class ExpiryTimerState:
-    enabled: bool
-    active: bool
+    unit_file_state: str
+    active_state: str
 
 
 @dataclass(frozen=True)
@@ -182,31 +182,66 @@ def _run_local_probe(argv: Sequence[str]) -> subprocess.CompletedProcess[bytes]:
 def _snapshot_expiry_timer_state(runner: Runner) -> ExpiryTimerState:
     probe = _run_local_probe if runner is _run_local else runner
     unit = "amneziawg-client-expiry.timer"
-    enabled_result = probe(("systemctl", "is-enabled", "--quiet", unit))
-    if enabled_result.returncode == 0:
-        enabled = True
-    elif enabled_result.returncode in {1, 4}:
-        enabled = False
-    else:
+    enabled_result = probe(("systemctl", "is-enabled", unit))
+    enabled_states = {
+        (0, b"enabled\n"): "enabled",
+        (0, b"enabled-runtime\n"): "enabled-runtime",
+        (1, b"disabled\n"): "disabled",
+        (4, b"not-found\n"): "not-found",
+    }
+    unit_file_state = enabled_states.get(
+        (enabled_result.returncode, enabled_result.stdout)
+    )
+    if unit_file_state is None:
         raise HostConfigurationError(
-            f"could not determine expiry timer enabled state (exit {enabled_result.returncode})"
+            "could not determine a supported expiry timer unit-file state "
+            f"(exit {enabled_result.returncode})"
         )
-    active_result = probe(("systemctl", "is-active", "--quiet", unit))
-    if active_result.returncode == 0:
-        active = True
-    elif active_result.returncode in {3, 4}:
-        active = False
-    else:
+    active_result = probe(("systemctl", "is-active", unit))
+    active_states = {
+        (0, b"active\n"): "active",
+        (3, b"inactive\n"): "inactive",
+    }
+    active_state = active_states.get((active_result.returncode, active_result.stdout))
+    if active_state is None:
         raise HostConfigurationError(
-            f"could not determine expiry timer active state (exit {active_result.returncode})"
+            "could not determine a supported expiry timer active state "
+            f"(exit {active_result.returncode})"
         )
-    return ExpiryTimerState(enabled=enabled, active=active)
+    if unit_file_state == "not-found" and active_state != "inactive":
+        raise HostConfigurationError(
+            "expiry timer not-found unit-file state must be inactive"
+        )
+    return ExpiryTimerState(
+        unit_file_state=unit_file_state,
+        active_state=active_state,
+    )
 
 
 def _restore_expiry_timer_state(state: ExpiryTimerState, runner: Runner) -> None:
     unit = "amneziawg-client-expiry.timer"
-    runner(("systemctl", "enable" if state.enabled else "disable", unit))
-    runner(("systemctl", "start" if state.active else "stop", unit))
+    if state.unit_file_state not in {
+        "enabled", "enabled-runtime", "disabled", "not-found",
+    }:
+        raise HostConfigurationError("unsupported expiry timer rollback unit-file state")
+    if state.active_state not in {"active", "inactive"}:
+        raise HostConfigurationError("unsupported expiry timer rollback active state")
+    if state.unit_file_state == "not-found":
+        if state.active_state != "inactive":
+            raise HostConfigurationError("a not-found expiry timer cannot be active")
+        return
+
+    runner(("systemctl", "disable", unit))
+    runner(("systemctl", "disable", "--runtime", unit))
+    if state.unit_file_state == "enabled":
+        runner(("systemctl", "enable", unit))
+    elif state.unit_file_state == "enabled-runtime":
+        runner(("systemctl", "enable", "--runtime", unit))
+    runner((
+        "systemctl",
+        "start" if state.active_state == "active" else "stop",
+        unit,
+    ))
 
 
 def _password_locked(name: str, runner: Runner) -> bool:

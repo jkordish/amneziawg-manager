@@ -334,12 +334,14 @@ class HostConfigurationTests(unittest.TestCase):
 
         snapshot = IdentitySnapshot(users={}, groups={}, locked_users=set(), supplementary_groups={})
         cases = (
-            ("preexisting-disabled", True, False, False),
-            ("enabled-inactive", True, True, False),
-            ("active", True, True, True),
-            ("new-timer", False, False, False),
+            ("preexisting-disabled", True, "disabled", "inactive"),
+            ("enabled-inactive", True, "enabled", "inactive"),
+            ("enabled-runtime-inactive", True, "enabled-runtime", "inactive"),
+            ("active", True, "enabled", "active"),
+            ("new-timer", False, "disabled", "inactive"),
+            ("missing-timer", False, "not-found", "inactive"),
         )
-        for label, file_exists, enabled, active in cases:
+        for label, file_exists, unit_file_state, active_state in cases:
             with self.subTest(label=label), tempfile.TemporaryDirectory() as directory:
                 root = pathlib.Path(directory)
                 paths = HostPaths.under(root)
@@ -351,10 +353,22 @@ class HostConfigurationTests(unittest.TestCase):
                 def runner(argv):
                     command = tuple(argv)
                     commands.append(command)
-                    if command[:3] == ("systemctl", "is-enabled", "--quiet"):
-                        return subprocess.CompletedProcess(argv, 0 if enabled else (1 if file_exists else 4), b"", b"")
-                    if command[:3] == ("systemctl", "is-active", "--quiet"):
-                        return subprocess.CompletedProcess(argv, 0 if active else (3 if file_exists else 4), b"", b"")
+                    if command[:2] == ("systemctl", "is-enabled"):
+                        code = (
+                            0
+                            if unit_file_state in {"enabled", "enabled-runtime"}
+                            else 4
+                            if unit_file_state == "not-found"
+                            else 1
+                        )
+                        return subprocess.CompletedProcess(
+                            argv, code, (unit_file_state + "\n").encode(), b""
+                        )
+                    if command[:2] == ("systemctl", "is-active"):
+                        code = 0 if active_state == "active" else 3
+                        return subprocess.CompletedProcess(
+                            argv, code, (active_state + "\n").encode(), b""
+                        )
                     return subprocess.CompletedProcess(argv, 0, b"", b"")
 
                 settings = resolve_installation_settings(sudo_user=None)
@@ -380,53 +394,60 @@ class HostConfigurationTests(unittest.TestCase):
                     if command == ("systemctl", "daemon-reload")
                 )
                 restoration = commands[final_reload + 1:]
-                expected_enabled = "enable" if enabled else "disable"
-                expected_active = "start" if active else "stop"
-                self.assertIn(
-                    ("systemctl", expected_enabled, "amneziawg-client-expiry.timer"),
-                    restoration,
-                )
-                self.assertIn(
-                    ("systemctl", expected_active, "amneziawg-client-expiry.timer"),
-                    restoration,
-                )
+                if unit_file_state == "not-found":
+                    self.assertFalse(
+                        any(
+                            command[:2]
+                            in {
+                                ("systemctl", "enable"),
+                                ("systemctl", "disable"),
+                                ("systemctl", "start"),
+                                ("systemctl", "stop"),
+                            }
+                            for command in restoration
+                        )
+                    )
+                else:
+                    expected_enablement = {
+                        "enabled": (
+                            "systemctl", "enable", "amneziawg-client-expiry.timer",
+                        ),
+                        "enabled-runtime": (
+                            "systemctl", "enable", "--runtime",
+                            "amneziawg-client-expiry.timer",
+                        ),
+                        "disabled": (
+                            "systemctl", "disable", "amneziawg-client-expiry.timer",
+                        ),
+                    }[unit_file_state]
+                    expected_active = "start" if active_state == "active" else "stop"
+                    self.assertIn(expected_enablement, restoration)
+                    self.assertIn(
+                        ("systemctl", expected_active, "amneziawg-client-expiry.timer"),
+                        restoration,
+                    )
                 if file_exists:
                     self.assertEqual(paths.expiry_timer.read_text(), "prior timer\n")
                 else:
                     self.assertFalse(paths.expiry_timer.exists())
 
-    def test_unknown_expiry_timer_query_state_fails_closed_before_host_writes(self):
-        from awginstall.host import HostConfigurationError, HostPaths, configure_host
-        from awginstall.identity import IdentitySnapshot
-        from awginstall.settings import resolve_installation_settings
+    def test_unknown_expiry_timer_text_state_fails_closed(self):
+        from awginstall.host import HostConfigurationError, _snapshot_expiry_timer_state
 
-        snapshot = IdentitySnapshot(users={}, groups={}, locked_users=set(), supplementary_groups={})
-
-        for failing_query, expected in (
-            ("is-enabled", "timer enabled state"),
-            ("is-active", "timer active state"),
+        for label, enabled, active, expected in (
+            ("alias", b"alias\n", b"inactive\n", "unit-file state"),
+            ("masked", b"masked\n", b"inactive\n", "unit-file state"),
+            ("activating", b"enabled\n", b"activating\n", "active state"),
+            ("malformed", b"enabled\nextra\n", b"active\n", "unit-file state"),
         ):
             def runner(argv):
-                if tuple(argv[0:2]) == ("systemctl", failing_query):
-                    return subprocess.CompletedProcess(argv, 2, b"", b"query failed")
-                return subprocess.CompletedProcess(argv, 0, b"", b"")
+                stdout = enabled if argv[1] == "is-enabled" else active
+                return subprocess.CompletedProcess(argv, 0, stdout, b"")
 
-            with self.subTest(failing_query=failing_query), tempfile.TemporaryDirectory() as directory:
-                root = pathlib.Path(directory)
-                with (
-                    mock.patch("awginstall.host._prepare_staging_root"),
-                    self.assertRaisesRegex(HostConfigurationError, expected),
-                ):
-                    configure_host(
-                        resolve_installation_settings(sudo_user=None),
-                        product_root=root / "opt/amneziawg",
-                        paths=HostPaths.under(root),
-                        allow_existing=False,
-                        dry_run=False,
-                        snapshot=snapshot,
-                        runner=runner,
-                    )
-                self.assertFalse((root / "etc").exists())
+            with self.subTest(label=label), self.assertRaisesRegex(
+                HostConfigurationError, expected
+            ):
+                _snapshot_expiry_timer_state(runner)
 
     def test_successful_configuration_report_can_be_compensated_by_outer_transaction(self):
         from awginstall.host import HostPaths, configure_host, rollback_host_configuration
@@ -437,7 +458,12 @@ class HostConfigurationTests(unittest.TestCase):
         commands = []
 
         def runner(argv):
-            commands.append(tuple(argv))
+            command = tuple(argv)
+            commands.append(command)
+            if command[:2] == ("systemctl", "is-enabled"):
+                return subprocess.CompletedProcess(argv, 1, b"disabled\n", b"")
+            if command[:2] == ("systemctl", "is-active"):
+                return subprocess.CompletedProcess(argv, 3, b"inactive\n", b"")
             return subprocess.CompletedProcess(argv, 0, b"", b"")
 
         with tempfile.TemporaryDirectory() as directory:
@@ -547,12 +573,14 @@ class HostConfigurationTests(unittest.TestCase):
 
                 def runner(argv):
                     command = tuple(argv)
-                    if command[:3] == ("systemctl", "is-enabled", "--quiet"):
+                    if command[:2] == ("systemctl", "is-enabled"):
                         code = 0 if state["enabled"] else 1
-                        return subprocess.CompletedProcess(argv, code, b"", b"")
-                    if command[:3] == ("systemctl", "is-active", "--quiet"):
+                        stdout = b"enabled\n" if state["enabled"] else b"disabled\n"
+                        return subprocess.CompletedProcess(argv, code, stdout, b"")
+                    if command[:2] == ("systemctl", "is-active"):
                         code = 0 if state["active"] else 3
-                        return subprocess.CompletedProcess(argv, code, b"", b"")
+                        stdout = b"active\n" if state["active"] else b"inactive\n"
+                        return subprocess.CompletedProcess(argv, code, stdout, b"")
 
                     fault = None
                     if command[:2] == ("systemd-analyze", "verify"):
@@ -618,7 +646,12 @@ class HostConfigurationTests(unittest.TestCase):
         commands = []
 
         def runner(argv):
-            commands.append(tuple(argv))
+            command = tuple(argv)
+            commands.append(command)
+            if command[:2] == ("systemctl", "is-enabled"):
+                return subprocess.CompletedProcess(argv, 1, b"disabled\n", b"")
+            if command[:2] == ("systemctl", "is-active"):
+                return subprocess.CompletedProcess(argv, 3, b"inactive\n", b"")
             return subprocess.CompletedProcess(argv, 0, b"", b"")
 
         with tempfile.TemporaryDirectory() as directory:
@@ -669,7 +702,12 @@ class HostConfigurationTests(unittest.TestCase):
         commands = []
 
         def runner(argv):
-            commands.append(tuple(argv))
+            command = tuple(argv)
+            commands.append(command)
+            if command[:2] == ("systemctl", "is-enabled"):
+                return subprocess.CompletedProcess(argv, 1, b"disabled\n", b"")
+            if command[:2] == ("systemctl", "is-active"):
+                return subprocess.CompletedProcess(argv, 3, b"inactive\n", b"")
             if argv[0] == "visudo":
                 raise HostConfigurationError("invalid sudoers")
             return subprocess.CompletedProcess(argv, 0, b"", b"")
