@@ -28,6 +28,7 @@ class NamespaceSelfTestTests(unittest.TestCase):
             port=51871,
         )
         for text in (server, client):
+            self.assertTrue(text.startswith("[Interface]\n"))
             self.assertIn("Jc = 6", text)
             self.assertNotRegex(text, r"(?m)^I[1-5]\s*=")
         self.assertIn("Endpoint = 192.0.2.1:51871", client)

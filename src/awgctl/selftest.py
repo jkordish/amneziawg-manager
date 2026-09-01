@@ -32,11 +32,11 @@ def render_peer_configs(
         raise SelfTestError("self-test requires exactly the classic AmneziaWG obfuscation fields")
     classic = "\n".join(f"{name} = {obfuscation[name]}" for name in CLASSIC_FIELDS)
     server = (
-        f"PrivateKey = {server_private}\nListenPort = {port}\n{classic}\n\n"
+        f"[Interface]\nPrivateKey = {server_private}\nListenPort = {port}\n{classic}\n\n"
         f"[Peer]\nPublicKey = {client_public}\nPresharedKey = {psk}\nAllowedIPs = 10.200.0.2/32\n"
     )
     client = (
-        f"PrivateKey = {client_private}\n{classic}\n\n"
+        f"[Interface]\nPrivateKey = {client_private}\n{classic}\n\n"
         f"[Peer]\nPublicKey = {server_public}\nPresharedKey = {psk}\n"
         f"Endpoint = 192.0.2.1:{port}\nAllowedIPs = 10.200.0.1/32\nPersistentKeepalive = 5\n"
     )
