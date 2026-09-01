@@ -24,6 +24,8 @@ import time
 import urllib.request
 from typing import Any, Iterable, Iterator, Sequence
 
+from .backups import BackupError, create_manifest as create_backup_manifest, verify_backup
+from .contracts import ContractError, health_envelope, json_envelope, normalize_client_metadata
 from .version import VERSION
 
 
@@ -512,6 +514,10 @@ def load_clients(*, include_secrets: bool = False) -> list[dict[str, Any]]:
             metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError) as exc:
             raise AwgctlError(f"cannot read client metadata: {directory.name}") from exc
+        try:
+            metadata = normalize_client_metadata(metadata)
+        except ContractError as exc:
+            raise AwgctlError(f"invalid client metadata: {directory.name}: {exc}") from exc
         if metadata.get("name") != directory.name or metadata.get("status") != "active":
             raise AwgctlError(f"invalid active client metadata: {directory.name}")
         validate_key(metadata.get("public_key", ""), "client public key")
@@ -527,7 +533,10 @@ def load_clients(*, include_secrets: bool = False) -> list[dict[str, Any]]:
             public_file = read_secret(key_dir / "public", "client public key")
             if public_file != record["public_key"]:
                 raise AwgctlError(f"client public key metadata drift: {directory.name}")
-            record["private_key"] = read_secret(key_dir / "private", "client private key")
+            if record.get("management", "managed") == "managed":
+                record["private_key"] = read_secret(key_dir / "private", "client private key")
+            else:
+                record["private_key"] = None
             record["psk"] = read_secret(key_dir / "psk", "client preshared key") if record.get("use_psk") else None
         records.append(record)
     records.sort(key=lambda item: int(ipaddress.ip_interface(item["address"]).ip))
@@ -804,6 +813,9 @@ def write_client_state(
     created_at: str | None = None,
     imported_from: str | None = None,
     profile_text: str | None = None,
+    owner: str | None = None,
+    device: str | None = None,
+    expires: str | None = None,
 ) -> dict[str, Any]:
     client_dir = CLIENTS / name
     key_dir = CLIENT_KEYS / name
@@ -812,17 +824,21 @@ def write_client_state(
     client_dir.mkdir(mode=0o700)
     key_dir.mkdir(mode=0o700)
     now = iso_now()
-    metadata = {
-        "schema_version": 1,
+    metadata = normalize_client_metadata({
+        "schema_version": 2,
         "name": name,
         "status": "active",
+        "management": "managed",
         "address": str(ipaddress.ip_interface(address)),
         "public_key": public,
         "public_key_fingerprint": fingerprint(public),
         "use_psk": bool(psk),
         "created_at": created_at or now,
         "updated_at": now,
-    }
+        "owner": owner,
+        "device": device,
+        "expires": expires,
+    })
     if imported_from:
         metadata["imported_from"] = imported_from
     atomic_write(key_dir / "private", private + "\n", 0o600)
@@ -874,6 +890,7 @@ def create_backup() -> pathlib.Path:
         (ROOT / "config", pathlib.Path("config")),
         (ROOT / "keys", pathlib.Path("keys")),
         (ROOT / "clients", pathlib.Path("clients")),
+        (ROOT / "revoked", pathlib.Path("revoked")),
         (ROOT / "generated", pathlib.Path("generated")),
     ):
         if source.exists():
@@ -890,8 +907,126 @@ def create_backup() -> pathlib.Path:
     nft_output = run(["nft", "-a", "list", "ruleset"], check=False).stdout
     atomic_write(state / "nftables.ruleset", nft_output, 0o600)
     chmod_secret_tree(destination)
+    manifest = create_backup_manifest(destination, product_version=VERSION, created_at=iso_now())
+    atomic_json(destination / "manifest.json", manifest, 0o600)
+    chmod_secret_tree(destination)
+    verify_backup(destination, expected_uid=os.geteuid(), expected_gid=os.getegid())
     audit(f"backup created: {destination.name}")
     return destination
+
+
+def resolve_backup_path(value: pathlib.Path) -> pathlib.Path:
+    backup_root = BACKUPS.resolve()
+    candidate = value if value.is_absolute() else BACKUPS / value
+    if candidate.is_symlink():
+        raise AwgctlError("backup path must not be a symbolic link")
+    resolved = candidate.resolve()
+    if resolved.parent != backup_root:
+        raise AwgctlError("backup must name one direct child of the managed backup directory")
+    if not resolved.is_dir():
+        raise AwgctlError(f"backup directory not found: {value}")
+    return resolved
+
+
+def verify_managed_backup(value: pathlib.Path) -> tuple[pathlib.Path, dict[str, Any]]:
+    path = resolve_backup_path(value)
+    try:
+        report = verify_backup(path, expected_uid=os.geteuid(), expected_gid=os.getegid())
+    except BackupError as exc:
+        raise AwgctlError(f"backup verification failed: {exc}") from exc
+    return path, report
+
+
+RESTORE_COMPONENTS = ("config", "keys", "clients", "revoked", "generated")
+
+
+def validate_restore_stage(stage: pathlib.Path) -> dict[str, Any]:
+    try:
+        config = json.loads((stage / "config/server.json").read_text(encoding="utf-8"))
+        server_private = (stage / "keys/server/private").read_text(encoding="ascii").strip()
+        server_public = (stage / "keys/server/public").read_text(encoding="ascii").strip()
+        generated_server = (stage / "generated/awg0.conf").read_text(encoding="utf-8")
+        generated_nft = (stage / "generated/nftables.nft").read_text(encoding="utf-8")
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise AwgctlError("backup is missing required managed state") from exc
+    validate_server_config(config)
+    validate_key(server_private, "server private key")
+    validate_key(server_public, "server public key")
+    derived_public = run(["awg", "pubkey"], input_data=(server_private + "\n").encode("ascii")).stdout.decode().strip()
+    if derived_public != server_public:
+        raise AwgctlError("backup server keypair does not match")
+    validate_native_server(generated_server)
+    validate_nftables_text(generated_nft)
+    parsed = parse_awg_config(generated_server)
+    interface_sections = parsed.get("Interface", [])
+    if len(interface_sections) != 1 or interface_sections[0].get("PrivateKey") != server_private:
+        raise AwgctlError("backup generated configuration does not use the backed-up server key")
+    return config
+
+
+def restore_backup_transaction(backup: pathlib.Path) -> tuple[pathlib.Path, bool]:
+    """Restore manager-owned state, rolling back both disk and runtime on failure."""
+    safety_backup = create_backup()
+    stage = pathlib.Path(tempfile.mkdtemp(prefix=".restore-stage-", dir=ROOT))
+    rollback = pathlib.Path(tempfile.mkdtemp(prefix=".restore-rollback-", dir=ROOT))
+    old_runtime = RUNTIME_CONFIG.read_bytes() if RUNTIME_CONFIG.exists() else None
+    active = False
+    moved_old: list[str] = []
+    moved_new: list[str] = []
+    try:
+        for component in RESTORE_COMPONENTS:
+            source = backup / component
+            destination = stage / component
+            if source.is_dir():
+                shutil.copytree(source, destination)
+            else:
+                destination.mkdir(parents=True, mode=0o700)
+        chmod_secret_tree(stage)
+        config = validate_restore_stage(stage)
+        active = is_service_active(config["interface"])
+        for component in RESTORE_COMPONENTS:
+            current = ROOT / component
+            if current.exists():
+                os.replace(current, rollback / component)
+                moved_old.append(component)
+            os.replace(stage / component, current)
+            moved_new.append(component)
+        fsync_directory(ROOT)
+        atomic_write(RUNTIME_CONFIG, GENERATED_CONFIG.read_bytes(), 0o600)
+        if active:
+            service_action("restart", config["interface"])
+            expected_server = SERVER_PUBLIC.read_text(encoding="ascii").strip()
+            if safe_awg_query(config["interface"], "public-key") != expected_server:
+                raise AwgctlError("restored runtime server identity verification failed")
+        chmod_secret_tree(ROOT / "config")
+        chmod_secret_tree(ROOT / "keys")
+        chmod_secret_tree(ROOT / "clients")
+        chmod_secret_tree(ROOT / "revoked")
+        chmod_secret_tree(ROOT / "generated")
+        return safety_backup, active
+    except Exception as original:
+        for component in reversed(moved_new):
+            current = ROOT / component
+            if current.exists():
+                shutil.rmtree(current)
+        for component in reversed(moved_old):
+            archived = rollback / component
+            if archived.exists():
+                os.replace(archived, ROOT / component)
+        if old_runtime is None:
+            with contextlib.suppress(FileNotFoundError):
+                RUNTIME_CONFIG.unlink()
+        else:
+            atomic_write(RUNTIME_CONFIG, old_runtime, 0o600)
+        if active:
+            with contextlib.suppress(Exception):
+                old_config = load_config()
+                service_action("restart", old_config["interface"])
+        audit(f"restore failed and rollback attempted: {backup.name}")
+        raise AwgctlError("restore failed; pre-restore state rollback was attempted") from original
+    finally:
+        shutil.rmtree(stage, ignore_errors=True)
+        shutil.rmtree(rollback, ignore_errors=True)
 
 
 def format_age(timestamp: int, *, now: int | None = None) -> str:
@@ -1062,17 +1197,88 @@ def handshake_map(interface: str) -> dict[str, int]:
     return result
 
 
+def parse_import_profile(
+    profile_text: str,
+    config: dict[str, Any],
+    *,
+    expected_server_public: str,
+    derive_public: Any | None = None,
+) -> dict[str, Any]:
+    """Validate a client profile against managed server semantics."""
+    parsed = parse_awg_config(profile_text)
+    interfaces = parsed.get("Interface", [])
+    peers = parsed.get("Peer", [])
+    if len(interfaces) != 1 or len(peers) != 1:
+        raise AwgctlError("client profile must contain exactly one Interface and one Peer")
+    interface = interfaces[0]
+    peer = peers[0]
+    try:
+        private = validate_key(interface["PrivateKey"], "client private key")
+        address = ipaddress.ip_interface(interface["Address"])
+        mtu = int(interface["MTU"])
+        profile_obfuscation = {field: int(interface[field]) for field in OBFUSCATION_FIELDS}
+        server_public = validate_key(peer["PublicKey"], "server public key")
+        endpoint_host, endpoint_port_text = peer["Endpoint"].rsplit(":", 1)
+        endpoint_port = int(endpoint_port_text)
+        keepalive = int(peer["PersistentKeepalive"])
+    except (KeyError, ValueError) as exc:
+        raise AwgctlError("client profile is missing required classic AmneziaWG fields") from exc
+    if address.version != 4 or address.network.prefixlen != 32:
+        raise AwgctlError("client profile address must be an IPv4 /32")
+    if validate_dns([value.strip() for value in interface["DNS"].split(",")]) != config["dns"]:
+        raise AwgctlError("client profile DNS differs from managed state")
+    if mtu != config["mtu"]:
+        raise AwgctlError("client profile MTU differs from managed state")
+    if profile_obfuscation != config["obfuscation"]:
+        raise AwgctlError("client profile obfuscation differs from managed state")
+    if server_public != expected_server_public:
+        raise AwgctlError("client profile server public key differs from managed identity")
+    if validate_endpoint(endpoint_host) != config["endpoint"] or endpoint_port != config["listen_port"]:
+        raise AwgctlError("client profile endpoint differs from managed state")
+    if keepalive != config["keepalive"]:
+        raise AwgctlError("client profile keepalive differs from managed state")
+    if peer.get("AllowedIPs", "").replace(" ", "") != "0.0.0.0/0,::/0":
+        raise AwgctlError("client profile must route IPv4 and IPv6 defaults through the tunnel")
+    psk_value = peer.get("PresharedKey")
+    psk = validate_key(psk_value, "client preshared key") if psk_value else None
+    if bool(psk) != bool(config.get("use_psk", True)):
+        raise AwgctlError("client profile preshared-key policy differs from managed state")
+    if derive_public is None:
+        def derive_public(value: str) -> str:
+            return validate_key(
+                run(["awg", "pubkey"], input_data=(value + "\n").encode()).stdout.decode().strip(),
+                "derived client public key",
+            )
+    public = validate_key(derive_public(private), "derived client public key")
+    return {
+        "private_key": private,
+        "public_key": public,
+        "psk": psk,
+        "address": str(address),
+        "profile": profile_text,
+    }
+
+
 def nft_table_active(table: str) -> bool:
     return run(["nft", "list", "table", "ip", table], check=False).returncode == 0
 
 
-def cmd_aws_rule(config: dict[str, Any] | None = None) -> None:
+def cmd_aws_rule(config: dict[str, Any] | None = None, *, as_json: bool = False) -> None:
     config = config or load_config()
+    data = {
+        "type": "Custom",
+        "protocol": "UDP",
+        "port": config["listen_port"],
+        "source": "0.0.0.0/0",
+    }
+    if as_json:
+        print(json.dumps(json_envelope("aws-rule", data=data), indent=2, sort_keys=True))
+        return
     print("AWS Lightsail inbound requirement")
     print(f"  Custom / UDP / {config['listen_port']} / 0.0.0.0/0")
 
 
-def cmd_status(_: argparse.Namespace) -> int:
+def cmd_status(args: argparse.Namespace) -> int:
     config = load_config()
     active, enabled = systemctl_state(config["interface"])
     link_result = run(["ip", "-brief", "link", "show", config["interface"]], check=False)
@@ -1086,6 +1292,38 @@ def cmd_status(_: argparse.Namespace) -> int:
             peers = live_peers(config["interface"])
             handshakes = handshake_map(config["interface"])
     clients = load_clients()
+    client_rows = [
+        {
+            "name": client["name"],
+            "address": str(ipaddress.ip_interface(client["address"]).ip),
+            "status": client.get("status", "active"),
+            "management": client.get("management", "managed"),
+            "last_handshake": format_age(handshakes.get(client["public_key"], 0)),
+        }
+        for client in clients
+    ]
+    status_data = {
+        "service": active,
+        "boot": enabled,
+        "interface": {"name": config["interface"], "up": link_up},
+        "endpoint": {"host": config["endpoint"], "port": config["listen_port"]},
+        "public_ipv4": public_ip,
+        "subnet": config["subnet"],
+        "forwarding": forwarding,
+        "nat": nft_table_active("amneziawg_nat"),
+        "isolation": nft_table_active("amneziawg_forward"),
+        "peer_count": len(peers) if active else 0,
+        "clients": client_rows,
+        "lightsail_rule": {
+            "type": "Custom",
+            "protocol": "UDP",
+            "port": config["listen_port"],
+            "source": "0.0.0.0/0",
+        },
+    }
+    if getattr(args, "json", False):
+        print(json.dumps(json_envelope("status", data=status_data), indent=2, sort_keys=True))
+        return 0
     print("AmneziaWG")
     print(f"  service:        {active}")
     print(f"  boot:           {enabled}")
@@ -1100,9 +1338,8 @@ def cmd_status(_: argparse.Namespace) -> int:
     print("Clients")
     if not clients:
         print("  none")
-    for client in clients:
-        seen = format_age(handshakes.get(client["public_key"], 0))
-        print(f"  {client['name']:<20} {str(ipaddress.ip_interface(client['address']).ip):<15} {seen}")
+    for client in client_rows:
+        print(f"  {client['name']:<20} {client['address']:<15} {client['last_handshake']}")
     cmd_aws_rule(config)
     return 0
 
@@ -1120,7 +1357,7 @@ def permission_problem(path: pathlib.Path, expected_mode: int, *, secret: bool =
     return None
 
 
-def cmd_health(_: argparse.Namespace) -> int:
+def cmd_health(args: argparse.Namespace) -> int:
     config = load_config()
     checks: list[tuple[str, str, str]] = []
 
@@ -1176,15 +1413,22 @@ def cmd_health(_: argparse.Namespace) -> int:
         duplicates = find_duplicate_client_state(clients)
         add("FAIL" if duplicates else "PASS", "client uniqueness", "; ".join(duplicates) if duplicates else f"{len(clients)} unique active clients")
         profile_drift: list[str] = []
+        external_count = 0
         server_public = server_public_key()
         for client in clients:
+            if client.get("management", "managed") != "managed":
+                external_count += 1
+                continue
             expected_profile = render_client_config(
                 config, client["private_key"], client.get("psk"), server_public, client["address"]
             ).encode()
             actual_profile = (CLIENTS / client["name"] / f"{client['name']}.conf").read_bytes()
             if expected_profile != actual_profile:
                 profile_drift.append(client["name"])
-        add("FAIL" if profile_drift else "PASS", "client profile consistency", ", ".join(profile_drift) if profile_drift else "profiles match managed state")
+        detail = ", ".join(profile_drift) if profile_drift else "managed profiles match state"
+        if external_count:
+            detail += f"; {external_count} external peer(s) have no locally managed profile"
+        add("FAIL" if profile_drift else "PASS", "client profile consistency", detail)
     except (AwgctlError, OSError) as exc:
         add("FAIL", "client state", str(exc))
 
@@ -1230,13 +1474,16 @@ def cmd_health(_: argparse.Namespace) -> int:
     ufw = run(["ufw", "status"], check=False).stdout.decode("utf-8", "replace")
     add("WARN" if "Status: active" in ufw else "PASS", "UFW", "active (unexpected)" if "Status: active" in ufw else "inactive; Lightsail remains public-ingress firewall")
 
+    failures = sum(1 for level, _, _ in checks if level == "FAIL")
+    warnings = sum(1 for level, _, _ in checks if level == "WARN")
+    if getattr(args, "json", False):
+        print(json.dumps(health_envelope(checks), indent=2, sort_keys=True))
+        return 3 if failures else 0
     print("AmneziaWG health")
     for level, name, detail in checks:
         print(f"  {level:<4} {name}: {detail}")
-    failures = sum(1 for level, _, _ in checks if level == "FAIL")
-    warnings = sum(1 for level, _, _ in checks if level == "WARN")
     print(f"Summary: {failures} failure(s), {warnings} warning(s)")
-    return 1 if failures else 0
+    return 3 if failures else 0
 
 
 def verify_peer_state(interface: str, public_key: str, *, present: bool) -> None:
@@ -1247,18 +1494,34 @@ def verify_peer_state(interface: str, public_key: str, *, present: bool) -> None
         raise AwgctlError(f"peer did not {expectation} in the running interface")
 
 
-def cmd_client_list(_: argparse.Namespace) -> int:
+def cmd_client_list(args: argparse.Namespace) -> int:
     config = load_config()
     clients = load_clients()
     handshakes: dict[str, int] = {}
     if is_service_active(config["interface"]):
         with contextlib.suppress(AwgctlError):
             handshakes = handshake_map(config["interface"])
-    print(f"{'NAME':<22} {'ADDRESS':<15} {'LAST HANDSHAKE'}")
+    rows = []
     for client in clients:
+        rows.append(
+            {
+                "name": client["name"],
+                "address": str(ipaddress.ip_interface(client["address"]).ip),
+                "status": client.get("status", "active"),
+                "management": client.get("management", "managed"),
+                "owner": client.get("owner"),
+                "device": client.get("device"),
+                "expires": client.get("expires"),
+                "last_handshake": format_age(handshakes.get(client["public_key"], 0)),
+            }
+        )
+    if getattr(args, "json", False):
+        print(json.dumps(json_envelope("client list", data={"clients": rows}), indent=2, sort_keys=True))
+        return 0
+    print(f"{'NAME':<22} {'ADDRESS':<15} {'LAST HANDSHAKE'}")
+    for client in rows:
         print(
-            f"{client['name']:<22} {str(ipaddress.ip_interface(client['address']).ip):<15} "
-            f"{format_age(handshakes.get(client['public_key'], 0))}"
+            f"{client['name']:<22} {client['address']:<15} {client['last_handshake']}"
         )
     if not clients:
         print("No active clients.")
@@ -1276,14 +1539,35 @@ def cmd_client_show(args: argparse.Namespace) -> int:
     if is_service_active(config["interface"]):
         with contextlib.suppress(AwgctlError):
             handshake = handshake_map(config["interface"]).get(client["public_key"], 0)
+    data = {
+        "name": name,
+        "status": client["status"],
+        "management": client.get("management", "managed"),
+        "address": client["address"],
+        "public_key_fingerprint": client["public_key_fingerprint"],
+        "created_at": client["created_at"],
+        "owner": client.get("owner"),
+        "device": client.get("device"),
+        "expires": client.get("expires"),
+        "last_handshake": format_age(handshake),
+        "config": str(CLIENTS / name / (name + ".conf")) if client.get("management", "managed") == "managed" else None,
+        "qr": str(CLIENTS / name / (name + ".png")) if client.get("management", "managed") == "managed" else None,
+    }
+    if getattr(args, "json", False):
+        print(json.dumps(json_envelope("client show", data=data), indent=2, sort_keys=True))
+        return 0
     print(f"Client: {name}")
     print(f"  status:                 {client['status']}")
     print(f"  address:                {client['address']}")
     print(f"  public key fingerprint: {client['public_key_fingerprint']}")
     print(f"  created:                {client['created_at']}")
     print(f"  last handshake:         {format_age(handshake)}")
-    print(f"  config:                 {CLIENTS / name / (name + '.conf')}")
-    print(f"  QR:                     {CLIENTS / name / (name + '.png')}")
+    if client.get("management", "managed") == "managed":
+        print(f"  config:                 {CLIENTS / name / (name + '.conf')}")
+        print(f"  QR:                     {CLIENTS / name / (name + '.png')}")
+    else:
+        print("  config:                 external (import profile to manage locally)")
+        print("  QR:                     unavailable")
     return 0
 
 
@@ -1299,11 +1583,60 @@ def cmd_client_add(args: argparse.Namespace) -> int:
         address = next_client_address(
             ipaddress.ip_network(config["subnet"]), ipaddress.ip_interface(config["server_address"]), allocated
         )
+        try:
+            proposed_metadata = normalize_client_metadata(
+                {
+                    "schema_version": 2,
+                    "management": "managed",
+                    "owner": getattr(args, "owner", None),
+                    "device": getattr(args, "device", None),
+                    "expires": getattr(args, "expires", None),
+                }
+            )
+        except ContractError as exc:
+            raise AwgctlError(str(exc)) from exc
+        if getattr(args, "dry_run", False):
+            data = {
+                "dry_run": True,
+                "name": name,
+                "address": str(address.ip),
+                "owner": proposed_metadata["owner"],
+                "device": proposed_metadata["device"],
+                "expires": proposed_metadata["expires"],
+                "runtime_action": "reload",
+                "backup": "created at execution",
+                "files": [
+                    str(CLIENT_KEYS / name),
+                    str(CLIENTS / name),
+                    str(GENERATED_CONFIG),
+                    str(RUNTIME_CONFIG),
+                ],
+                "rollback": "remove the staged client and restore the pre-change server configuration",
+            }
+            if getattr(args, "json", False):
+                print(json.dumps(json_envelope("client add", data=data), indent=2, sort_keys=True))
+            else:
+                print(f"Dry run: create client {name}")
+                print(f"  address: {address.ip}")
+                print("  runtime action: reload")
+                print("  credentials: generated only during execution")
+                print("No state was changed.")
+            return 0
         backup = create_backup()
         private, public, psk = generate_key_material(config["use_psk"])
         committed = False
         try:
-            write_client_state(config, name, str(address), private, public, psk)
+            write_client_state(
+                config,
+                name,
+                str(address),
+                private,
+                public,
+                psk,
+                owner=getattr(args, "owner", None),
+                device=getattr(args, "device", None),
+                expires=getattr(args, "expires", None),
+            )
             new_clients = load_clients(include_secrets=True)
             new_server = render_server_config(config, server_private_key(), new_clients)
             active = commit_server_config(new_server, runtime_action="reload")
@@ -1325,6 +1658,197 @@ def cmd_client_add(args: argparse.Namespace) -> int:
         print(f"QR: {CLIENTS / name / (name + '.png')}")
         print(f"Pre-change backup: {backup}")
         print("Server configuration reloaded successfully." if active else "Server configuration installed; service is stopped.")
+    return 0
+
+
+def _server_peer_for_public(public_key: str) -> dict[str, str]:
+    try:
+        text = GENERATED_CONFIG.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise AwgctlError("cannot read generated server configuration") from exc
+    matches = [
+        peer for peer in parse_awg_config(text).get("Peer", [])
+        if peer.get("PublicKey") == public_key
+    ]
+    if len(matches) != 1:
+        raise AwgctlError("client profile does not match exactly one server peer")
+    return matches[0]
+
+
+def cmd_client_import(args: argparse.Namespace) -> int:
+    name = validate_client_name(args.client_name)
+    profile_path = args.profile.expanduser()
+    try:
+        metadata = profile_path.lstat()
+    except OSError as exc:
+        raise AwgctlError(f"cannot read client profile: {profile_path}") from exc
+    if not stat.S_ISREG(metadata.st_mode) or profile_path.is_symlink():
+        raise AwgctlError("client profile must be a regular non-symlink file")
+    if stat.S_IMODE(metadata.st_mode) & 0o077:
+        raise AwgctlError("client profile must not be accessible by group or other users")
+    if metadata.st_size > 64 * 1024:
+        raise AwgctlError("client profile is unexpectedly large")
+    profile_text = profile_path.read_text(encoding="utf-8")
+    with mutation_lock():
+        ensure_no_drift()
+        config = load_config()
+        imported = parse_import_profile(
+            profile_text,
+            config,
+            expected_server_public=server_public_key(),
+        )
+        peer = _server_peer_for_public(imported["public_key"])
+        if peer.get("AllowedIPs") != imported["address"]:
+            raise AwgctlError("client profile address differs from the matching server peer")
+        if peer.get("PresharedKey") != imported["psk"]:
+            raise AwgctlError("client profile PSK differs from the matching server peer")
+        clients = load_clients(include_secrets=True)
+        same_name = next((client for client in clients if client["name"] == name), None)
+        same_public = next((client for client in clients if client["public_key"] == imported["public_key"]), None)
+        if same_name and same_name.get("management", "managed") == "managed":
+            raise AwgctlError(f"client is already managed: {name}")
+        if same_name and same_name["public_key"] != imported["public_key"]:
+            raise AwgctlError(f"external peer identity differs from imported profile: {name}")
+        if same_public and same_public["name"] != name:
+            raise AwgctlError(f"matching external peer is named {same_public['name']}; import using that name")
+        try:
+            proposed = normalize_client_metadata(
+                {
+                    "schema_version": 2,
+                    "management": "managed",
+                    "owner": getattr(args, "owner", None) if not same_name else same_name.get("owner"),
+                    "device": getattr(args, "device", None) if not same_name else same_name.get("device"),
+                    "expires": getattr(args, "expires", None) if not same_name else same_name.get("expires"),
+                }
+            )
+        except ContractError as exc:
+            raise AwgctlError(str(exc)) from exc
+        if getattr(args, "dry_run", False):
+            data = {
+                "dry_run": True,
+                "name": name,
+                "address": str(ipaddress.ip_interface(imported["address"]).ip),
+                "public_key_fingerprint": fingerprint(imported["public_key"]),
+                "converts_external_peer": bool(same_name),
+                "runtime_action": "none",
+                "backup": "created at execution",
+                "profile": str(profile_path),
+            }
+            if getattr(args, "json", False):
+                print(json.dumps(json_envelope("client import", data=data), indent=2, sort_keys=True))
+            else:
+                print(f"Dry run: import existing client profile as {name}")
+                print(f"  address: {data['address']}")
+                print("  matching server peer: verified")
+                print("  runtime action: none")
+                print("No state was changed.")
+            return 0
+        backup = create_backup()
+        with tempfile.TemporaryDirectory(prefix="awgctl-import-") as temporary_text:
+            temporary = pathlib.Path(temporary_text)
+            if same_name:
+                shutil.copytree(CLIENTS / name, temporary / "client")
+                shutil.copytree(CLIENT_KEYS / name, temporary / "keys")
+                remove_client_state(name)
+            try:
+                write_client_state(
+                    config,
+                    name,
+                    imported["address"],
+                    imported["private_key"],
+                    imported["public_key"],
+                    imported["psk"],
+                    created_at=same_name.get("created_at") if same_name else None,
+                    imported_from=str(profile_path),
+                    profile_text=profile_text,
+                    owner=proposed["owner"],
+                    device=proposed["device"],
+                    expires=proposed["expires"],
+                )
+                if semantic_signature(render_current_server()) != semantic_signature(GENERATED_CONFIG.read_text()):
+                    raise AwgctlError("imported client does not reproduce the existing server peer semantics")
+            except Exception:
+                remove_client_state(name)
+                if same_name:
+                    shutil.copytree(temporary / "client", CLIENTS / name)
+                    shutil.copytree(temporary / "keys", CLIENT_KEYS / name)
+                    chmod_secret_tree(CLIENTS / name)
+                    chmod_secret_tree(CLIENT_KEYS / name)
+                audit(f"client import failed: {name}")
+                raise
+        audit(f"client imported: {name}")
+        data = {
+            "name": name,
+            "address": str(ipaddress.ip_interface(imported["address"]).ip),
+            "config": str(CLIENTS / name / f"{name}.conf"),
+            "qr": str(CLIENTS / name / f"{name}.png"),
+            "backup": str(backup),
+            "runtime_action": "none",
+        }
+        if getattr(args, "json", False):
+            print(json.dumps(json_envelope("client import", data=data), indent=2, sort_keys=True))
+        else:
+            print(f"Imported client: {name}")
+            print(f"Address: {data['address']}")
+            print(f"Config: {data['config']}")
+            print(f"QR: {data['qr']}")
+            print(f"Pre-change backup: {backup}")
+            print("Matching server peer was preserved; no reload was required.")
+    return 0
+
+
+def cmd_client_edit(args: argparse.Namespace) -> int:
+    name = validate_client_name(args.client_name)
+    supplied = {field for field in ("owner", "device", "expires") if hasattr(args, field)}
+    if not supplied:
+        raise AwgctlError("client edit requires --owner, --device, or --expires")
+    with mutation_lock():
+        ensure_no_drift()
+        clients = {client["name"]: client for client in load_clients()}
+        if name not in clients:
+            raise AwgctlError(f"unknown active client: {name}")
+        old = clients[name]
+        proposed = dict(old)
+        for field in supplied:
+            value = getattr(args, field)
+            if field == "expires" and isinstance(value, str) and value.lower() == "none":
+                value = None
+            proposed[field] = value
+        try:
+            proposed = normalize_client_metadata(proposed)
+        except ContractError as exc:
+            raise AwgctlError(str(exc)) from exc
+        changes = {
+            field: {"old": old.get(field), "new": proposed.get(field)}
+            for field in sorted(supplied)
+            if old.get(field) != proposed.get(field)
+        }
+        data = {"dry_run": bool(getattr(args, "dry_run", False)), "name": name, "changes": changes}
+        if getattr(args, "dry_run", False):
+            if getattr(args, "json", False):
+                print(json.dumps(json_envelope("client edit", data=data), indent=2, sort_keys=True))
+            else:
+                print(f"Dry run: edit client metadata for {name}")
+                for field, change in changes.items():
+                    print(f"  {field}: {change['old']!r} -> {change['new']!r}")
+                print("No state was changed.")
+            return 0
+        if not changes:
+            if getattr(args, "json", False):
+                print(json.dumps(json_envelope("client edit", data=data), indent=2, sort_keys=True))
+            else:
+                print(f"No change: client metadata for {name} already matches")
+            return 0
+        backup = create_backup()
+        proposed["updated_at"] = iso_now()
+        atomic_json(CLIENTS / name / "metadata.json", proposed, 0o600)
+        audit(f"client metadata changed: {name} fields={','.join(sorted(changes))}")
+        data.update({"backup": str(backup), "dry_run": False})
+        if getattr(args, "json", False):
+            print(json.dumps(json_envelope("client edit", data=data), indent=2, sort_keys=True))
+        else:
+            print(f"Updated client metadata: {name}")
+            print(f"Pre-change backup: {backup}")
     return 0
 
 
@@ -1351,6 +1875,24 @@ def cmd_client_revoke(args: argparse.Namespace) -> int:
         target = next((client for client in old_clients if client["name"] == name), None)
         if target is None:
             raise AwgctlError(f"unknown active client: {name}")
+        if getattr(args, "dry_run", False):
+            data = {
+                "dry_run": True,
+                "name": name,
+                "address": str(ipaddress.ip_interface(target["address"]).ip),
+                "management": target.get("management", "managed"),
+                "runtime_action": "reload",
+                "archive": "created at execution",
+                "backup": "created at execution",
+            }
+            if getattr(args, "json", False):
+                print(json.dumps(json_envelope("client revoke", data=data), indent=2, sort_keys=True))
+            else:
+                print(f"Dry run: revoke client {name}")
+                print("  runtime action: reload")
+                print("  credentials: archive retained; nothing permanently deleted")
+                print("No state was changed.")
+            return 0
         backup = create_backup()
         archive = archive_client_copy(name)
         remaining = [client for client in old_clients if client["name"] != name]
@@ -1400,6 +1942,26 @@ def cmd_client_rotate(args: argparse.Namespace) -> int:
         target = next((client for client in old_clients if client["name"] == name), None)
         if target is None:
             raise AwgctlError(f"unknown active client: {name}")
+        if target.get("management", "managed") != "managed":
+            raise AwgctlError("external client cannot be rotated; import its profile first")
+        if getattr(args, "dry_run", False):
+            data = {
+                "dry_run": True,
+                "name": name,
+                "address": str(ipaddress.ip_interface(target["address"]).ip),
+                "runtime_action": "reload",
+                "old_credentials": "archived at execution",
+                "new_credentials": "generated only at execution",
+                "backup": "created at execution",
+            }
+            if getattr(args, "json", False):
+                print(json.dumps(json_envelope("client rotate", data=data), indent=2, sort_keys=True))
+            else:
+                print(f"Dry run: rotate client {name}")
+                print("  runtime action: reload")
+                print("  prior credentials: archived, not deleted")
+                print("No state was changed.")
+            return 0
         backup = create_backup()
         archive = archive_client_copy(name, rotation=True)
         private, public, psk = generate_key_material(config["use_psk"])
@@ -1452,6 +2014,9 @@ def cmd_client_export(args: argparse.Namespace) -> int:
     name = validate_client_name(args.client_name)
     profile = CLIENTS / name / f"{name}.conf"
     if not profile.is_file():
+        clients = {client["name"]: client for client in load_clients()}
+        if name in clients and clients[name].get("management", "managed") == "external":
+            raise AwgctlError("external client has no local profile; use client import first")
         raise AwgctlError(f"unknown active client: {name}")
     if args.stdout:
         print("WARNING: the following profile contains credentials; protect terminal scrollback and logs.", file=sys.stderr)
@@ -1479,9 +2044,20 @@ def cmd_client_qr(args: argparse.Namespace) -> int:
     name = validate_client_name(args.client_name)
     profile_path = CLIENTS / name / f"{name}.conf"
     if not profile_path.is_file():
+        clients = {client["name"]: client for client in load_clients()}
+        if name in clients and clients[name].get("management", "managed") == "external":
+            raise AwgctlError("external client has no local profile; use client import first")
         raise AwgctlError(f"unknown active client: {name}")
     with mutation_lock():
         output = CLIENTS / name / f"{name}.png"
+        if getattr(args, "dry_run", False):
+            data = {"dry_run": True, "name": name, "output": str(output)}
+            if getattr(args, "json", False):
+                print(json.dumps(json_envelope("client qr", data=data), indent=2, sort_keys=True))
+            else:
+                print(f"Dry run: regenerate protected QR image at {output}")
+                print("No state was changed.")
+            return 0
         generate_qr(profile_path.read_text(encoding="utf-8"), output)
         audit(f"client QR regenerated: {name}")
         print(f"Protected QR image: {output}")
@@ -1489,14 +2065,20 @@ def cmd_client_qr(args: argparse.Namespace) -> int:
     return 0
 
 
-def cmd_config_show(_: argparse.Namespace) -> int:
-    print(json.dumps(load_config(), indent=2, sort_keys=True))
+def cmd_config_show(args: argparse.Namespace) -> int:
+    config = load_config()
+    if getattr(args, "json", False):
+        print(json.dumps(json_envelope("config show", data=config), indent=2, sort_keys=True))
+    else:
+        print(json.dumps(config, indent=2, sort_keys=True))
     return 0
 
 
 def snapshot_client_artifacts(clients: Sequence[dict[str, Any]]) -> dict[pathlib.Path, bytes]:
     snapshot: dict[pathlib.Path, bytes] = {}
     for client in clients:
+        if client.get("management", "managed") != "managed":
+            continue
         directory = CLIENTS / client["name"]
         for suffix in (".conf", ".png"):
             path = directory / f"{client['name']}{suffix}"
@@ -1513,10 +2095,6 @@ def cmd_config_set(args: argparse.Namespace) -> int:
     with mutation_lock():
         ensure_no_drift()
         config = load_config()
-        old_config_bytes = CONFIG_FILE.read_bytes()
-        old_nft = GENERATED_NFT.read_bytes()
-        clients = load_clients(include_secrets=True)
-        artifacts = snapshot_client_artifacts(clients)
         new_config = json.loads(json.dumps(config))
         old_display: str
         new_display: str
@@ -1552,6 +2130,33 @@ def cmd_config_set(args: argparse.Namespace) -> int:
         if new_config == config:
             print(f"No change: {args.key} is already {new_display}")
             return 0
+        if getattr(args, "dry_run", False):
+            data = {
+                "dry_run": True,
+                "key": args.key,
+                "old": old_display,
+                "new": new_display,
+                "runtime_action": runtime_action or "none",
+                "profiles": "managed client profiles would be regenerated",
+                "backup": "created at execution",
+            }
+            if args.key == "listen-port":
+                data["aws_firewall_update_required"] = True
+                data["old_aws_rule"] = f"Custom / UDP / {old_display} / 0.0.0.0/0"
+                data["new_aws_rule"] = f"Custom / UDP / {new_display} / 0.0.0.0/0"
+            if getattr(args, "json", False):
+                print(json.dumps(json_envelope("config set", data=data), indent=2, sort_keys=True))
+            else:
+                print(f"Dry run: set {args.key}: {old_display} -> {new_display}")
+                print(f"  runtime action: {runtime_action or 'none'}")
+                if args.key == "listen-port":
+                    print("AWS LIGHTSAIL FIREWALL UPDATE REQUIRED")
+                print("No state was changed.")
+            return 0
+        old_config_bytes = CONFIG_FILE.read_bytes()
+        old_nft = GENERATED_NFT.read_bytes()
+        clients = load_clients(include_secrets=True)
+        artifacts = snapshot_client_artifacts(clients)
         backup = create_backup()
         server_public = server_public_key()
         new_profiles = {
@@ -1559,6 +2164,7 @@ def cmd_config_set(args: argparse.Namespace) -> int:
                 new_config, client["private_key"], client.get("psk"), server_public, client["address"]
             )
             for client in clients
+            if client.get("management", "managed") == "managed"
         }
         new_server = render_server_config(new_config, server_private_key(), clients)
         new_nft = render_nftables_config(new_config)
@@ -1566,6 +2172,8 @@ def cmd_config_set(args: argparse.Namespace) -> int:
         try:
             atomic_json(CONFIG_FILE, new_config, 0o600)
             for client in clients:
+                if client.get("management", "managed") != "managed":
+                    continue
                 directory = CLIENTS / client["name"]
                 profile = new_profiles[client["name"]]
                 atomic_write(directory / f"{client['name']}.conf", profile, 0o600)
@@ -1599,16 +2207,121 @@ def cmd_service(args: argparse.Namespace) -> int:
     with mutation_lock():
         if args.command in {"start", "restart", "reload"}:
             ensure_no_drift()
+        if getattr(args, "dry_run", False):
+            data = {
+                "dry_run": True,
+                "action": args.command,
+                "service": SERVICE_TEMPLATE.format(interface=config["interface"]),
+            }
+            if getattr(args, "json", False):
+                print(json.dumps(json_envelope(args.command, data=data), indent=2, sort_keys=True))
+            else:
+                print(f"Dry run: systemctl {args.command} {data['service']}")
+                print("No state was changed.")
+            return 0
         service_action(args.command, config["interface"])
         audit(f"service {args.command}: {config['interface']}")
         print(f"{SERVICE_TEMPLATE.format(interface=config['interface'])}: {args.command} successful")
     return 0
 
 
-def cmd_backup(_: argparse.Namespace) -> int:
+def cmd_backup(args: argparse.Namespace) -> int:
+    operation = args.backup_command
+    if operation == "list":
+        if args.backup is not None:
+            raise AwgctlError("backup list does not accept a backup name")
+        entries: list[dict[str, Any]] = []
+        if BACKUPS.is_dir():
+            for path in sorted(BACKUPS.iterdir(), reverse=True):
+                if not path.is_dir() or path.is_symlink():
+                    continue
+                entry: dict[str, Any] = {"name": path.name, "verified": False, "legacy": True}
+                if (path / "manifest.json").is_file():
+                    entry["legacy"] = False
+                    try:
+                        report = verify_backup(path)
+                    except BackupError as exc:
+                        entry["error"] = str(exc)
+                    else:
+                        entry.update(
+                            verified=True,
+                            created_at=report["created_at"],
+                            product_version=report["product_version"],
+                            file_count=report["file_count"],
+                        )
+                entries.append(entry)
+        if getattr(args, "json", False):
+            print(json.dumps(json_envelope("backup list", data={"backups": entries}), indent=2, sort_keys=True))
+        elif not entries:
+            print("No managed backups found.")
+        else:
+            for entry in entries:
+                state = "verified" if entry["verified"] else ("legacy/unverified" if entry["legacy"] else "INVALID")
+                version = f"  {entry.get('product_version')}" if entry.get("product_version") else ""
+                print(f"{entry['name']}  {state}{version}")
+        return 0
+    if operation == "verify":
+        if args.backup is None:
+            raise AwgctlError("backup verify requires a backup name")
+        path, report = verify_managed_backup(args.backup)
+        if getattr(args, "json", False):
+            print(json.dumps(json_envelope("backup verify", data=report), indent=2, sort_keys=True))
+        else:
+            print(f"Verified backup: {path}")
+            print(f"Files: {report['file_count']}")
+            print(f"Created: {report['created_at']}")
+            print(f"Product version: {report['product_version']}")
+        return 0
+    if args.backup is not None:
+        raise AwgctlError("use 'awgctl backup verify NAME' to verify a backup")
+    if args.dry_run:
+        data = {"dry_run": True, "would_create": str(BACKUPS / utc_timestamp())}
+        if getattr(args, "json", False):
+            print(json.dumps(json_envelope("backup", data=data), indent=2, sort_keys=True))
+        else:
+            print("Backup dry run: managed configuration, keys, clients, revoked clients, and generated state would be copied.")
+            print("A SHA-256 manifest would be created and verified before success is reported.")
+        return 0
     with mutation_lock():
         path = create_backup()
-        print(f"Created protected backup: {path}")
+    data = {"path": str(path), "verified": True}
+    if getattr(args, "json", False):
+        print(json.dumps(json_envelope("backup", data=data), indent=2, sort_keys=True))
+    else:
+        print(f"Created and verified protected backup: {path}")
+    return 0
+
+
+def cmd_restore(args: argparse.Namespace) -> int:
+    backup, report = verify_managed_backup(args.backup)
+    if args.dry_run:
+        data = {
+            "dry_run": True,
+            "backup": str(backup),
+            "verified_files": report["file_count"],
+            "components": list(RESTORE_COMPONENTS),
+            "runtime_action": "restart-if-running",
+        }
+        if getattr(args, "json", False):
+            print(json.dumps(json_envelope("restore", data=data), indent=2, sort_keys=True))
+        else:
+            print(f"Restore dry run: verified {backup.name} ({report['file_count']} files).")
+            print("Would create a pre-restore backup, atomically replace managed state, and restart awg0 only if running.")
+        return 0
+    with mutation_lock():
+        safety_backup, was_active = restore_backup_transaction(backup)
+    audit(f"backup restored: {backup.name}; safety backup: {safety_backup.name}")
+    data = {
+        "backup": str(backup),
+        "pre_restore_backup": str(safety_backup),
+        "interface_restarted": was_active,
+    }
+    if getattr(args, "json", False):
+        print(json.dumps(json_envelope("restore", data=data), indent=2, sort_keys=True))
+    else:
+        print(f"Restored verified backup: {backup}")
+        print(f"Pre-restore rollback point: {safety_backup}")
+        print("Running interface restarted and verified." if was_active else "Interface was stopped; it was not started.")
     return 0
 
 
@@ -1728,28 +2441,74 @@ def cmd_migrate_existing(args: argparse.Namespace) -> int:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="awgctl", description="Manage the host's AmneziaWG installation")
     parser.add_argument("--version", action="version", version=f"awgctl {VERSION}")
+    parser.add_argument("--json", action="store_true", help="emit a stable machine-readable response")
     subcommands = parser.add_subparsers(dest="command", required=True)
-    for name in ("status", "health", "check", "start", "stop", "restart", "reload", "backup", "aws-rule"):
-        subcommands.add_parser(name)
+
+    def output_flag(command: argparse.ArgumentParser) -> None:
+        command.add_argument("--json", action="store_true", default=argparse.SUPPRESS)
+
+    def dry_run_flag(command: argparse.ArgumentParser) -> None:
+        command.add_argument("--dry-run", action="store_true")
+
+    for name in ("status", "health", "check", "aws-rule", "version"):
+        output_flag(subcommands.add_parser(name))
+    for name in ("start", "stop", "restart", "reload"):
+        command = subcommands.add_parser(name)
+        output_flag(command)
+        dry_run_flag(command)
+    backup_command = subcommands.add_parser("backup")
+    backup_command.add_argument("backup_command", nargs="?", choices=("list", "verify"))
+    backup_command.add_argument("backup", nargs="?", type=pathlib.Path)
+    output_flag(backup_command)
+    dry_run_flag(backup_command)
+    restore = subcommands.add_parser("restore")
+    restore.add_argument("backup", type=pathlib.Path)
+    output_flag(restore)
+    dry_run_flag(restore)
 
     config_parser = subcommands.add_parser("config")
     config_commands = config_parser.add_subparsers(dest="config_command", required=True)
-    config_commands.add_parser("show")
+    output_flag(config_commands.add_parser("show"))
     config_set = config_commands.add_parser("set")
     config_set.add_argument("key", choices=("endpoint", "dns", "mtu", "listen-port"))
     config_set.add_argument("value")
+    output_flag(config_set)
+    dry_run_flag(config_set)
 
     client_parser = subcommands.add_parser("client")
     client_commands = client_parser.add_subparsers(dest="client_command", required=True)
-    client_commands.add_parser("list")
+    output_flag(client_commands.add_parser("list"))
     for name in ("add", "show", "qr", "revoke", "rotate"):
         command = client_commands.add_parser(name)
         command.add_argument("client_name", metavar="NAME")
+        output_flag(command)
+        if name != "show":
+            dry_run_flag(command)
+        if name == "add":
+            command.add_argument("--owner")
+            command.add_argument("--device")
+            command.add_argument("--expires")
     export = client_commands.add_parser("export")
     export.add_argument("client_name", metavar="NAME")
+    output_flag(export)
     export_group = export.add_mutually_exclusive_group()
     export_group.add_argument("--output", type=pathlib.Path)
     export_group.add_argument("--stdout", action="store_true")
+    client_import = client_commands.add_parser("import")
+    client_import.add_argument("client_name", metavar="NAME")
+    client_import.add_argument("--config", dest="profile", type=pathlib.Path, required=True)
+    client_import.add_argument("--owner")
+    client_import.add_argument("--device")
+    client_import.add_argument("--expires")
+    output_flag(client_import)
+    dry_run_flag(client_import)
+    client_edit = client_commands.add_parser("edit")
+    client_edit.add_argument("client_name", metavar="NAME")
+    client_edit.add_argument("--owner", default=argparse.SUPPRESS)
+    client_edit.add_argument("--device", default=argparse.SUPPRESS)
+    client_edit.add_argument("--expires", default=argparse.SUPPRESS)
+    output_flag(client_edit)
+    dry_run_flag(client_edit)
 
     firewall = subcommands.add_parser("_firewall", help=argparse.SUPPRESS)
     firewall.add_argument("firewall_action", choices=("up", "down"))
@@ -1762,6 +2521,13 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def dispatch(args: argparse.Namespace) -> int:
+    if args.command == "version":
+        data = {"version": VERSION}
+        if getattr(args, "json", False):
+            print(json.dumps(json_envelope("version", data=data), indent=2, sort_keys=True))
+        else:
+            print(f"awgctl {VERSION}")
+        return 0
     require_root()
     if args.command == "status":
         return cmd_status(args)
@@ -1771,8 +2537,10 @@ def dispatch(args: argparse.Namespace) -> int:
         return cmd_service(args)
     if args.command == "backup":
         return cmd_backup(args)
+    if args.command == "restore":
+        return cmd_restore(args)
     if args.command == "aws-rule":
-        cmd_aws_rule()
+        cmd_aws_rule(as_json=getattr(args, "json", False))
         return 0
     if args.command == "config":
         return cmd_config_show(args) if args.config_command == "show" else cmd_config_set(args)
@@ -1785,6 +2553,8 @@ def dispatch(args: argparse.Namespace) -> int:
             "qr": cmd_client_qr,
             "revoke": cmd_client_revoke,
             "rotate": cmd_client_rotate,
+            "import": cmd_client_import,
+            "edit": cmd_client_edit,
         }
         return handlers[args.client_command](args)
     if args.command == "_firewall":
@@ -1800,6 +2570,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         return dispatch(args)
     except AwgctlError as exc:
+        audit(f"command failed: {args.command}")
+        print(f"awgctl: {exc}", file=sys.stderr)
+        return 1
+    except (BackupError, ContractError) as exc:
         audit(f"command failed: {args.command}")
         print(f"awgctl: {exc}", file=sys.stderr)
         return 1
