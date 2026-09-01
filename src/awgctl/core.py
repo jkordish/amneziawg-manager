@@ -14,6 +14,7 @@ import hashlib
 import ipaddress
 import io
 import json
+import errno
 import os
 import pathlib
 import pwd
@@ -73,6 +74,10 @@ GENERATED_CONFIG = GENERATED / "awg0.conf"
 GENERATED_NFT = GENERATED / "nftables.nft"
 BACKUPS = ROOT / "backups"
 DIAGNOSTICS = ROOT / "diagnostics"
+TRANSITIONS = ROOT / "transitions"
+PENDING_TRANSITIONS = ROOT / "pending/obfuscation"
+TRANSITION_FILE = TRANSITIONS / "obfuscation.json"
+TRANSITION_OUTCOME_FILE = TRANSITIONS / "obfuscation-outcome.json"
 RUNTIME_CONFIG = pathlib.Path("/etc/amnezia/amneziawg/awg0.conf")
 LOCK_FILE = pathlib.Path("/run/lock/awgctl.lock")
 PUBLIC_ENTRYPOINT = pathlib.Path("/usr/local/sbin/awgctl")
@@ -126,6 +131,9 @@ BLOCKED_FORWARD_IPV4 = (
     "240.0.0.0/4",
 )
 CLIENT_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,31}$")
+TRANSACTION_ID_RE = re.compile(r"^[0-9a-f]{32}$")
+BACKUP_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 INTERFACE_RE = re.compile(r"^[A-Za-z0-9_.-]{1,15}$")
 LEGACY_FIREWALL_MARKERS = (
     "amneziawg-awg0-egress",
@@ -264,6 +272,33 @@ def require_awg31_capability(
         "tools_version": tools_version,
         "module_version": loaded_module_version,
         "qualified": True,
+    }
+
+
+def inspect_awg_versions(
+    *,
+    command_runner: Any = run,
+    loaded_version_reader: Any = _loaded_awg_module_version,
+) -> dict[str, Any]:
+    """Inspect exact versions without treating source qualification as a classic-mode gate."""
+    try:
+        tools_result = command_runner(["awg", "--version"])
+        module_result = command_runner(["modinfo", "-F", "version", "amneziawg"])
+        if tools_result.returncode != 0 or module_result.returncode != 0:
+            raise AwgctlError("AmneziaWG version inspection command failed")
+        tools = parse_awg_tools_version(tools_result.stdout.decode("ascii"))
+        packaged = parse_awg_module_version(module_result.stdout.decode("ascii"))
+        loaded = parse_awg_module_version(loaded_version_reader())
+    except AwgctlError:
+        raise
+    except (AttributeError, OSError, UnicodeError) as exc:
+        raise AwgctlError("AmneziaWG version inspection failed") from exc
+    if packaged != loaded:
+        raise AwgctlError("loaded and packaged AmneziaWG module versions do not match")
+    return {
+        "policy_version": AWG31_QUALIFICATION_POLICY_VERSION,
+        "tools_version": tools,
+        "module_version": loaded,
     }
 
 
@@ -457,6 +492,322 @@ def validate_client_name(name: str) -> str:
     if not CLIENT_NAME_RE.fullmatch(name):
         raise AwgctlError("client name must match [A-Za-z0-9][A-Za-z0-9_-]{0,31}")
     return name
+
+
+def validate_transaction_id(value: str) -> str:
+    if not isinstance(value, str) or TRANSACTION_ID_RE.fullmatch(value) is None:
+        raise AwgctlError("transaction ID must be exactly 32 lowercase hexadecimal characters")
+    return value
+
+
+def transaction_id_argument(value: str) -> str:
+    try:
+        return validate_transaction_id(value)
+    except AwgctlError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from exc
+
+
+def _transition_time(value: Any, field: str) -> dt.datetime:
+    if not isinstance(value, str) or len(value) > 32:
+        raise AwgctlError(f"{field} must be one bounded UTC timestamp")
+    try:
+        parsed = dt.datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise AwgctlError(f"{field} must be one bounded UTC timestamp") from exc
+    if parsed.tzinfo is None or parsed.utcoffset() != dt.timedelta(0):
+        raise AwgctlError(f"{field} must be one bounded UTC timestamp")
+    return parsed
+
+
+def normalize_transition_document(value: Any) -> dict[str, Any]:
+    """Validate the complete protected prepared/active transaction contract."""
+    if not isinstance(value, dict):
+        raise AwgctlError("obfuscation transition must be an object")
+    fields = {
+        "schema_version",
+        "transaction_id",
+        "state",
+        "mode",
+        "profile_name",
+        "client_name",
+        "old_port",
+        "new_port",
+        "backup_name",
+        "pending",
+        "ingress_boundary",
+        "capability",
+        "prepared_at",
+        "activated_at",
+        "deadline_at",
+        "pre_rx",
+        "pre_tx",
+        "prestate_sha256",
+        "pending_sha256",
+    }
+    if set(value) != fields:
+        raise AwgctlError("obfuscation transition fields are incomplete or unexpected")
+    schema = value["schema_version"]
+    if not isinstance(schema, int) or isinstance(schema, bool) or schema != 1:
+        raise AwgctlError("unsupported obfuscation transition schema")
+    transaction_id = validate_transaction_id(value["transaction_id"])
+    state = value["state"]
+    if state not in {"prepared", "active"}:
+        raise AwgctlError("obfuscation transition state must be prepared or active")
+    if value["mode"] != "awg31" or value["profile_name"] != "russia-ios-v1":
+        raise AwgctlError("unsupported obfuscation transition mode or profile")
+    client_name = validate_client_name(value["client_name"])
+    for field in ("old_port", "new_port"):
+        port = value[field]
+        if not isinstance(port, int) or isinstance(port, bool) or not 1 <= port <= 65535:
+            raise AwgctlError(f"{field} must be an integer from 1 to 65535")
+    if not 1024 <= value["new_port"] <= 9999 or value["new_port"] == value["old_port"]:
+        raise AwgctlError("new transition port must be distinct and within 1024..9999")
+    backup_name = value["backup_name"]
+    if not isinstance(backup_name, str) or BACKUP_NAME_RE.fullmatch(backup_name) is None:
+        raise AwgctlError("invalid transition backup identity")
+    if value["ingress_boundary"] not in {
+        "lightsail",
+        "equivalent-external-firewall",
+    }:
+        raise AwgctlError("transition ingress boundary attestation is invalid")
+    capability = value["capability"]
+    capability_fields = {
+        "policy_version",
+        "tools_version",
+        "module_version",
+        "qualified",
+    }
+    if not isinstance(capability, dict) or set(capability) != capability_fields:
+        raise AwgctlError("transition capability evidence is invalid")
+    policy = capability["policy_version"]
+    if (
+        not isinstance(policy, int)
+        or isinstance(policy, bool)
+        or policy != AWG31_QUALIFICATION_POLICY_VERSION
+        or capability["qualified"] is not True
+    ):
+        raise AwgctlError("transition capability evidence is invalid")
+    parse_awg_tools_version(
+        f"amneziawg-tools v{capability['tools_version']} - https://amnezia.org\n"
+        if isinstance(capability["tools_version"], str)
+        else ""
+    )
+    parse_awg_module_version(
+        f"{capability['module_version']}\n"
+        if isinstance(capability["module_version"], str)
+        else ""
+    )
+
+    pending = value["pending"]
+    pending_fields = {"root", "server_state", "server_config", "header_key", "profiles"}
+    if not isinstance(pending, dict) or set(pending) != pending_fields:
+        raise AwgctlError("transition pending paths are invalid")
+    expected_root = PENDING_TRANSITIONS / transaction_id
+    expected_paths = {
+        "root": expected_root,
+        "server_state": expected_root / "server.json",
+        "server_config": expected_root / "awg0.conf",
+        "header_key": expected_root / "header-protection",
+    }
+    for field, expected in expected_paths.items():
+        supplied = pending[field]
+        if not isinstance(supplied, str) or pathlib.Path(supplied) != expected:
+            raise AwgctlError("transition pending path differs from the protected layout")
+    profiles = pending["profiles"]
+    if not isinstance(profiles, list) or not profiles:
+        raise AwgctlError("transition pending profile set is empty or invalid")
+    normalized_profiles: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for item in profiles:
+        item_fields = {"name", "config", "qr", "current_revision"}
+        if not isinstance(item, dict) or set(item) != item_fields:
+            raise AwgctlError("transition pending profile entry is invalid")
+        name = validate_client_name(item["name"])
+        revision = item["current_revision"]
+        if name in seen or not isinstance(revision, int) or isinstance(revision, bool) or revision < 1:
+            raise AwgctlError("transition pending profile identity is invalid")
+        seen.add(name)
+        profile_root = expected_root / "clients" / name
+        if (
+            not isinstance(item["config"], str)
+            or not isinstance(item["qr"], str)
+            or pathlib.Path(item["config"]) != profile_root / f"{name}.conf"
+            or pathlib.Path(item["qr"]) != profile_root / f"{name}.png"
+        ):
+            raise AwgctlError("transition pending profile path differs from the protected layout")
+        normalized_profiles.append(dict(item))
+    if client_name not in seen or [item["name"] for item in profiles] != sorted(seen):
+        raise AwgctlError("transition pending profile set is not canonical")
+
+    prepared_at = _transition_time(value["prepared_at"], "prepared_at")
+    active_fields = ("activated_at", "deadline_at", "pre_rx", "pre_tx")
+    if state == "prepared":
+        if any(value[field] is not None for field in active_fields):
+            raise AwgctlError("prepared transition contains active-only state")
+    else:
+        if value["activated_at"] is None or value["deadline_at"] is None:
+            raise AwgctlError("active transition is missing activation timestamps")
+        activated_at = _transition_time(value["activated_at"], "activated_at")
+        deadline_at = _transition_time(value["deadline_at"], "deadline_at")
+        if activated_at < prepared_at or deadline_at - activated_at != dt.timedelta(minutes=10):
+            raise AwgctlError("active transition timestamps are inconsistent")
+        for field in ("pre_rx", "pre_tx"):
+            counter = value[field]
+            if not isinstance(counter, int) or isinstance(counter, bool) or counter < 0:
+                raise AwgctlError(f"{field} must be a nonnegative integer")
+    digest = value["prestate_sha256"]
+    if not isinstance(digest, str) or SHA256_RE.fullmatch(digest) is None:
+        raise AwgctlError("transition prestate digest is invalid")
+    pending_digest = value["pending_sha256"]
+    if not isinstance(pending_digest, str) or SHA256_RE.fullmatch(pending_digest) is None:
+        raise AwgctlError("transition pending artifact digest is invalid")
+    return copy.deepcopy(value)
+
+
+def _private_directory(path: pathlib.Path, *, create: bool) -> None:
+    if create:
+        try:
+            path.mkdir(parents=True, mode=0o700, exist_ok=True)
+        except OSError as exc:
+            raise AwgctlError("cannot create protected transition directory") from exc
+    try:
+        descriptor = os.open(
+            path,
+            os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0),
+        )
+    except OSError as exc:
+        raise AwgctlError("protected transition directory is missing or unsafe") from exc
+    try:
+        metadata = os.fstat(descriptor)
+        if (
+            not stat.S_ISDIR(metadata.st_mode)
+            or (metadata.st_uid, metadata.st_gid) != (os.geteuid(), os.getegid())
+            or stat.S_IMODE(metadata.st_mode) != 0o700
+        ):
+            raise AwgctlError("protected transition directory is not private")
+    finally:
+        os.close(descriptor)
+
+
+def ensure_transition_layout() -> None:
+    _private_directory(TRANSITIONS, create=True)
+    _private_directory(PENDING_TRANSITIONS.parent, create=True)
+    _private_directory(PENDING_TRANSITIONS, create=True)
+
+
+def _read_protected_json(path: pathlib.Path, *, maximum: int = 256 * 1024) -> Any | None:
+    try:
+        parent = os.open(
+            path.parent,
+            os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0),
+        )
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        raise AwgctlError("protected transition directory is unsafe") from exc
+    descriptor = -1
+    try:
+        parent_metadata = os.fstat(parent)
+        if (
+            not stat.S_ISDIR(parent_metadata.st_mode)
+            or (parent_metadata.st_uid, parent_metadata.st_gid) != (os.geteuid(), os.getegid())
+            or stat.S_IMODE(parent_metadata.st_mode) != 0o700
+        ):
+            raise AwgctlError("protected transition directory is not private")
+        try:
+            descriptor = os.open(
+                path.name,
+                os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0),
+                dir_fd=parent,
+            )
+        except FileNotFoundError:
+            return None
+        metadata = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_nlink != 1
+            or (metadata.st_uid, metadata.st_gid) != (os.geteuid(), os.getegid())
+            or stat.S_IMODE(metadata.st_mode) != 0o600
+            or metadata.st_size > maximum
+        ):
+            raise AwgctlError("protected transition document is unsafe")
+        chunks: list[bytes] = []
+        total = 0
+        while True:
+            chunk = os.read(descriptor, min(16 * 1024, maximum + 1 - total))
+            if not chunk:
+                break
+            total += len(chunk)
+            if total > maximum:
+                raise AwgctlError("protected transition document is too large")
+            chunks.append(chunk)
+        try:
+            return json.loads(b"".join(chunks).decode("utf-8"))
+        except (UnicodeError, json.JSONDecodeError) as exc:
+            raise AwgctlError("protected transition document is invalid") from exc
+    except OSError as exc:
+        if exc.errno == errno.ELOOP:
+            raise AwgctlError("protected transition document must not be a symbolic link") from exc
+        raise AwgctlError("cannot read protected transition document") from exc
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        os.close(parent)
+
+
+def load_transition_document(*, required: bool = True) -> dict[str, Any] | None:
+    value = _read_protected_json(TRANSITION_FILE)
+    if value is None:
+        if required:
+            raise AwgctlError("no obfuscation transition is pending")
+        return None
+    return normalize_transition_document(value)
+
+
+def compare_and_swap_transition(
+    value: dict[str, Any],
+    *,
+    expected_transaction_id: str | None,
+    expected_state: str | None,
+) -> None:
+    """Persist only none->prepared or exact prepared->active while the caller holds the lock."""
+    proposed = normalize_transition_document(value)
+    ensure_transition_layout()
+    current = load_transition_document(required=False)
+    if expected_transaction_id is None or expected_state is None:
+        if expected_transaction_id is not None or expected_state is not None or current is not None:
+            raise AwgctlError("another obfuscation transition is already pending")
+        if proposed["state"] != "prepared":
+            raise AwgctlError("new obfuscation transition must begin prepared")
+    else:
+        expected_transaction_id = validate_transaction_id(expected_transaction_id)
+        if expected_state not in {"prepared", "active"}:
+            raise AwgctlError("invalid expected obfuscation transition state")
+        if (
+            current is None
+            or current["transaction_id"] != expected_transaction_id
+            or current["state"] != expected_state
+        ):
+            raise AwgctlError("obfuscation transition changed; stale operation rejected")
+        if (
+            expected_state != "prepared"
+            or proposed["state"] != "active"
+            or proposed["transaction_id"] != expected_transaction_id
+        ):
+            raise AwgctlError("invalid obfuscation transition compare-and-swap")
+        expected_prepared = copy.deepcopy(proposed)
+        expected_prepared.update(
+            state="prepared",
+            activated_at=None,
+            deadline_at=None,
+            pre_rx=None,
+            pre_tx=None,
+        )
+        if current != expected_prepared:
+            raise AwgctlError("obfuscation transition changed; stale operation rejected")
+    atomic_json(TRANSITION_FILE, proposed, 0o600)
+    if load_transition_document() != proposed:
+        raise AwgctlError("obfuscation transition write could not be verified")
 
 
 def _wizard_prompt(input_stream: TextIO, output_stream: TextIO, prompt: str) -> str:
@@ -1233,7 +1584,11 @@ def header_protection_key_for_config(config: dict[str, Any]) -> bytes | None:
     path = pathlib.Path(
         normalized["obfuscation"]["profile"]["header_protection_key_path"]
     )
-    return read_header_protection_key(path)
+    return read_header_protection_key(
+        path,
+        expected_uid=os.geteuid(),
+        expected_gid=os.getegid(),
+    )
 
 
 def obfuscation_status(config: dict[str, Any]) -> dict[str, str]:
@@ -1241,7 +1596,11 @@ def obfuscation_status(config: dict[str, Any]) -> dict[str, str]:
     profile = normalized["obfuscation"]["profile"]
     result = {"mode": normalized["obfuscation"]["mode"], "profile": profile["name"]}
     if normalized["obfuscation"]["mode"] == "awg31":
-        material = read_header_protection_key(pathlib.Path(profile["header_protection_key_path"]))
+        material = read_header_protection_key(
+            pathlib.Path(profile["header_protection_key_path"]),
+            expected_uid=os.geteuid(),
+            expected_gid=os.getegid(),
+        )
         result["header_protection_key_fingerprint"] = header_protection_fingerprint(material)
     return result
 
@@ -1552,8 +1911,8 @@ def legacy_lifecycle_hook_drift(expected: bytes, actual: bytes) -> bool:
     return legacy != expected and actual == legacy
 
 
-def ensure_no_drift() -> None:
-    expected = render_current_server().encode("utf-8")
+def ensure_no_drift(*, now: dt.datetime | None = None) -> None:
+    expected = render_current_server(now=now).encode("utf-8")
     try:
         generated = GENERATED_CONFIG.read_bytes()
         runtime = RUNTIME_CONFIG.read_bytes()
@@ -1576,7 +1935,7 @@ def is_service_active(interface: str) -> bool:
 
 def safe_awg_query(interface: str, field: str) -> str:
     # Deliberately limited: never add I1-I5 to this allowlist; querying unset values can crash awg 3.1.
-    if field not in {"public-key", "listen-port", "peers", "latest-handshakes"}:
+    if field not in {"public-key", "listen-port", "peers", "latest-handshakes", "transfer"}:
         raise AwgctlError("unsupported safe awg query")
     return run(["awg", "show", interface, field]).stdout.decode("utf-8", "replace").strip()
 
@@ -2105,7 +2464,9 @@ def _validate_restore_clients(
     return records
 
 
-def validate_restore_stage(stage: pathlib.Path) -> dict[str, Any]:
+def validate_restore_stage(
+    stage: pathlib.Path, *, now: dt.datetime | None = None
+) -> dict[str, Any]:
     try:
         config = json.loads((stage / "config/server.json").read_text(encoding="utf-8"))
         server_private = (stage / "keys/server/private").read_text(encoding="ascii").strip()
@@ -2115,7 +2476,7 @@ def validate_restore_stage(stage: pathlib.Path) -> dict[str, Any]:
     except (OSError, UnicodeError, json.JSONDecodeError) as exc:
         raise AwgctlError("backup is missing required managed state") from exc
     config = validate_server_config(config)
-    restore_now = dt.datetime.now(dt.timezone.utc)
+    restore_now = now or dt.datetime.now(dt.timezone.utc)
     validate_key(server_private, "server private key")
     validate_key(server_public, "server public key")
     derived_public = run(["awg", "pubkey"], input_data=(server_private + "\n").encode("ascii")).stdout.decode().strip()
@@ -2266,6 +2627,134 @@ def format_age(timestamp: int, *, now: int | None = None) -> str:
     if hours < 48:
         return f"{hours}h ago"
     return f"{hours // 24}d ago"
+
+
+def udp_port_is_listening(port: int) -> bool:
+    output = run(["ss", "-H", "-lun"], check=False).stdout.decode("utf-8", "replace")
+    endpoint = re.compile(rf"(?:^|[\]:]){port}$")
+    return any(
+        endpoint.search(field) is not None
+        for line in output.splitlines()
+        for field in line.split()
+    )
+
+
+def udp_port_bind_available(port: int) -> bool:
+    candidate = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        candidate.bind(("0.0.0.0", port))
+    except OSError:
+        return False
+    finally:
+        candidate.close()
+    return True
+
+
+def select_transition_port(
+    *,
+    current_port: int,
+    managed_ports: set[int],
+    randbits: Any = secrets.randbits,
+    listening_checker: Any = udp_port_is_listening,
+    bind_checker: Any = udp_port_bind_available,
+) -> int:
+    """Choose an unbiased CSPRNG UDP port after every conflict class is excluded."""
+    if not isinstance(current_port, int) or isinstance(current_port, bool):
+        raise AwgctlError("current managed UDP port is invalid")
+    if any(not isinstance(port, int) or isinstance(port, bool) for port in managed_ports):
+        raise AwgctlError("managed UDP port inventory is invalid")
+    population = 9999 - 1024 + 1
+    rejection_limit = (1 << 14) // population * population
+    for _ in range(4096):
+        draw = randbits(14)
+        if not isinstance(draw, int) or isinstance(draw, bool) or not 0 <= draw < (1 << 14):
+            raise AwgctlError("CSPRNG returned an invalid UDP port sample")
+        if draw >= rejection_limit:
+            continue
+        candidate = 1024 + draw
+        if candidate == current_port or candidate in managed_ports:
+            continue
+        if listening_checker(candidate) or not bind_checker(candidate):
+            continue
+        return candidate
+    raise AwgctlError("cannot select an unused UDP port after bounded attempts")
+
+
+def _digest_managed_entry(digest: Any, path: pathlib.Path, label: str) -> None:
+    try:
+        metadata = path.lstat()
+    except FileNotFoundError:
+        digest.update(f"missing:{label}\0".encode("utf-8"))
+        return
+    except OSError as exc:
+        raise AwgctlError("cannot inspect managed transition prestate") from exc
+    if stat.S_ISLNK(metadata.st_mode):
+        raise AwgctlError("managed transition prestate contains a symbolic link")
+    digest.update(
+        f"{label}\0{stat.S_IFMT(metadata.st_mode):o}\0{stat.S_IMODE(metadata.st_mode):o}\0".encode(
+            "utf-8"
+        )
+    )
+    if stat.S_ISDIR(metadata.st_mode):
+        try:
+            names = sorted(os.listdir(path))
+        except OSError as exc:
+            raise AwgctlError("cannot inspect managed transition prestate") from exc
+        for name in names:
+            _digest_managed_entry(digest, path / name, f"{label}/{name}")
+        return
+    if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+        raise AwgctlError("managed transition prestate contains an unsafe file")
+    try:
+        descriptor = os.open(
+            path,
+            os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0),
+        )
+        try:
+            opened = os.fstat(descriptor)
+            if (
+                not stat.S_ISREG(opened.st_mode)
+                or opened.st_nlink != 1
+                or (opened.st_dev, opened.st_ino) != (metadata.st_dev, metadata.st_ino)
+            ):
+                raise AwgctlError("managed transition prestate file changed during inspection")
+            while True:
+                chunk = os.read(descriptor, 64 * 1024)
+                if not chunk:
+                    break
+                digest.update(chunk)
+        finally:
+            os.close(descriptor)
+    except AwgctlError:
+        raise
+    except OSError as exc:
+        raise AwgctlError("cannot read managed transition prestate") from exc
+    digest.update(b"\0")
+
+
+def managed_transition_prestate_digest() -> str:
+    digest = hashlib.sha256()
+    for path, label in (
+        (CONFIG_FILE, "config/server.json"),
+        (INSTALLATION_CONFIG, "config/installation.json"),
+        (SERVER_PRIVATE, "keys/server/private"),
+        (SERVER_PUBLIC, "keys/server/public"),
+        (HEADER_PROTECTION_KEY, "keys/server/header-protection"),
+        (CLIENT_KEYS, "keys/clients"),
+        (CLIENTS, "clients"),
+        (GENERATED, "generated"),
+        (RUNTIME_CONFIG, "runtime/awg0.conf"),
+    ):
+        _digest_managed_entry(digest, path, label)
+    return digest.hexdigest()
+
+
+def pending_transition_artifact_digest(root: pathlib.Path) -> str:
+    if not root.is_dir() or root.is_symlink():
+        raise AwgctlError("pending transition artifact root is missing or unsafe")
+    digest = hashlib.sha256()
+    _digest_managed_entry(digest, root, "pending")
+    return digest.hexdigest()
 
 
 def suspicious_wildcard_listeners(
@@ -2444,6 +2933,24 @@ def handshake_map(interface: str) -> dict[str, int]:
     return result
 
 
+def transfer_map(interface: str) -> dict[str, tuple[int, int]]:
+    output = safe_awg_query(interface, "transfer")
+    result: dict[str, tuple[int, int]] = {}
+    for line in output.splitlines():
+        fields = line.split()
+        if len(fields) != 3:
+            continue
+        try:
+            public_key = validate_key(fields[0], "managed peer public key")
+            received = int(fields[1])
+            transmitted = int(fields[2])
+        except (AwgctlError, ValueError):
+            continue
+        if received >= 0 and transmitted >= 0:
+            result[public_key] = (received, transmitted)
+    return result
+
+
 def parse_import_profile(
     profile_text: str,
     config: dict[str, Any],
@@ -2564,6 +3071,26 @@ def cmd_aws_rule(config: dict[str, Any] | None = None, *, as_json: bool = False)
 def cmd_status(args: argparse.Namespace) -> int:
     config = load_config()
     obfuscation_data = obfuscation_status(config)
+    try:
+        transition_summary = obfuscation_summary(config)
+    except (AwgctlError, OSError):
+        transition_summary = {
+            "mode": obfuscation_data["mode"],
+            "profile": obfuscation_data["profile"],
+            "profile_revisions": {},
+            "server_client_consistency": False,
+            "transition": {
+                "client": None,
+                "deadline_at": None,
+                "state": "unavailable",
+                "transaction_id": None,
+            },
+            "versions": {
+                "policy_version": AWG31_QUALIFICATION_POLICY_VERSION,
+                "tools_version": None,
+                "module_version": None,
+            },
+        }
     boundary = ingress_boundary_attestation()
     active, enabled = systemctl_state(config["interface"])
     link_result = run(["ip", "-brief", "link", "show", config["interface"]], check=False)
@@ -2583,6 +3110,7 @@ def cmd_status(args: argparse.Namespace) -> int:
             "address": str(ipaddress.ip_interface(client["address"]).ip),
             "status": effective_client_status(client),
             "management": client.get("management", "managed"),
+            "profile_revision": client.get("profile_revision"),
             "last_handshake": format_age(handshakes.get(client["public_key"], 0)),
         }
         for client in clients
@@ -2595,6 +3123,12 @@ def cmd_status(args: argparse.Namespace) -> int:
         "public_ipv4": public_ip,
         "subnet": config["subnet"],
         "obfuscation": obfuscation_data,
+        "mode": transition_summary["mode"],
+        "profile": transition_summary["profile"],
+        "profile_revisions": transition_summary["profile_revisions"],
+        "server_client_consistency": transition_summary["server_client_consistency"],
+        "transition": transition_summary["transition"],
+        "versions": transition_summary["versions"],
         "forwarding": forwarding,
         "nat": nft_table_active("amneziawg_nat"),
         "isolation": nft_table_active("amneziawg_forward"),
@@ -2628,6 +3162,28 @@ def cmd_status(args: argparse.Namespace) -> int:
             "  header key:     sha256:"
             + obfuscation_data["header_protection_key_fingerprint"]
         )
+    print(
+        "  transition:     "
+        f"{transition_summary['transition']['state']}"
+        + (
+            f" deadline={transition_summary['transition']['deadline_at']}"
+            if transition_summary["transition"]["deadline_at"]
+            else ""
+        )
+    )
+    print(
+        "  versions:       tools="
+        f"{transition_summary['versions']['tools_version'] or 'unavailable'} "
+        f"module={transition_summary['versions']['module_version'] or 'unavailable'}"
+    )
+    print(
+        "  consistency:    "
+        + (
+            "server/client consistent"
+            if transition_summary["server_client_consistency"]
+            else "server/client inconsistent"
+        )
+    )
     print(f"  forwarding:     {'enabled' if forwarding else 'disabled'}")
     print(f"  NAT:            {'active' if nft_table_active('amneziawg_nat') else 'inactive'}")
     print(f"  isolation:      {'active' if nft_table_active('amneziawg_forward') else 'inactive'}")
@@ -2802,6 +3358,55 @@ def cmd_health(args: argparse.Namespace) -> int:
     def add(level: str, name: str, detail: str) -> None:
         checks.append((level, name, detail))
 
+    try:
+        transition_summary = obfuscation_summary(config)
+    except (AwgctlError, OSError) as exc:
+        transition_summary = {
+            "mode": config.get("obfuscation", {}).get("mode", "unavailable"),
+            "profile": "unavailable",
+            "profile_revisions": {},
+            "server_client_consistency": False,
+            "transition": {
+                "client": None,
+                "deadline_at": None,
+                "state": "unavailable",
+                "transaction_id": None,
+            },
+            "versions": {
+                "policy_version": AWG31_QUALIFICATION_POLICY_VERSION,
+                "tools_version": None,
+                "module_version": None,
+            },
+        }
+        add("FAIL", "obfuscation state", str(exc))
+    else:
+        add(
+            "PASS",
+            "obfuscation state",
+            f"{transition_summary['mode']} ({transition_summary['profile']})",
+        )
+        versions = transition_summary["versions"]
+        add(
+            "PASS" if versions["tools_version"] and versions["module_version"] else "WARN",
+            "AmneziaWG versions",
+            f"tools={versions['tools_version'] or 'unavailable'} "
+            f"module={versions['module_version'] or 'unavailable'}",
+        )
+        transition = transition_summary["transition"]
+        add(
+            "PASS",
+            "obfuscation transition",
+            transition["state"]
+            + (f" deadline={transition['deadline_at']}" if transition["deadline_at"] else ""),
+        )
+        add(
+            "PASS" if transition_summary["server_client_consistency"] else "FAIL",
+            "server/client consistency",
+            "canonical server and managed profiles agree"
+            if transition_summary["server_client_consistency"]
+            else "canonical server or managed profile drift",
+        )
+
     active, enabled = systemctl_state(config["interface"])
     add("PASS" if active == "active" else "FAIL", "service", active)
     add("PASS" if enabled == "enabled" else "FAIL", "boot", enabled)
@@ -2963,7 +3568,20 @@ def cmd_health(args: argparse.Namespace) -> int:
     failures = sum(1 for level, _, _ in checks if level == "FAIL")
     warnings = sum(1 for level, _, _ in checks if level == "WARN")
     if getattr(args, "json", False):
-        print(json.dumps(health_envelope(checks), indent=2, sort_keys=True))
+        envelope = health_envelope(checks)
+        envelope["data"].update(
+            mode=transition_summary["mode"],
+            profile=transition_summary["profile"],
+            profile_revisions=transition_summary["profile_revisions"],
+            server_client_consistency=transition_summary["server_client_consistency"],
+            transition=transition_summary["transition"],
+            versions=transition_summary["versions"],
+        )
+        if "header_protection_key_fingerprint" in transition_summary:
+            envelope["data"]["header_protection_key_fingerprint"] = transition_summary[
+                "header_protection_key_fingerprint"
+            ]
+        print(json.dumps(envelope, indent=2, sort_keys=True))
         return 3 if failures else 0
     print("AmneziaWG health")
     for level, name, detail in checks:
@@ -3060,6 +3678,1135 @@ def cmd_client_expire(args: argparse.Namespace) -> int:
         argv.append("--json")
     result = run(argv, timeout=90)
     sys.stdout.write(result.stdout.decode("utf-8", "replace"))
+    return 0
+
+
+def _prepare_transition_clients(
+    clients: Sequence[dict[str, Any]],
+    client_name: str,
+    *,
+    now: dt.datetime,
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    target = next((client for client in clients if client.get("name") == client_name), None)
+    if target is None or target.get("management", "managed") != "managed":
+        raise AwgctlError(f"unknown managed client: {client_name}")
+    if effective_client_status(target, now=now) != "active":
+        raise AwgctlError(f"client is not eligible for transition: {client_name}")
+    eligible = [client for client in clients if client_is_server_eligible(client, now=now)]
+    external = [
+        client["name"]
+        for client in eligible
+        if client.get("management", "managed") != "managed"
+    ]
+    if external:
+        raise AwgctlError(
+            "active external peers prevent a complete AWG 3.1 profile cutover: "
+            + ", ".join(sorted(external))
+        )
+    managed = [
+        client for client in clients if client.get("management", "managed") == "managed"
+    ]
+    if not managed:
+        raise AwgctlError("no managed clients are available for transition")
+    return target, sorted(managed, key=lambda item: item["name"])
+
+
+def _verify_managed_profiles_before_transition(
+    config: dict[str, Any], clients: Sequence[dict[str, Any]]
+) -> set[int]:
+    server_public = server_public_key()
+    header_key = header_protection_key_for_config(config)
+    ports = {config["listen_port"]}
+    for client in clients:
+        expected = render_client_config(
+            config,
+            client["private_key"],
+            client.get("psk"),
+            server_public,
+            client["address"],
+            header_protection_key=header_key,
+        ).encode("utf-8")
+        path = CLIENTS / client["name"] / f"{client['name']}.conf"
+        try:
+            actual = path.read_bytes()
+        except OSError as exc:
+            raise AwgctlError(
+                f"cannot read managed client profile before transition: {client['name']}"
+            ) from exc
+        if actual != expected:
+            raise AwgctlError(
+                f"managed client profile drift prevents transition: {client['name']}"
+            )
+    return ports
+
+
+def _utc_z(value: dt.datetime) -> str:
+    return (
+        value.astimezone(dt.timezone.utc)
+        .replace(microsecond=0)
+        .isoformat()
+        .replace("+00:00", "Z")
+    )
+
+
+def _validate_pending_tree(root: pathlib.Path) -> None:
+    try:
+        entries = [root, *sorted(root.rglob("*"))]
+    except OSError as exc:
+        raise AwgctlError("cannot inspect pending transition artifacts") from exc
+    for path in entries:
+        try:
+            metadata = path.lstat()
+        except OSError as exc:
+            raise AwgctlError("cannot inspect pending transition artifacts") from exc
+        if (metadata.st_uid, metadata.st_gid) != (os.geteuid(), os.getegid()):
+            raise AwgctlError("pending transition artifact ownership is invalid")
+        if stat.S_ISDIR(metadata.st_mode):
+            if stat.S_IMODE(metadata.st_mode) != 0o700:
+                raise AwgctlError("pending transition artifact directory is not private")
+        elif (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_nlink != 1
+            or stat.S_IMODE(metadata.st_mode) != 0o600
+        ):
+            raise AwgctlError("pending transition artifact file is unsafe")
+
+
+def validate_pending_transition_artifacts(
+    document: dict[str, Any],
+    clients: Sequence[dict[str, Any]],
+    *,
+    now: dt.datetime,
+) -> tuple[dict[str, Any], str, bytes]:
+    document = normalize_transition_document(document)
+    root = pathlib.Path(document["pending"]["root"])
+    _validate_pending_tree(root)
+    if pending_transition_artifact_digest(root) != document["pending_sha256"]:
+        raise AwgctlError("pending transition artifact integrity check failed")
+    state_value = _read_protected_json(pathlib.Path(document["pending"]["server_state"]))
+    if state_value is None:
+        raise AwgctlError("pending transition server state is missing")
+    config = validate_server_config(state_value)
+    if (
+        config["obfuscation"]["mode"] != "awg31"
+        or config["obfuscation"]["profile"]["name"] != document["profile_name"]
+        or config["listen_port"] != document["new_port"]
+    ):
+        raise AwgctlError("pending transition server state differs from the transaction")
+    header = read_header_protection_key(
+        pathlib.Path(document["pending"]["header_key"]),
+        expected_uid=os.geteuid(),
+        expected_gid=os.getegid(),
+    )
+    pending_server = _restore_text(
+        pathlib.Path(document["pending"]["server_config"]),
+        label="pending transition server configuration",
+    )
+    expected_server = render_server_config(
+        config,
+        server_private_key(),
+        clients,
+        now=now,
+        header_protection_key=header,
+    )
+    if pending_server != expected_server:
+        raise AwgctlError("pending transition server configuration is not canonical")
+    by_name = {client["name"]: client for client in clients}
+    server_public = server_public_key()
+    for entry in document["pending"]["profiles"]:
+        client = by_name.get(entry["name"])
+        if (
+            client is None
+            or client.get("management", "managed") != "managed"
+            or client.get("profile_revision") != entry["current_revision"]
+        ):
+            raise AwgctlError("pending transition profile identity changed")
+        actual = _restore_text(
+            pathlib.Path(entry["config"]),
+            label=f"pending transition profile: {entry['name']}",
+        )
+        expected = render_client_config(
+            config,
+            client["private_key"],
+            client.get("psk"),
+            server_public,
+            client["address"],
+            header_protection_key=header,
+        )
+        if actual != expected:
+            raise AwgctlError(
+                f"pending transition profile is not canonical: {entry['name']}"
+            )
+    expected_names = sorted(
+        client["name"]
+        for client in clients
+        if client.get("management", "managed") == "managed"
+    )
+    if [entry["name"] for entry in document["pending"]["profiles"]] != expected_names:
+        raise AwgctlError("pending transition profile inventory changed")
+    validate_native_server(pending_server)
+    return config, pending_server, header
+
+
+def verify_transition_backup_precondition(
+    backup_name: str,
+    current_config: dict[str, Any],
+    *,
+    now: dt.datetime | None = None,
+) -> pathlib.Path:
+    backup, _ = verify_managed_backup(pathlib.Path(backup_name))
+    backup_config = validate_restore_stage(backup, now=now)
+    if backup_config["obfuscation"]["mode"] != "classic" or backup_config != current_config:
+        raise AwgctlError("transition backup is not the exact classic prestate")
+    try:
+        if (backup / "generated/awg0.conf").read_bytes() != GENERATED_CONFIG.read_bytes():
+            raise AwgctlError("transition backup generated state differs from the classic prestate")
+    except OSError as exc:
+        raise AwgctlError("cannot compare transition backup prestate") from exc
+    return backup
+
+
+def verify_active_transition_postcondition(
+    config: dict[str, Any],
+    server_text: str,
+    clients: Sequence[dict[str, Any]],
+    *,
+    now: dt.datetime,
+) -> None:
+    if load_config() != config:
+        raise AwgctlError("active transition server state was not installed exactly")
+    try:
+        generated = GENERATED_CONFIG.read_text(encoding="utf-8")
+        runtime = RUNTIME_CONFIG.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise AwgctlError("cannot verify active transition configuration") from exc
+    if generated != server_text or runtime != server_text or render_current_server(
+        clients, now=now
+    ) != server_text:
+        raise AwgctlError("active transition server configuration is inconsistent")
+    if safe_awg_query(config["interface"], "public-key") != server_public_key():
+        raise AwgctlError("active transition server identity verification failed")
+    if safe_awg_query(config["interface"], "listen-port") != str(config["listen_port"]):
+        raise AwgctlError("active transition UDP port verification failed")
+    expected_peers = {
+        client["public_key"]
+        for client in clients
+        if client_is_server_eligible(client, now=now)
+    }
+    if live_peers(config["interface"]) != expected_peers:
+        raise AwgctlError("active transition peer set verification failed")
+
+
+def schedule_transition_timeout(transaction_id: str, timeout: str) -> None:
+    transaction_id = validate_transaction_id(transaction_id)
+    if timeout != "10m":
+        raise AwgctlError("obfuscation activation timeout must be exactly 10m")
+    unit = f"awgctl-obfuscation-rollback-{transaction_id}"
+    run(
+        [
+            "systemd-run",
+            "--quiet",
+            "--collect",
+            "--unit",
+            unit,
+            "--on-active=10m",
+            str(INTERNAL_ENTRYPOINT),
+            "_obfuscation-timeout",
+            transaction_id,
+        ],
+        timeout=15,
+    )
+
+
+def transition_unit_names(transaction_id: str) -> tuple[str, str]:
+    transaction_id = validate_transaction_id(transaction_id)
+    base = f"awgctl-obfuscation-rollback-{transaction_id}"
+    return f"{base}.timer", f"{base}.service"
+
+
+def cancel_transition_timeout(transaction_id: str) -> None:
+    timer, service = transition_unit_names(transaction_id)
+    run(["systemctl", "stop", timer, service], check=False, timeout=45)
+    still_active = [
+        unit
+        for unit in (timer, service)
+        if run(["systemctl", "is-active", "--quiet", unit], check=False).returncode == 0
+    ]
+    if still_active:
+        raise AwgctlError("automatic rollback timer cancellation could not be verified")
+
+
+def normalize_transition_outcome(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        raise AwgctlError("obfuscation transition outcome must be an object")
+    fields = {
+        "schema_version",
+        "transaction_id",
+        "outcome",
+        "reason",
+        "completed_at",
+        "client_name",
+        "profile_name",
+        "old_port",
+        "new_port",
+    }
+    if set(value) != fields:
+        raise AwgctlError("obfuscation transition outcome fields are incomplete or unexpected")
+    schema = value["schema_version"]
+    if not isinstance(schema, int) or isinstance(schema, bool) or schema != 1:
+        raise AwgctlError("unsupported obfuscation transition outcome schema")
+    validate_transaction_id(value["transaction_id"])
+    if value["outcome"] not in {"confirmed", "rolled_back"}:
+        raise AwgctlError("invalid obfuscation transition outcome")
+    reasons = {"confirmed", "operator", "timeout", "activation-failed"}
+    if value["reason"] not in reasons:
+        raise AwgctlError("invalid obfuscation transition outcome reason")
+    if (value["outcome"] == "confirmed") != (value["reason"] == "confirmed"):
+        raise AwgctlError("inconsistent obfuscation transition outcome")
+    _transition_time(value["completed_at"], "completed_at")
+    validate_client_name(value["client_name"])
+    if value["profile_name"] != "russia-ios-v1":
+        raise AwgctlError("invalid obfuscation transition outcome profile")
+    for field in ("old_port", "new_port"):
+        port = value[field]
+        if not isinstance(port, int) or isinstance(port, bool) or not 1 <= port <= 65535:
+            raise AwgctlError("invalid obfuscation transition outcome port")
+    if not 1024 <= value["new_port"] <= 9999 or value["new_port"] == value["old_port"]:
+        raise AwgctlError("invalid obfuscation transition outcome port")
+    return copy.deepcopy(value)
+
+
+def load_transition_outcome() -> dict[str, Any] | None:
+    value = _read_protected_json(TRANSITION_OUTCOME_FILE)
+    return None if value is None else normalize_transition_outcome(value)
+
+
+def complete_transition_document(
+    document: dict[str, Any], *, outcome: str, reason: str, completed_at: str
+) -> dict[str, Any]:
+    document = normalize_transition_document(document)
+    current = load_transition_document()
+    if current != document:
+        raise AwgctlError("obfuscation transition changed; stale completion rejected")
+    result = normalize_transition_outcome(
+        {
+            "schema_version": 1,
+            "transaction_id": document["transaction_id"],
+            "outcome": outcome,
+            "reason": reason,
+            "completed_at": completed_at,
+            "client_name": document["client_name"],
+            "profile_name": document["profile_name"],
+            "old_port": document["old_port"],
+            "new_port": document["new_port"],
+        }
+    )
+    ensure_transition_layout()
+    atomic_json(TRANSITION_OUTCOME_FILE, result, 0o600)
+    if load_transition_outcome() != result:
+        raise AwgctlError("obfuscation transition outcome write could not be verified")
+    pending_root = pathlib.Path(document["pending"]["root"])
+    shutil.rmtree(pending_root, ignore_errors=False)
+    if pending_root.exists() or pending_root.is_symlink():
+        raise AwgctlError("pending transition artifacts could not be removed")
+    TRANSITION_FILE.unlink()
+    fsync_directory(TRANSITION_FILE.parent)
+    return result
+
+
+def restore_obfuscation_backup(
+    backup_name: str,
+    document: dict[str, Any],
+    *,
+    now: dt.datetime | None = None,
+) -> None:
+    """Restore the exact protected classic backup without acquiring the mutation lock."""
+    document = normalize_transition_document(document)
+    backup, _ = verify_managed_backup(pathlib.Path(backup_name))
+    stage = pathlib.Path(tempfile.mkdtemp(prefix=".obfuscation-restore-", dir=ROOT))
+    displaced = pathlib.Path(tempfile.mkdtemp(prefix=".obfuscation-displaced-", dir=ROOT))
+    moved: list[str] = []
+    try:
+        for component in RESTORE_COMPONENTS:
+            source = backup / component
+            destination = stage / component
+            if source.is_dir():
+                shutil.copytree(source, destination)
+            else:
+                destination.mkdir(parents=True, mode=0o700)
+        chmod_secret_tree(stage)
+        restore_now = now or dt.datetime.now(dt.timezone.utc)
+        classic = validate_restore_stage(stage, now=restore_now)
+        if (
+            classic["obfuscation"]["mode"] != "classic"
+            or classic["listen_port"] != document["old_port"]
+        ):
+            raise AwgctlError("transition backup does not contain the exact classic prestate")
+        for component in RESTORE_COMPONENTS:
+            current = ROOT / component
+            if current.exists():
+                os.replace(current, displaced / component)
+            os.replace(stage / component, current)
+            moved.append(component)
+        fsync_directory(ROOT)
+        atomic_write(RUNTIME_CONFIG, GENERATED_CONFIG.read_bytes(), 0o600)
+        service_action("reload", classic["interface"])
+        restored_clients = load_clients(include_secrets=True)
+        expected = render_current_server(restored_clients, now=restore_now)
+        if (
+            load_config() != classic
+            or GENERATED_CONFIG.read_text(encoding="utf-8") != expected
+            or RUNTIME_CONFIG.read_text(encoding="utf-8") != expected
+            or safe_awg_query(classic["interface"], "public-key") != server_public_key()
+            or safe_awg_query(classic["interface"], "listen-port") != str(document["old_port"])
+            or live_peers(classic["interface"])
+            != {
+                client["public_key"]
+                for client in restored_clients
+                if client_is_server_eligible(client, now=restore_now)
+            }
+        ):
+            raise AwgctlError("classic rollback postcondition could not be verified")
+    except Exception as exc:
+        raise AwgctlError("classic rollback could not be proven") from exc
+    finally:
+        shutil.rmtree(stage, ignore_errors=True)
+        shutil.rmtree(displaced, ignore_errors=True)
+
+
+def _install_active_transition(
+    document: dict[str, Any],
+    pending_config: dict[str, Any],
+    pending_server: str,
+    header: bytes,
+    clients: Sequence[dict[str, Any]],
+    *,
+    activation_now: dt.datetime,
+    pre_rx: int,
+    pre_tx: int,
+    timeout: str,
+) -> dict[str, Any]:
+    atomic_json(CONFIG_FILE, pending_config, 0o600)
+    atomic_write(HEADER_PROTECTION_KEY, header, 0o600)
+    for entry in document["pending"]["profiles"]:
+        destination = CLIENTS / entry["name"]
+        profile = _read_restore_artifact(
+            pathlib.Path(entry["config"]),
+            label=f"pending transition profile: {entry['name']}",
+            maximum=64 * 1024,
+        )
+        qr = _read_restore_artifact(
+            pathlib.Path(entry["qr"]),
+            label=f"pending transition QR: {entry['name']}",
+            maximum=4 * 1024 * 1024,
+        )
+        atomic_write(destination / f"{entry['name']}.conf", profile, 0o600)
+        atomic_write(destination / f"{entry['name']}.png", qr, 0o600)
+    if not commit_server_config(pending_server, runtime_action="reload"):
+        raise AwgctlError("activation requires an active reloaded interface")
+    verify_active_transition_postcondition(
+        pending_config,
+        pending_server,
+        clients,
+        now=activation_now,
+    )
+    active = copy.deepcopy(document)
+    active.update(
+        state="active",
+        activated_at=_utc_z(activation_now),
+        deadline_at=_utc_z(activation_now + dt.timedelta(minutes=10)),
+        pre_rx=pre_rx,
+        pre_tx=pre_tx,
+    )
+    compare_and_swap_transition(
+        active,
+        expected_transaction_id=document["transaction_id"],
+        expected_state="prepared",
+    )
+    schedule_transition_timeout(document["transaction_id"], timeout)
+    return active
+
+
+def cmd_obfuscation_prepare(args: argparse.Namespace) -> int:
+    if args.mode != "awg31" or args.profile != "russia-ios-v1":
+        raise AwgctlError("unsupported obfuscation transition mode or profile")
+    client_name = validate_client_name(args.client)
+    if getattr(args, "dry_run", False):
+        transaction_now = dt.datetime.now(dt.timezone.utc)
+        if load_transition_document(required=False) is not None:
+            raise AwgctlError("another obfuscation transition is already pending")
+        config = load_config()
+        if config["obfuscation"]["mode"] != "classic":
+            raise AwgctlError("AWG 3.1 preparation requires classic active mode")
+        _prepare_transition_clients(load_clients(), client_name, now=transaction_now)
+        boundary = ingress_boundary_attestation()
+        if boundary not in {"lightsail", "equivalent-external-firewall"}:
+            raise AwgctlError("persisted ingress boundary attestation is required")
+        require_awg31_capability()
+        data = {
+            "client": client_name,
+            "dry_run": True,
+            "ingress_boundary": boundary,
+            "mode": "awg31",
+            "planned_checks": [
+                "exact managed client eligibility",
+                "qualified tools/module pair",
+                "persisted ingress attestation",
+                "unused UDP port 1024..9999 at execution",
+                "complete managed profile set",
+            ],
+            "profile": "russia-ios-v1",
+            "required_ingress": {
+                "port": "selected-at-execution",
+                "protocol": "UDP",
+                "source": "0.0.0.0/0",
+                "type": "Custom",
+            },
+            "runtime_action": "none",
+        }
+        if getattr(args, "json", False):
+            print(
+                json.dumps(
+                    json_envelope("obfuscation prepare", data=data),
+                    indent=2,
+                    sort_keys=True,
+                )
+            )
+        else:
+            print(f"Dry run: prepare {args.profile} for {client_name}")
+            print(f"  attested ingress boundary: {boundary}")
+            print("  execution will select and persist one unused UDP port from 1024..9999")
+            print("  runtime action: none")
+            print("No state was changed.")
+        return 0
+    pending_root: pathlib.Path | None = None
+    transaction_id: str | None = None
+    with mutation_lock():
+        transaction_now = dt.datetime.now(dt.timezone.utc)
+        ensure_no_drift(now=transaction_now)
+        if load_transition_document(required=False) is not None:
+            raise AwgctlError("another obfuscation transition is already pending")
+        config = load_config()
+        if config["obfuscation"]["mode"] != "classic":
+            raise AwgctlError("AWG 3.1 preparation requires classic active mode")
+        if HEADER_PROTECTION_KEY.exists():
+            raise AwgctlError("classic state contains an unexpected header-protection key")
+        clients = load_clients(include_secrets=True)
+        _, managed_clients = _prepare_transition_clients(
+            clients, client_name, now=transaction_now
+        )
+        boundary = ingress_boundary_attestation()
+        if boundary not in {"lightsail", "equivalent-external-firewall"}:
+            raise AwgctlError("persisted ingress boundary attestation is required")
+        managed_ports = _verify_managed_profiles_before_transition(config, managed_clients)
+
+        # This gate is deliberately the last read-only precondition before entropy or writes.
+        capability = require_awg31_capability()
+        transaction_id = validate_transaction_id(secrets.token_hex(16))
+        new_port = select_transition_port(
+            current_port=config["listen_port"], managed_ports=managed_ports
+        )
+        prestate_digest = managed_transition_prestate_digest()
+        backup = create_backup()
+        if backup.parent != BACKUPS or BACKUP_NAME_RE.fullmatch(backup.name) is None:
+            raise AwgctlError("backup creation returned an invalid managed identity")
+        pending_root = PENDING_TRANSITIONS / transaction_id
+        try:
+            ensure_transition_layout()
+            if pending_root.exists() or pending_root.is_symlink():
+                raise AwgctlError("pending transition artifact root already exists")
+            pending_root.mkdir(mode=0o700)
+            clients_root = pending_root / "clients"
+            clients_root.mkdir(mode=0o700)
+            pending_header = pending_root / "header-protection"
+            write_header_protection_key(
+                pending_header,
+                owner_uid=os.geteuid(),
+                owner_gid=os.getegid(),
+            )
+            header_material = read_header_protection_key(
+                pending_header,
+                expected_uid=os.geteuid(),
+                expected_gid=os.getegid(),
+            )
+            new_config = copy.deepcopy(config)
+            new_config["listen_port"] = new_port
+            new_config["obfuscation"] = build_russia_ios_obfuscation(
+                HEADER_PROTECTION_KEY,
+                mtu=new_config["mtu"],
+            )
+            new_config = validate_server_config(new_config)
+            pending_server = render_server_config(
+                new_config,
+                server_private_key(),
+                clients,
+                now=transaction_now,
+                header_protection_key=header_material,
+            )
+            validate_native_server(pending_server)
+            atomic_json(pending_root / "server.json", new_config, 0o600)
+            atomic_write(pending_root / "awg0.conf", pending_server, 0o600)
+            profile_entries: list[dict[str, Any]] = []
+            server_public = server_public_key()
+            for client in managed_clients:
+                profile_root = clients_root / client["name"]
+                profile_root.mkdir(mode=0o700)
+                profile_path = profile_root / f"{client['name']}.conf"
+                qr_path = profile_root / f"{client['name']}.png"
+                profile_text = render_client_config(
+                    new_config,
+                    client["private_key"],
+                    client.get("psk"),
+                    server_public,
+                    client["address"],
+                    header_protection_key=header_material,
+                )
+                atomic_write(profile_path, profile_text, 0o600)
+                generate_qr(profile_text, qr_path)
+                profile_entries.append(
+                    {
+                        "name": client["name"],
+                        "config": str(profile_path),
+                        "qr": str(qr_path),
+                        "current_revision": client["profile_revision"],
+                    }
+                )
+            pending_digest = pending_transition_artifact_digest(pending_root)
+            document = {
+                "schema_version": 1,
+                "transaction_id": transaction_id,
+                "state": "prepared",
+                "mode": "awg31",
+                "profile_name": "russia-ios-v1",
+                "client_name": client_name,
+                "old_port": config["listen_port"],
+                "new_port": new_port,
+                "backup_name": backup.name,
+                "pending": {
+                    "root": str(pending_root),
+                    "server_state": str(pending_root / "server.json"),
+                    "server_config": str(pending_root / "awg0.conf"),
+                    "header_key": str(pending_header),
+                    "profiles": profile_entries,
+                },
+                "ingress_boundary": boundary,
+                "capability": capability,
+                "prepared_at": _utc_z(transaction_now),
+                "activated_at": None,
+                "deadline_at": None,
+                "pre_rx": None,
+                "pre_tx": None,
+                "prestate_sha256": prestate_digest,
+                "pending_sha256": pending_digest,
+            }
+            compare_and_swap_transition(
+                document,
+                expected_transaction_id=None,
+                expected_state=None,
+            )
+        except Exception:
+            if transaction_id is not None:
+                with contextlib.suppress(AwgctlError):
+                    current = load_transition_document(required=False)
+                    if current is not None and current["transaction_id"] == transaction_id:
+                        TRANSITION_FILE.unlink()
+                        fsync_directory(TRANSITION_FILE.parent)
+            if pending_root is not None:
+                shutil.rmtree(pending_root, ignore_errors=True)
+            audit("obfuscation prepare failed; pending artifacts removed")
+            raise
+        audit(f"obfuscation transition prepared: id={transaction_id}")
+        data = {
+            "backup": backup.name,
+            "client": client_name,
+            "ingress_boundary": boundary,
+            "mode": "awg31",
+            "profile": "russia-ios-v1",
+            "required_ingress": {
+                "port": new_port,
+                "protocol": "UDP",
+                "source": "0.0.0.0/0",
+                "type": "Custom",
+            },
+            "runtime_action": "none",
+            "state": "prepared",
+            "transaction_id": transaction_id,
+        }
+        if getattr(args, "json", False):
+            print(
+                json.dumps(
+                    json_envelope("obfuscation prepare", data=data),
+                    indent=2,
+                    sort_keys=True,
+                )
+            )
+        else:
+            print(f"Prepared AWG 3.1 transition: {transaction_id}")
+            print(f"Protected backup retained: {backup.name}")
+            print(
+                f"INGRESS RULE REQUIRED ({boundary}): "
+                f"Custom / UDP / {new_port} / 0.0.0.0/0"
+            )
+            print("The active interface and distributed profiles were not changed.")
+        return 0
+
+
+def cmd_obfuscation_activate(args: argparse.Namespace) -> int:
+    transaction_id = validate_transaction_id(args.transaction_id)
+    if not getattr(args, "ingress_ready", False):
+        raise AwgctlError("activation requires explicit --ingress-ready")
+    if args.timeout != "10m":
+        raise AwgctlError("obfuscation activation timeout must be exactly 10m")
+    with mutation_lock():
+        document = load_transition_document()
+        if (
+            document["transaction_id"] != transaction_id
+            or document["state"] != "prepared"
+        ):
+            raise AwgctlError("activation requires the exact prepared transaction ID")
+        activation_now = dt.datetime.now(dt.timezone.utc)
+        current_config = load_config()
+        if current_config["obfuscation"]["mode"] != "classic":
+            raise AwgctlError("prepared activation requires exact classic prestate")
+        ensure_no_drift(now=activation_now)
+        verify_transition_backup_precondition(
+            document["backup_name"], current_config, now=activation_now
+        )
+        if managed_transition_prestate_digest() != document["prestate_sha256"]:
+            raise AwgctlError("managed state changed after obfuscation preparation")
+        boundary = ingress_boundary_attestation()
+        if boundary != document["ingress_boundary"]:
+            raise AwgctlError("persisted ingress boundary changed after preparation")
+        capability = require_awg31_capability()
+        if capability != document["capability"]:
+            raise AwgctlError("AWG 3.1 capability changed after preparation")
+        if udp_port_is_listening(document["new_port"]) or not udp_port_bind_available(
+            document["new_port"]
+        ):
+            raise AwgctlError("prepared UDP port is no longer available")
+        if not is_service_active(current_config["interface"]):
+            raise AwgctlError("activation requires the classic interface to be active")
+        clients = load_clients(include_secrets=True)
+        target, _ = _prepare_transition_clients(
+            clients, document["client_name"], now=activation_now
+        )
+        pending_config, pending_server, header = validate_pending_transition_artifacts(
+            document, clients, now=activation_now
+        )
+        counters = transfer_map(current_config["interface"])
+        if target["public_key"] not in counters:
+            raise AwgctlError("cannot capture the managed client's pre-activation counters")
+        pre_rx, pre_tx = counters[target["public_key"]]
+
+        try:
+            active = _install_active_transition(
+                document,
+                pending_config,
+                pending_server,
+                header,
+                clients,
+                activation_now=activation_now,
+                pre_rx=pre_rx,
+                pre_tx=pre_tx,
+                timeout=args.timeout,
+            )
+        except Exception as original:
+            with contextlib.suppress(Exception):
+                cancel_transition_timeout(transaction_id)
+            try:
+                restore_obfuscation_backup(
+                    document["backup_name"], document, now=activation_now
+                )
+            except Exception as rollback_error:
+                with contextlib.suppress(Exception):
+                    service_action("stop", current_config["interface"])
+                audit(
+                    f"obfuscation activation failed; rollback unverified; interface stopped: id={transaction_id}"
+                )
+                raise AwgctlError(
+                    "obfuscation activation failed and classic rollback could not be proven; interface stopped"
+                ) from rollback_error
+            try:
+                current = load_transition_document()
+                if current["transaction_id"] != transaction_id:
+                    raise AwgctlError("obfuscation transition changed during activation rollback")
+                complete_transition_document(
+                    current,
+                    outcome="rolled_back",
+                    reason="activation-failed",
+                    completed_at=_utc_z(activation_now),
+                )
+            except Exception as cleanup_error:
+                with contextlib.suppress(Exception):
+                    service_action("stop", current_config["interface"])
+                audit(
+                    f"obfuscation activation rollback cleanup failed; interface stopped: id={transaction_id}"
+                )
+                raise AwgctlError(
+                    "classic state was restored but transition cleanup failed; interface stopped"
+                ) from cleanup_error
+            audit(f"obfuscation activation failed; classic state restored: id={transaction_id}")
+            raise AwgctlError(
+                "obfuscation activation failed; classic state restored"
+            ) from original
+        audit(f"obfuscation transition activated: id={transaction_id}")
+        data = {
+            "deadline_at": active["deadline_at"],
+            "mode": "awg31",
+            "profile": active["profile_name"],
+            "state": "active",
+            "transaction_id": transaction_id,
+        }
+        if getattr(args, "json", False):
+            print(
+                json.dumps(
+                    json_envelope("obfuscation activate", data=data),
+                    indent=2,
+                    sort_keys=True,
+                )
+            )
+        else:
+            print(f"Activated AWG 3.1 transition: {transaction_id}")
+            print(f"Automatic rollback deadline: {active['deadline_at']}")
+            print("Confirm only after the managed client has a fresh bidirectional session.")
+        return 0
+
+
+def cmd_obfuscation_confirm(args: argparse.Namespace) -> int:
+    transaction_id = validate_transaction_id(args.transaction_id)
+    with mutation_lock():
+        document = load_transition_document()
+        if document["transaction_id"] != transaction_id or document["state"] != "active":
+            raise AwgctlError("confirmation requires the exact active transaction ID")
+        confirm_now = dt.datetime.now(dt.timezone.utc)
+        activated_at = _transition_time(document["activated_at"], "activated_at")
+        deadline_at = _transition_time(document["deadline_at"], "deadline_at")
+        if confirm_now >= deadline_at:
+            raise AwgctlError("obfuscation confirmation deadline has passed")
+        config = load_config()
+        if (
+            config["obfuscation"]["mode"] != "awg31"
+            or config["obfuscation"]["profile"]["name"] != document["profile_name"]
+            or config["listen_port"] != document["new_port"]
+        ):
+            raise AwgctlError("active AWG 3.1 state differs from the transaction")
+        clients = load_clients()
+        target, _ = _prepare_transition_clients(
+            clients, document["client_name"], now=confirm_now
+        )
+        if not is_service_active(config["interface"]):
+            raise AwgctlError("confirmation requires the active AWG 3.1 interface")
+        handshake = handshake_map(config["interface"]).get(target["public_key"], 0)
+        counters = transfer_map(config["interface"])
+        if target["public_key"] not in counters:
+            raise AwgctlError("cannot query the managed client's transfer counters")
+        current_rx, current_tx = counters[target["public_key"]]
+        activation_epoch = int(activated_at.timestamp())
+        confirm_epoch = int(confirm_now.timestamp())
+        if (
+            handshake <= activation_epoch
+            or handshake > confirm_epoch
+            or confirm_epoch - handshake > 180
+        ):
+            raise AwgctlError(
+                "confirmation requires a fresh managed-client handshake after activation"
+            )
+        if current_rx <= document["pre_rx"] or current_tx <= document["pre_tx"]:
+            raise AwgctlError(
+                "confirmation requires increased receive and transmit counters"
+            )
+        by_name = {client["name"]: client for client in clients}
+        timestamp = _utc_z(confirm_now)
+        proposed: dict[str, dict[str, Any]] = {}
+        snapshots: dict[pathlib.Path, bytes] = {}
+        for entry in document["pending"]["profiles"]:
+            client = by_name.get(entry["name"])
+            if (
+                client is None
+                or client.get("management", "managed") != "managed"
+                or client.get("profile_revision") != entry["current_revision"]
+            ):
+                raise AwgctlError("managed profile revision changed before confirmation")
+            proposed[entry["name"]] = mark_profile_regenerated(
+                client,
+                reason="obfuscation:awg31",
+                timestamp=timestamp,
+            )
+            metadata_path = CLIENTS / entry["name"] / "metadata.json"
+            try:
+                snapshots[metadata_path] = metadata_path.read_bytes()
+            except OSError as exc:
+                raise AwgctlError("cannot snapshot client metadata before confirmation") from exc
+        cancel_transition_timeout(transaction_id)
+        try:
+            for name, metadata in proposed.items():
+                atomic_json(CLIENTS / name / "metadata.json", metadata, 0o600)
+            complete_transition_document(
+                document,
+                outcome="confirmed",
+                reason="confirmed",
+                completed_at=timestamp,
+            )
+        except Exception as original:
+            for path, content in snapshots.items():
+                with contextlib.suppress(Exception):
+                    atomic_write(path, content, 0o600)
+            with contextlib.suppress(Exception):
+                service_action("stop", config["interface"])
+            audit(f"obfuscation confirmation cleanup failed; interface stopped: id={transaction_id}")
+            raise AwgctlError(
+                "obfuscation confirmation could not be completed safely; interface stopped"
+            ) from original
+        audit(f"obfuscation transition confirmed: id={transaction_id}")
+        data = {
+            "mode": "awg31",
+            "profile": document["profile_name"],
+            "profile_acknowledgement_required": [
+                entry["name"] for entry in document["pending"]["profiles"]
+            ],
+            "remove_ingress": {
+                "port": document["old_port"],
+                "protocol": "UDP",
+                "source": "0.0.0.0/0",
+                "type": "Custom",
+            },
+            "state": "confirmed",
+            "transaction_id": transaction_id,
+        }
+        if getattr(args, "json", False):
+            print(
+                json.dumps(
+                    json_envelope("obfuscation confirm", data=data),
+                    indent=2,
+                    sort_keys=True,
+                )
+            )
+        else:
+            print(f"Confirmed AWG 3.1 transition: {transaction_id}")
+            print("Secure distribution acknowledgement is required for the new profile revision.")
+            print(
+                f"OLD INGRESS RULE CAN BE REMOVED: Custom / UDP / "
+                f"{document['old_port']} / 0.0.0.0/0"
+            )
+        return 0
+
+
+def _emit_obfuscation_rollback(
+    args: argparse.Namespace,
+    *,
+    transaction_id: str,
+    state: str,
+    idempotent: bool,
+    reason: str,
+) -> int:
+    data = {
+        "idempotent": idempotent,
+        "reason": reason,
+        "state": state,
+        "transaction_id": transaction_id,
+    }
+    command = "obfuscation timeout" if reason == "timeout" else "obfuscation rollback"
+    if getattr(args, "json", False):
+        print(json.dumps(json_envelope(command, data=data), indent=2, sort_keys=True))
+    elif reason != "timeout":
+        if idempotent:
+            print(f"Transition already completed: {transaction_id} ({state})")
+        else:
+            print(f"Rolled back obfuscation transition: {transaction_id}")
+    return 0
+
+
+def _rollback_obfuscation_transition(
+    args: argparse.Namespace, *, reason: str, cancel_timer: bool
+) -> int:
+    transaction_id = validate_transaction_id(args.transaction_id)
+    with mutation_lock():
+        current = load_transition_document(required=False)
+        if current is None:
+            outcome = load_transition_outcome()
+            if outcome is None or outcome["transaction_id"] != transaction_id:
+                raise AwgctlError("unknown or stale obfuscation transaction ID")
+            return _emit_obfuscation_rollback(
+                args,
+                transaction_id=transaction_id,
+                state=outcome["outcome"],
+                idempotent=True,
+                reason=reason,
+            )
+        if current["transaction_id"] != transaction_id:
+            raise AwgctlError("rollback transaction ID does not match the current transition")
+        rollback_now = dt.datetime.now(dt.timezone.utc)
+        if cancel_timer and current["state"] == "active":
+            with contextlib.suppress(AwgctlError):
+                cancel_transition_timeout(transaction_id)
+        try:
+            restore_obfuscation_backup(
+                current["backup_name"], current, now=rollback_now
+            )
+        except Exception as original:
+            interface = "awg0"
+            with contextlib.suppress(AwgctlError):
+                interface = load_config()["interface"]
+            with contextlib.suppress(Exception):
+                service_action("stop", interface)
+            audit(
+                f"obfuscation rollback unverified; interface stopped: id={transaction_id}"
+            )
+            raise AwgctlError(
+                "classic rollback could not be proven; interface stopped"
+            ) from original
+        completed_at = _utc_z(rollback_now)
+        try:
+            complete_transition_document(
+                current,
+                outcome="rolled_back",
+                reason=reason,
+                completed_at=completed_at,
+            )
+        except Exception as original:
+            interface = "awg0"
+            with contextlib.suppress(AwgctlError):
+                interface = load_config()["interface"]
+            with contextlib.suppress(Exception):
+                service_action("stop", interface)
+            audit(
+                f"obfuscation rollback cleanup failed; interface stopped: id={transaction_id}"
+            )
+            raise AwgctlError(
+                "classic state was restored but rollback cleanup failed; interface stopped"
+            ) from original
+        audit(f"obfuscation transition rolled back: id={transaction_id} reason={reason}")
+        return _emit_obfuscation_rollback(
+            args,
+            transaction_id=transaction_id,
+            state="rolled_back",
+            idempotent=False,
+            reason=reason,
+        )
+
+
+def cmd_obfuscation_rollback(args: argparse.Namespace) -> int:
+    return _rollback_obfuscation_transition(args, reason="operator", cancel_timer=True)
+
+
+def cmd_obfuscation_timeout(args: argparse.Namespace) -> int:
+    return _rollback_obfuscation_transition(args, reason="timeout", cancel_timer=False)
+
+
+def server_client_consistency(
+    config: dict[str, Any], clients: Sequence[dict[str, Any]]
+) -> bool:
+    try:
+        expected_server = render_server_config(
+            config,
+            server_private_key(),
+            clients,
+            header_protection_key=header_protection_key_for_config(config),
+        )
+        if (
+            GENERATED_CONFIG.read_text(encoding="utf-8") != expected_server
+            or RUNTIME_CONFIG.read_text(encoding="utf-8") != expected_server
+        ):
+            return False
+        server_public = server_public_key()
+        header = header_protection_key_for_config(config)
+        for client in clients:
+            if client.get("management", "managed") != "managed":
+                continue
+            expected = render_client_config(
+                config,
+                client["private_key"],
+                client.get("psk"),
+                server_public,
+                client["address"],
+                header_protection_key=header,
+            )
+            if (CLIENTS / client["name"] / f"{client['name']}.conf").read_text(
+                encoding="utf-8"
+            ) != expected:
+                return False
+        return True
+    except (AwgctlError, OSError, UnicodeError):
+        return False
+
+
+def obfuscation_summary(config: dict[str, Any] | None = None) -> dict[str, Any]:
+    config = config or load_config()
+    status = obfuscation_status(config)
+    clients = load_clients(include_secrets=True)
+    current = load_transition_document(required=False)
+    outcome = load_transition_outcome() if current is None else None
+    transition: dict[str, Any]
+    if current is not None:
+        transition = {
+            "client": current["client_name"],
+            "deadline_at": current["deadline_at"],
+            "state": current["state"],
+            "transaction_id": current["transaction_id"],
+        }
+    else:
+        transition = {
+            "client": outcome["client_name"] if outcome else None,
+            "deadline_at": None,
+            "state": outcome["outcome"] if outcome else "none",
+            "transaction_id": outcome["transaction_id"] if outcome else None,
+        }
+    try:
+        versions = inspect_awg_versions()
+    except AwgctlError:
+        versions = {
+            "policy_version": AWG31_QUALIFICATION_POLICY_VERSION,
+            "tools_version": None,
+            "module_version": None,
+        }
+    result: dict[str, Any] = {
+        "mode": status["mode"],
+        "profile": status["profile"],
+        "profile_revisions": {
+            client["name"]: client.get("profile_revision")
+            for client in clients
+            if client.get("management", "managed") == "managed"
+        },
+        "server_client_consistency": server_client_consistency(config, clients),
+        "transition": transition,
+        "versions": versions,
+    }
+    if "header_protection_key_fingerprint" in status:
+        result["header_protection_key_fingerprint"] = status[
+            "header_protection_key_fingerprint"
+        ]
+    return result
+
+
+def cmd_obfuscation_show(args: argparse.Namespace) -> int:
+    data = obfuscation_summary()
+    if getattr(args, "json", False):
+        print(
+            json.dumps(
+                json_envelope("obfuscation show", data=data),
+                indent=2,
+                sort_keys=True,
+            )
+        )
+    else:
+        print(f"Obfuscation: {data['mode']} ({data['profile']})")
+        print(
+            f"Transition: {data['transition']['state']}"
+            + (
+                f" deadline={data['transition']['deadline_at']}"
+                if data["transition"]["deadline_at"]
+                else ""
+            )
+        )
+        print(
+            "Versions: tools="
+            f"{data['versions']['tools_version'] or 'unavailable'} "
+            f"module={data['versions']['module_version'] or 'unavailable'}"
+        )
+        print(
+            "Server/client consistency: "
+            + ("consistent" if data["server_client_consistency"] else "inconsistent")
+        )
     return 0
 
 
@@ -4762,6 +6509,8 @@ def build_parser(*, entrypoint: str = "public") -> argparse.ArgumentParser:
         expire = subcommands.add_parser("_expire-clients", help=argparse.SUPPRESS)
         expire.add_argument("--dry-run", action="store_true")
         expire.add_argument("--json", action="store_true")
+        timeout = subcommands.add_parser("_obfuscation-timeout", help=argparse.SUPPRESS)
+        timeout.add_argument("transaction_id", type=transaction_id_argument)
         return parser
 
     def output_flag(command: argparse.ArgumentParser) -> None:
@@ -4857,6 +6606,27 @@ def build_parser(*, entrypoint: str = "public") -> argparse.ArgumentParser:
     output_flag(client_edit)
     dry_run_flag(client_edit)
 
+    obfuscation = subcommands.add_parser("obfuscation")
+    obfuscation_commands = obfuscation.add_subparsers(
+        dest="obfuscation_command", required=True
+    )
+    prepare = obfuscation_commands.add_parser("prepare")
+    prepare.add_argument("--mode", choices=("awg31",), required=True)
+    prepare.add_argument("--profile", choices=("russia-ios-v1",), required=True)
+    prepare.add_argument("--client", required=True)
+    output_flag(prepare)
+    dry_run_flag(prepare)
+    activate = obfuscation_commands.add_parser("activate")
+    activate.add_argument("transaction_id", type=transaction_id_argument)
+    activate.add_argument("--ingress-ready", action="store_true", required=True)
+    activate.add_argument("--timeout", choices=("10m",), default="10m")
+    output_flag(activate)
+    for name in ("confirm", "rollback"):
+        command = obfuscation_commands.add_parser(name)
+        command.add_argument("transaction_id", type=transaction_id_argument)
+        output_flag(command)
+    output_flag(obfuscation_commands.add_parser("show"))
+
     firewall = subcommands.add_parser("_firewall", help=argparse.SUPPRESS)
     firewall.add_argument("firewall_action", choices=("up", "down"))
     return parser
@@ -4906,6 +6676,15 @@ def dispatch(args: argparse.Namespace) -> int:
             "edit": cmd_client_edit,
         }
         return handlers[args.client_command](args)
+    if args.command == "obfuscation":
+        handlers = {
+            "prepare": cmd_obfuscation_prepare,
+            "activate": cmd_obfuscation_activate,
+            "confirm": cmd_obfuscation_confirm,
+            "rollback": cmd_obfuscation_rollback,
+            "show": cmd_obfuscation_show,
+        }
+        return handlers[args.obfuscation_command](args)
     if args.command == "_firewall":
         return cmd_firewall(args)
     if args.command == "_migrate-existing":
@@ -4914,6 +6693,8 @@ def dispatch(args: argparse.Namespace) -> int:
         return cmd_initialize_fresh(args)
     if args.command == "_expire-clients":
         return cmd_expire_clients(args)
+    if args.command == "_obfuscation-timeout":
+        return cmd_obfuscation_timeout(args)
     raise AwgctlError("unknown command")
 
 
@@ -4930,7 +6711,13 @@ def main(argv: Sequence[str] | None = None, *, entrypoint: str = "public") -> in
         public_error = sanitize_cps_text(str(exc))
         if getattr(args, "json", False):
             command = args.command
-            for attribute in ("config_command", "client_command", "backup_command", "update_action"):
+            for attribute in (
+                "config_command",
+                "client_command",
+                "obfuscation_command",
+                "backup_command",
+                "update_action",
+            ):
                 value = getattr(args, attribute, None)
                 if value:
                     command += f" {value}"
