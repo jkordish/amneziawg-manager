@@ -38,8 +38,9 @@ explicitly attested Lightsail or equivalent external-firewall ingress boundary.
 - The source-only AWG 3.1 qualifier is root/operator-triggered and refuses a
   dirty or disconnected source revision, unhealthy/non-classic production, an
   active transition, version drift, or pre-existing qualifier resources. It
-  may create only owned isolated `awgq-*` namespaces and links. It holds the
-  existing manager mutation lock and compares complete live plus aggregate
+  may create only owned isolated `awgq-*` namespaces and links. After external
+  health/status preflight it holds the existing manager mutation lock, directly
+  revalidates locked state, and compares complete live plus aggregate
   protected production snapshots before and after, never repairs a mismatch,
   and writes a closed redacted receipt only after successful cleanup. That
   receipt explicitly disclaims disposable-host, package-upgrade, future-kernel,

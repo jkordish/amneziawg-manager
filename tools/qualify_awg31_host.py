@@ -35,6 +35,9 @@ from awgctl.core import (
     LOCK_FILE,
     build_russia_ios_obfuscation,
     inspect_awg_versions,
+    load_config,
+    load_service_operation_intent,
+    load_transition_document,
     sha256_bytes,
 )
 from awgctl.diagnostics import redact_awg_config
@@ -952,6 +955,17 @@ _CLASSIC_CANDIDATE = {
     "H3": 103,
     "H4": 104,
 }
+_SAFE_STABLE_AWG_FIELDS = (
+    "public-key",
+    "private-key",
+    "listen-port",
+    "fwmark",
+    "peers",
+    "preshared-keys",
+    "endpoints",
+    "allowed-ips",
+    "persistent-keepalive",
+)
 
 
 class ProtectedReader(Protocol):
@@ -1358,34 +1372,36 @@ def capture_production_snapshot(
             command_runner, ["ip", "-j", "address", "show", "dev", "awg0"]
         ),
     )
-    peers = _normalized_peer_lines(
-        _runner_output(command_runner, ["awg", "show", "awg0", "peers"])
+    stable_live_outputs = {
+        field: _runner_output(
+            command_runner, ["awg", "show", "awg0", field]
+        )
+        for field in _SAFE_STABLE_AWG_FIELDS
+    }
+    stable_live_size = sum(len(output) for output in stable_live_outputs.values())
+    if stable_live_size == 0 or stable_live_size > 1024 * 1024:
+        _fail("complete safe live AWG state is unavailable or unbounded")
+    stable_live_configuration = b"".join(
+        field.encode("ascii") + b"\0" + stable_live_outputs[field] + b"\0"
+        for field in _SAFE_STABLE_AWG_FIELDS
     )
+    peers = _normalized_peer_lines(stable_live_outputs["peers"])
     handshake_peers = _normalized_peer_lines(
         _runner_output(
             command_runner, ["awg", "show", "awg0", "latest-handshakes"]
         ),
         handshakes=True,
     )
-    live_configuration = _runner_output(
-        command_runner, ["awg", "showconf", "awg0"]
-    )
-    if not live_configuration or len(live_configuration) > 1024 * 1024:
-        _fail("complete live AWG configuration is unavailable or unbounded")
     interface_bytes = _canonical_json(
         {
             "address": _without_volatile_fields(interface_document),
             "peers": peers,
             "handshake_peers": handshake_peers,
         }
-    ) + b"\0" + live_configuration
+    ) + b"\0" + stable_live_configuration
 
     try:
-        port = int(
-            _runner_output(
-                command_runner, ["awg", "show", "awg0", "listen-port"]
-            ).decode("ascii")
-        )
+        port = int(stable_live_outputs["listen-port"].decode("ascii"))
     except (UnicodeError, ValueError) as exc:
         raise QualificationError("invalid production listener port") from exc
     if not 1 <= port <= 65535:
@@ -1421,6 +1437,16 @@ def capture_production_snapshot(
         ],
     )
     dkms = _runner_output(command_runner, ["dkms", "status"])
+    try:
+        loaded_module = protected_reader.read_text(
+            pathlib.Path("/sys/module/amneziawg/version")
+        ).strip()
+    except (OSError, UnicodeError) as exc:
+        raise QualificationError(
+            "loaded AmneziaWG module version is unavailable during snapshot"
+        ) from exc
+    if _VERSION.fullmatch(loaded_module) is None:
+        _fail("loaded AmneziaWG module version is invalid during snapshot")
     return ProductionSnapshot(
         protected_tree_sha256=protected_digest,
         interface_sha256=sha256_bytes(interface_bytes),
@@ -1429,7 +1455,9 @@ def capture_production_snapshot(
             _canonical_json(_without_volatile_fields(nft_document))
         ),
         service_state=(service, boot),
-        package_sha256=sha256_bytes(packages + b"\0" + dkms),
+        package_sha256=sha256_bytes(
+            packages + b"\0" + dkms + b"\0" + loaded_module.encode("ascii")
+        ),
     )
 
 
@@ -1534,6 +1562,66 @@ class LiveAdapters:
             versions=versions,
         )
 
+    def verify_locked_state(
+        self,
+        *,
+        preflight: PreflightEvidence,
+        expected_tools: str,
+        expected_module: str,
+    ) -> None:
+        """Revalidate non-locking state after the manager flock is held."""
+        if self.effective_uid() != 0:
+            _fail("non-root qualification is forbidden")
+        git_prefix = ["git", "-C", str(REPO_ROOT)]
+        git_status = _runner_output(
+            self.command_runner, [*git_prefix, "status", "--porcelain=v1"]
+        )
+        head = _runner_output(
+            self.command_runner, [*git_prefix, "rev-parse", "HEAD"]
+        ).decode("ascii").strip()
+        origin_main = _runner_output(
+            self.command_runner, [*git_prefix, "rev-parse", "origin/main"]
+        ).decode("ascii").strip()
+        if git_status or head != origin_main or head != preflight.source_commit:
+            _fail("source state changed before locked qualification")
+        try:
+            config = load_config()
+            transition = load_transition_document(required=False)
+            service_operation = load_service_operation_intent(required=False)
+        except AwgctlError as exc:
+            raise QualificationError(safe_error(exc)) from exc
+        obfuscation = config.get("obfuscation")
+        if (
+            not isinstance(obfuscation, dict)
+            or obfuscation.get("mode") != "classic"
+            or transition is not None
+            or service_operation is not None
+        ):
+            _fail("classic production state changed before locked qualification")
+        service = _runner_output(
+            self.command_runner,
+            ["systemctl", "is-active", "awg-quick@awg0.service"],
+        )
+        boot = _runner_output(
+            self.command_runner,
+            ["systemctl", "is-enabled", "awg-quick@awg0.service"],
+        )
+        if service != b"active\n" or boot != b"enabled\n":
+            _fail("production service state changed before locked qualification")
+        versions = verify_preflight(
+            expected_tools=expected_tools,
+            expected_module=expected_module,
+            command_runner=self.command_runner,
+            loaded_version_reader=lambda: self.protected_reader.read_text(
+                pathlib.Path("/sys/module/amneziawg/version")
+            ),
+        )
+        kernel = _runner_output(self.command_runner, ["uname", "-r"]).decode(
+            "ascii"
+        ).strip()
+        if versions != preflight.versions or kernel != preflight.kernel:
+            _fail("native version state changed before locked qualification")
+
     def capture_snapshot(self) -> ProductionSnapshot:
         return capture_production_snapshot(
             self.command_runner, self.protected_reader
@@ -1563,8 +1651,13 @@ def execute_qualification(
 ) -> pathlib.Path:
     """Execute preflight, isolated traffic, invariant comparison, then receipt."""
     started_at = adapters.now()
+    evidence = adapters.verify_preflight(
+        expected_tools=expected_tools,
+        expected_module=expected_module,
+    )
     with adapters.mutation_exclusion():
-        evidence = adapters.verify_preflight(
+        adapters.verify_locked_state(
+            preflight=evidence,
             expected_tools=expected_tools,
             expected_module=expected_module,
         )

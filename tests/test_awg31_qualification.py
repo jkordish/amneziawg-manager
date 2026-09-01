@@ -523,8 +523,9 @@ class NamespaceQualificationTests(unittest.TestCase):
 
 
 class StaticProtectedReader:
-    def __init__(self, digest="f" * 64):
+    def __init__(self, digest="f" * 64, module="3.1.20260812\n"):
         self.value = digest
+        self.module = module
 
     def digest_paths(self, paths):
         return self.value
@@ -532,7 +533,7 @@ class StaticProtectedReader:
     def read_text(self, path):
         values = {
             pathlib.Path("/etc/os-release"): 'ID=ubuntu\nVERSION_ID="24.04"\n',
-            pathlib.Path("/sys/module/amneziawg/version"): "3.1.20260812\n",
+            pathlib.Path("/sys/module/amneziawg/version"): self.module,
         }
         return values[path]
 
@@ -582,6 +583,21 @@ def status_document():
             "service": "active",
             "transition": {"state": "none"},
         },
+    }
+
+
+def stable_live_awg_outputs(*, allowed_ips=b"peer\t10.77.42.2/32\n"):
+    peer = b"A" * 43 + b"="
+    return {
+        ("awg", "show", "awg0", "public-key"): peer + b"\n",
+        ("awg", "show", "awg0", "private-key"): b"B" * 43 + b"=\n",
+        ("awg", "show", "awg0", "listen-port"): b"55323\n",
+        ("awg", "show", "awg0", "fwmark"): b"off\n",
+        ("awg", "show", "awg0", "peers"): peer + b"\n",
+        ("awg", "show", "awg0", "preshared-keys"): peer + b"\t" + b"C" * 43 + b"=\n",
+        ("awg", "show", "awg0", "endpoints"): peer + b"\t(none)\n",
+        ("awg", "show", "awg0", "allowed-ips"): allowed_ips,
+        ("awg", "show", "awg0", "persistent-keepalive"): peer + b"\toff\n",
     }
 
 
@@ -731,6 +747,7 @@ class QualificationCliTests(unittest.TestCase):
     def test_snapshot_normalizes_only_volatile_handshakes_and_nft_counters(self):
         peer = b"A" * 43 + b"="
         common = {
+            **stable_live_awg_outputs(),
             ("ip", "-j", "address", "show", "dev", "awg0"): b'[{"ifname":"awg0","ifindex":9,"addr_info":[{"local":"10.77.42.1","valid_life_time":100}]}]',
             ("awg", "show", "awg0", "peers"): peer + b"\n",
             ("awg", "showconf", "awg0"): b"[Interface]\nPrivateKey = hidden\n\n[Peer]\nAllowedIPs = 10.77.42.2/32\n",
@@ -775,6 +792,7 @@ class QualificationCliTests(unittest.TestCase):
     def test_snapshot_detects_any_complete_live_awg_configuration_change(self):
         peer = b"A" * 43 + b"="
         common = {
+            **stable_live_awg_outputs(),
             ("ip", "-j", "address", "show", "dev", "awg0"): b'[{"ifname":"awg0","addr_info":[{"local":"10.77.42.1"}]}]',
             ("awg", "show", "awg0", "peers"): peer + b"\n",
             ("awg", "show", "awg0", "latest-handshakes"): peer + b"\t0\n",
@@ -796,13 +814,19 @@ class QualificationCliTests(unittest.TestCase):
         before = MappingRunner(
             {
                 **common,
-                ("awg", "showconf", "awg0"): b"[Peer]\nAllowedIPs = 10.77.42.2/32\n",
+                **stable_live_awg_outputs(
+                    allowed_ips=b"peer\t10.77.42.2/32\n"
+                ),
+                ("awg", "showconf", "awg0"): b"same\n",
             }
         )
         after = MappingRunner(
             {
                 **common,
-                ("awg", "showconf", "awg0"): b"[Peer]\nAllowedIPs = 10.77.42.99/32\n",
+                **stable_live_awg_outputs(
+                    allowed_ips=b"peer\t10.77.42.99/32\n"
+                ),
+                ("awg", "showconf", "awg0"): b"same\n",
             }
         )
 
@@ -814,6 +838,66 @@ class QualificationCliTests(unittest.TestCase):
         )
 
         self.assertNotEqual(first.interface_sha256, second.interface_sha256)
+
+    def test_snapshot_uses_only_closed_safe_awg_selectors(self):
+        outputs = {
+            **stable_live_awg_outputs(),
+            ("awg", "showconf", "awg0"): b"unsafe enumerating output\n",
+            ("ip", "-j", "address", "show", "dev", "awg0"): b'[{"ifname":"awg0"}]',
+            ("awg", "show", "awg0", "latest-handshakes"): b"A" * 43 + b"=\t0\n",
+            ("ss", "-H", "-lunp"): b"UNCONN 0 0 0.0.0.0:55323 0.0.0.0:*\n",
+            ("nft", "-j", "list", "ruleset"): b'{"nftables":[]}',
+            ("systemctl", "is-active", "awg-quick@awg0.service"): b"active\n",
+            ("systemctl", "is-enabled", "awg-quick@awg0.service"): b"enabled\n",
+            (
+                "dpkg-query",
+                "-W",
+                "-f=${Package}\\t${Version}\\n",
+                "amneziawg",
+                "amneziawg-tools",
+                "amneziawg-dkms",
+            ): b"packages\n",
+            ("dkms", "status"): b"dkms\n",
+        }
+        runner = MappingRunner(outputs)
+
+        qualification.capture_production_snapshot(
+            runner, StaticProtectedReader()
+        )
+
+        self.assertNotIn(("awg", "showconf", "awg0"), runner.argv)
+
+    def test_snapshot_binds_the_loaded_module_identity(self):
+        outputs = {
+            **stable_live_awg_outputs(),
+            ("awg", "showconf", "awg0"): b"same\n",
+            ("ip", "-j", "address", "show", "dev", "awg0"): b'[{"ifname":"awg0"}]',
+            ("awg", "show", "awg0", "latest-handshakes"): b"A" * 43 + b"=\t0\n",
+            ("ss", "-H", "-lunp"): b"UNCONN 0 0 0.0.0.0:55323 0.0.0.0:*\n",
+            ("nft", "-j", "list", "ruleset"): b'{"nftables":[]}',
+            ("systemctl", "is-active", "awg-quick@awg0.service"): b"active\n",
+            ("systemctl", "is-enabled", "awg-quick@awg0.service"): b"enabled\n",
+            (
+                "dpkg-query",
+                "-W",
+                "-f=${Package}\\t${Version}\\n",
+                "amneziawg",
+                "amneziawg-tools",
+                "amneziawg-dkms",
+            ): b"packages\n",
+            ("dkms", "status"): b"dkms\n",
+        }
+
+        before = qualification.capture_production_snapshot(
+            MappingRunner(outputs),
+            StaticProtectedReader(module="3.1.20260812\n"),
+        )
+        after = qualification.capture_production_snapshot(
+            MappingRunner(outputs),
+            StaticProtectedReader(module="3.1.20260813\n"),
+        )
+
+        self.assertNotEqual(before.package_sha256, after.package_sha256)
 
     def test_snapshot_turns_malformed_native_json_into_a_bounded_error(self):
         runner = MappingRunner(
@@ -893,6 +977,9 @@ class QualificationCliTests(unittest.TestCase):
                     ),
                 )
 
+            def verify_locked_state(self, **_kwargs):
+                events.append("locked-preflight")
+
             def capture_snapshot(self):
                 events.append("snapshot")
                 return snapshot
@@ -924,8 +1011,9 @@ class QualificationCliTests(unittest.TestCase):
         self.assertEqual(
             events,
             [
-                "lock-enter",
                 "preflight",
+                "lock-enter",
+                "locked-preflight",
                 "snapshot",
                 "qualify",
                 "snapshot",
