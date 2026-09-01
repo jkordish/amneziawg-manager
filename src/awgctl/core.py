@@ -84,7 +84,8 @@ ACTIVATION_JOURNAL_FILE = TRANSITIONS / "obfuscation-activation.json"
 RUNTIME_CONFIG = pathlib.Path("/etc/amnezia/amneziawg/awg0.conf")
 RUNTIME_DIR = pathlib.Path("/run/awgctl")
 LOCK_FILE = RUNTIME_DIR / "mutation.lock"
-FIREWALL_HOOK_OPERATION_ENV = "AWGCTL_FIREWALL_HOOK_OPERATION_ID"
+SERVICE_OPERATION_FILE = RUNTIME_DIR / "service-operation.json"
+PROC_ROOT = pathlib.Path("/proc")
 PUBLIC_ENTRYPOINT = pathlib.Path("/usr/local/sbin/awgctl")
 INTERNAL_ENTRYPOINT = ROOT / "libexec/awgctl-internal"
 SUDOERS_CONFIG = pathlib.Path("/etc/sudoers.d/amneziawg-manager")
@@ -195,20 +196,14 @@ def run(
     argv: Sequence[str],
     *,
     input_data: bytes | None = None,
-    environment: dict[str, str] | None = None,
     check: bool = True,
     timeout: float = 15,
 ) -> subprocess.CompletedProcess[bytes]:
     """Run without a shell; keep secret material out of the process argv."""
-    child_environment = None
-    if environment is not None:
-        child_environment = os.environ.copy()
-        child_environment.update(environment)
     try:
         result = subprocess.run(
             list(argv),
             input=input_data,
-            env=child_environment,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             check=False,
@@ -347,6 +342,7 @@ def mutation_lock(
     *,
     timeout_seconds: float | None = None,
     transition_lifecycle: bool = False,
+    service_lifecycle: bool = False,
 ) -> Iterator[None]:
     require_root()
     if timeout_seconds is not None and (
@@ -361,6 +357,8 @@ def mutation_lock(
     acquired = False
     marked = False
     previous_depth = int(getattr(_MUTATION_LOCK_STATE, "depth", 0))
+    previous_fd = getattr(_MUTATION_LOCK_STATE, "fd", None)
+    previous_released = bool(getattr(_MUTATION_LOCK_STATE, "released", False))
     try:
         try:
             fd = os.open(
@@ -400,16 +398,38 @@ def mutation_lock(
                         raise AwgctlError("mutation lock acquisition timeout")
                     time.sleep(min(0.05, remaining))
         _MUTATION_LOCK_STATE.depth = previous_depth + 1
+        _MUTATION_LOCK_STATE.fd = fd
+        _MUTATION_LOCK_STATE.released = False
         marked = True
-        reconcile_transition_recovery_locked()
-        if not transition_lifecycle and load_transition_document(required=False) is not None:
-            raise AwgctlError(
-                "obfuscation transition is pending; complete its lifecycle first"
-            )
+        if service_lifecycle:
+            if load_service_operation_intent(required=False) is None:
+                reconcile_transition_recovery_locked()
+                if load_transition_document(required=False) is not None:
+                    raise AwgctlError(
+                        "obfuscation transition is pending; complete its lifecycle first"
+                    )
+        else:
+            current_service_operation = load_service_operation_intent(required=False)
+            if current_service_operation is not None:
+                owner_pid = current_service_operation["owner_pid"]
+                owner_start_ticks = current_service_operation["owner_start_ticks"]
+                if owner_pid is not None and process_identity_is_alive(
+                    owner_pid,
+                    owner_start_ticks,
+                ):
+                    raise AwgctlError("service operation is pending")
+                reconcile_service_operation_locked()
+            reconcile_transition_recovery_locked()
+            if not transition_lifecycle and load_transition_document(required=False) is not None:
+                raise AwgctlError(
+                    "obfuscation transition is pending; complete its lifecycle first"
+                )
         yield
     finally:
         if marked:
             _MUTATION_LOCK_STATE.depth = previous_depth
+            _MUTATION_LOCK_STATE.fd = previous_fd
+            _MUTATION_LOCK_STATE.released = previous_released
         if acquired:
             fcntl.flock(fd, fcntl.LOCK_UN)
         if fd >= 0:
@@ -418,7 +438,32 @@ def mutation_lock(
 
 
 def mutation_lock_is_held() -> bool:
-    return int(getattr(_MUTATION_LOCK_STATE, "depth", 0)) > 0
+    return (
+        int(getattr(_MUTATION_LOCK_STATE, "depth", 0)) > 0
+        and not bool(getattr(_MUTATION_LOCK_STATE, "released", False))
+    )
+
+
+@contextlib.contextmanager
+def temporarily_release_mutation_lock() -> Iterator[None]:
+    depth = int(getattr(_MUTATION_LOCK_STATE, "depth", 0))
+    descriptor = getattr(_MUTATION_LOCK_STATE, "fd", None)
+    if depth != 1 or not isinstance(descriptor, int) or not mutation_lock_is_held():
+        raise AwgctlError("service operation requires one held mutation lock")
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_UN)
+    except OSError as exc:
+        raise AwgctlError("mutation lock could not be released for service operation") from exc
+    _MUTATION_LOCK_STATE.released = True
+    try:
+        yield
+    finally:
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX)
+        except OSError as exc:
+            raise AwgctlError("mutation lock could not be reacquired after service operation") from exc
+        else:
+            _MUTATION_LOCK_STATE.released = False
 
 
 def fsync_directory(path: pathlib.Path) -> None:
@@ -599,6 +644,52 @@ def validate_transaction_id(value: str) -> str:
     if not isinstance(value, str) or TRANSACTION_ID_RE.fullmatch(value) is None:
         raise AwgctlError("transaction ID must be exactly 32 lowercase hexadecimal characters")
     return value
+
+
+def _process_start_ticks(pid: int) -> int | None:
+    try:
+        text = (PROC_ROOT / str(pid) / "stat").read_text(encoding="ascii")
+    except FileNotFoundError:
+        return None
+    except (OSError, UnicodeError) as exc:
+        raise AwgctlError("service operation process identity is unavailable") from exc
+    if len(text) > 4096 or not text.startswith(f"{pid} ("):
+        raise AwgctlError("service operation process identity is invalid")
+    closing = text.rfind(")")
+    if closing < len(str(pid)) + 2:
+        raise AwgctlError("service operation process identity is invalid")
+    fields = text[closing + 1 :].strip().split()
+    if len(fields) < 20 or len(fields[0]) != 1:
+        raise AwgctlError("service operation process identity is invalid")
+    try:
+        start_ticks = int(fields[19], 10)
+    except ValueError as exc:
+        raise AwgctlError("service operation process identity is invalid") from exc
+    if not 1 <= start_ticks <= 2**63 - 1:
+        raise AwgctlError("service operation process identity is invalid")
+    return start_ticks
+
+
+def current_process_identity() -> tuple[int, int]:
+    pid = os.getpid()
+    start_ticks = _process_start_ticks(pid)
+    if start_ticks is None:
+        raise AwgctlError("service operation process identity is unavailable")
+    return pid, start_ticks
+
+
+def process_identity_is_alive(pid: int, start_ticks: int) -> bool:
+    if (
+        not isinstance(pid, int)
+        or isinstance(pid, bool)
+        or not 1 <= pid <= 2**31 - 1
+        or not isinstance(start_ticks, int)
+        or isinstance(start_ticks, bool)
+        or not 1 <= start_ticks <= 2**63 - 1
+    ):
+        raise AwgctlError("service operation process identity is invalid")
+    observed = _process_start_ticks(pid)
+    return observed is not None and observed == start_ticks
 
 
 def transaction_id_argument(value: str) -> str:
@@ -792,6 +883,101 @@ def normalize_transition_document(value: Any) -> dict[str, Any]:
     return copy.deepcopy(value)
 
 
+def normalize_service_operation_intent(value: Any) -> dict[str, Any]:
+    fields = {
+        "schema_version",
+        "operation_id",
+        "service_action",
+        "interface",
+        "phase",
+        "goal",
+        "expected_actions",
+        "next_action",
+        "transition_id",
+        "generation_sha256",
+        "owner_pid",
+        "owner_start_ticks",
+        "pre_service_active",
+        "pre_firewall_up",
+        "created_at",
+        "updated_at",
+    }
+    if not isinstance(value, dict) or set(value) != fields:
+        raise AwgctlError("service operation intent is invalid")
+    schema = value["schema_version"]
+    if not isinstance(schema, int) or isinstance(schema, bool) or schema != 1:
+        raise AwgctlError("service operation intent is invalid")
+    operation_id = validate_transaction_id(value["operation_id"])
+    service_action = value["service_action"]
+    requested_actions = {
+        "start": ["up"],
+        "stop": ["down"],
+        "restart": ["down", "up"],
+    }
+    if not isinstance(service_action, str) or service_action not in requested_actions:
+        raise AwgctlError("service operation action is invalid")
+    interface = value["interface"]
+    if not isinstance(interface, str) or INTERFACE_RE.fullmatch(interface) is None:
+        raise AwgctlError("service operation interface is invalid")
+    phase = value["phase"]
+    phases = {
+        "prepared",
+        "invoking",
+        "compensating",
+        "verified",
+    }
+    if not isinstance(phase, str) or phase not in phases:
+        raise AwgctlError("service operation phase is invalid")
+    goal = value["goal"]
+    if not isinstance(goal, str) or goal not in {"requested", "stopped"}:
+        raise AwgctlError("service operation goal is invalid")
+    if (
+        phase == "compensating" and goal != "stopped"
+    ) or (
+        phase in {"prepared", "invoking"} and goal != "requested"
+    ):
+        raise AwgctlError("service operation phase and goal are inconsistent")
+    expected_actions = value["expected_actions"]
+    expected = ["down"] if goal == "stopped" else requested_actions[service_action]
+    if expected_actions != expected:
+        raise AwgctlError("service operation action sequence is invalid")
+    next_action = value["next_action"]
+    if (
+        not isinstance(next_action, int)
+        or isinstance(next_action, bool)
+        or not 0 <= next_action <= len(expected)
+    ):
+        raise AwgctlError("service operation action progress is invalid")
+    transition_id = value["transition_id"]
+    if transition_id is not None:
+        transition_id = validate_transaction_id(transition_id)
+    generation = value["generation_sha256"]
+    if not isinstance(generation, str) or SHA256_RE.fullmatch(generation) is None:
+        raise AwgctlError("service operation generation is invalid")
+    owner_pid = value["owner_pid"]
+    owner_start_ticks = value["owner_start_ticks"]
+    if phase == "verified":
+        if owner_pid is not None or owner_start_ticks is not None:
+            raise AwgctlError("service operation recovery owner is invalid")
+    elif (
+        not isinstance(owner_pid, int)
+        or isinstance(owner_pid, bool)
+        or not 1 <= owner_pid <= 2**31 - 1
+        or not isinstance(owner_start_ticks, int)
+        or isinstance(owner_start_ticks, bool)
+        or not 1 <= owner_start_ticks <= 2**63 - 1
+    ):
+        raise AwgctlError("service operation owner is invalid")
+    for field in ("pre_service_active", "pre_firewall_up"):
+        if not isinstance(value[field], bool):
+            raise AwgctlError(f"{field} must be boolean")
+    created_at = _transition_time(value["created_at"], "created_at")
+    updated_at = _transition_time(value["updated_at"], "updated_at")
+    if updated_at < created_at:
+        raise AwgctlError("service operation timestamps are inconsistent")
+    return copy.deepcopy(value)
+
+
 def _private_directory(path: pathlib.Path, *, create: bool) -> None:
     if create:
         try:
@@ -821,6 +1007,58 @@ def ensure_transition_layout() -> None:
     _private_directory(TRANSITIONS, create=True)
     _private_directory(PENDING_TRANSITIONS.parent, create=True)
     _private_directory(PENDING_TRANSITIONS, create=True)
+
+
+def load_service_operation_intent(*, required: bool = True) -> dict[str, Any] | None:
+    value = _read_protected_json(SERVICE_OPERATION_FILE)
+    if value is None:
+        if required:
+            raise AwgctlError("service operation intent is missing")
+        return None
+    return normalize_service_operation_intent(value)
+
+
+def compare_and_swap_service_operation_intent(
+    value: dict[str, Any],
+    *,
+    expected_operation_id: str | None,
+    expected_phase: str | None,
+) -> None:
+    if not mutation_lock_is_held():
+        raise AwgctlError("service operation intent update requires the mutation lock")
+    normalized = normalize_service_operation_intent(value)
+    runtime_descriptor = _open_protected_runtime_directory()
+    os.close(runtime_descriptor)
+    current = load_service_operation_intent(required=False)
+    if expected_operation_id is None and expected_phase is None:
+        if current is not None:
+            raise AwgctlError("service operation intent changed")
+    elif (
+        current is None
+        or current["operation_id"] != validate_transaction_id(expected_operation_id)
+        or current["phase"] != expected_phase
+    ):
+        raise AwgctlError("service operation intent changed")
+    try:
+        atomic_json(SERVICE_OPERATION_FILE, normalized, 0o600)
+    except OSError as exc:
+        raise AwgctlError("service operation intent persistence failed") from exc
+    if load_service_operation_intent() != normalized:
+        raise AwgctlError("service operation intent could not be verified")
+
+
+def delete_service_operation_intent(operation_id: str) -> None:
+    if not mutation_lock_is_held():
+        raise AwgctlError("service operation intent deletion requires the mutation lock")
+    operation_id = validate_transaction_id(operation_id)
+    current = load_service_operation_intent()
+    if current["operation_id"] != operation_id:
+        raise AwgctlError("service operation intent does not match")
+    try:
+        SERVICE_OPERATION_FILE.unlink()
+        fsync_directory(SERVICE_OPERATION_FILE.parent)
+    except OSError as exc:
+        raise AwgctlError("service operation intent cleanup failed") from exc
 
 
 def _read_protected_json(path: pathlib.Path, *, maximum: int = 256 * 1024) -> Any | None:
@@ -2202,287 +2440,379 @@ def apply_firewall() -> None:
             integration_path.unlink()
 
 
-def _firewall_hook_paths(action: str) -> tuple[pathlib.Path, pathlib.Path]:
+def firewall_action_postcondition(action: str) -> bool:
     if action not in {"up", "down"}:
         raise AwgctlError("invalid firewall hook action")
-    return (
-        RUNTIME_DIR / f"firewall-hook-{action}.json",
-        RUNTIME_DIR / f"firewall-hook-{action}.consumed.json",
-    )
-
-
-def _normalize_firewall_hook_authorization(
-    value: Any,
-    *,
-    expected_action: str,
-    now: dt.datetime,
-) -> dict[str, Any]:
-    fields = {
-        "schema_version",
-        "operation_id",
-        "service_action",
-        "firewall_action",
-        "interface",
-        "transition_id",
-        "generation_sha256",
-        "issued_at",
-        "expires_at",
+    result = run(["nft", "-j", "-a", "list", "ruleset"], check=False)
+    if result.returncode != 0:
+        raise AwgctlError("cannot verify firewall lifecycle state")
+    try:
+        values = json.loads(result.stdout).get("nftables", [])
+    except (AttributeError, json.JSONDecodeError) as exc:
+        raise AwgctlError("cannot verify firewall lifecycle state") from exc
+    if not isinstance(values, list):
+        raise AwgctlError("cannot verify firewall lifecycle state")
+    tables: set[tuple[str, str]] = set()
+    docker_chain = False
+    managed_docker_rules = 0
+    try:
+        for value in values:
+            if not isinstance(value, dict):
+                raise ValueError
+            table = value.get("table")
+            if table is not None:
+                tables.add((str(table["family"]), str(table["name"])))
+            chain = value.get("chain")
+            if chain is not None and (
+                chain.get("family"), chain.get("table"), chain.get("name")
+            ) == ("ip", "filter", "DOCKER-USER"):
+                docker_chain = True
+            rule = value.get("rule")
+            if rule is not None and (
+                rule.get("family"), rule.get("table"), rule.get("chain")
+            ) == ("ip", "filter", "DOCKER-USER"):
+                comment = rule.get("comment")
+                if isinstance(comment, str) and (
+                    comment.startswith(FIREWALL_MARKER_PREFIX)
+                    or comment in LEGACY_FIREWALL_MARKERS
+                ):
+                    managed_docker_rules += 1
+    except (AttributeError, KeyError, TypeError, ValueError) as exc:
+        raise AwgctlError("cannot verify firewall lifecycle state") from exc
+    managed_tables = {
+        ("ip", "amneziawg_forward"),
+        ("ip", "amneziawg_nat"),
     }
-    if not isinstance(value, dict) or set(value) != fields:
-        raise AwgctlError("firewall hook authorization is invalid")
-    schema = value["schema_version"]
-    if not isinstance(schema, int) or isinstance(schema, bool) or schema != 1:
-        raise AwgctlError("firewall hook authorization is invalid")
-    operation_id = validate_transaction_id(value["operation_id"])
-    service_operation = value["service_action"]
-    firewall_action = value["firewall_action"]
-    expected = {
-        "start": {"up"},
-        "stop": {"down"},
-        "restart": {"down", "up"},
-    }
-    if (
-        not isinstance(service_operation, str)
-        or service_operation not in expected
-        or not isinstance(firewall_action, str)
-        or firewall_action != expected_action
-        or firewall_action not in expected[service_operation]
-    ):
-        raise AwgctlError("firewall hook authorization does not match the service operation")
-    interface = value["interface"]
-    if not isinstance(interface, str) or INTERFACE_RE.fullmatch(interface) is None:
-        raise AwgctlError("firewall hook authorization is invalid")
-    transition_id = value["transition_id"]
-    if transition_id is not None:
-        transition_id = validate_transaction_id(transition_id)
-    generation = value["generation_sha256"]
-    if not isinstance(generation, str) or SHA256_RE.fullmatch(generation) is None:
-        raise AwgctlError("firewall hook authorization is invalid")
-    issued_at = _transition_time(value["issued_at"], "issued_at")
-    expires_at = _transition_time(value["expires_at"], "expires_at")
-    if (
-        now.tzinfo is None
-        or issued_at > now
-        or now >= expires_at
-        or not dt.timedelta(0) < expires_at - issued_at <= dt.timedelta(seconds=60)
-    ):
-        raise AwgctlError("firewall hook authorization is stale")
-    normalized = copy.deepcopy(value)
-    normalized.update(
-        operation_id=operation_id,
-        service_action=service_operation,
-        firewall_action=firewall_action,
-        interface=interface,
-        transition_id=transition_id,
-        generation_sha256=generation,
-    )
-    return normalized
+    if action == "down":
+        return managed_tables.isdisjoint(tables) and managed_docker_rules == 0
+    if not managed_tables.issubset(tables):
+        return False
+    expected_docker_rules = 3 if docker_chain else 0
+    return managed_docker_rules == expected_docker_rules
 
 
-def _firewall_hook_actions(service_operation: str) -> tuple[str, ...]:
-    return {
-        "start": ("up",),
-        "stop": ("down",),
-        "restart": ("down", "up"),
-        "reload": (),
-    }[service_operation]
-
-
-def issue_firewall_hook_authorizations(
-    service_operation: str,
-    interface: str,
-    *,
-    operation_id: str | None = None,
-) -> tuple[str, ...]:
-    actions = _firewall_hook_actions(service_operation)
-    if not actions:
-        return actions
+def run_firewall_action_locked(action: str) -> None:
     if not mutation_lock_is_held():
-        raise AwgctlError("service firewall hooks require the protected mutation lock")
+        raise AwgctlError("firewall lifecycle action requires the mutation lock")
+    if action not in {"up", "down"}:
+        raise AwgctlError("invalid firewall hook action")
+    intent = load_service_operation_intent(required=False)
+    if intent is None:
+        apply_firewall() if action == "up" else firewall_cleanup()
+        if not firewall_action_postcondition(action):
+            raise AwgctlError("firewall lifecycle postcondition was not proven")
+        return
+    current_transition = load_transition_document(required=False)
+    current_transition_id = (
+        current_transition["transaction_id"] if current_transition is not None else None
+    )
+    if intent["transition_id"] != current_transition_id:
+        raise AwgctlError("service operation transition changed")
+    if intent["generation_sha256"] != managed_transition_prestate_digest():
+        raise AwgctlError("service operation generation changed")
+    if intent["phase"] not in {"invoking", "compensating"}:
+        raise AwgctlError("service operation is not accepting firewall hooks")
+    expected = intent["expected_actions"]
+    position = intent["next_action"]
+    is_current = position < len(expected) and action == expected[position]
+    is_duplicate = position > 0 and action == expected[position - 1]
+    if not is_current and not is_duplicate:
+        raise AwgctlError("expected firewall action does not match service operation")
+    if is_current:
+        apply_firewall() if action == "up" else firewall_cleanup()
+    if not firewall_action_postcondition(action):
+        raise AwgctlError("firewall lifecycle postcondition was not proven")
+    if is_current:
+        updated = copy.deepcopy(intent)
+        updated["next_action"] = position + 1
+        updated["updated_at"] = _utc_z(
+            dt.datetime.now(dt.timezone.utc).replace(microsecond=0)
+        )
+        compare_and_swap_service_operation_intent(
+            updated,
+            expected_operation_id=intent["operation_id"],
+            expected_phase=intent["phase"],
+        )
+
+
+
+def service_is_active_exact(interface: str) -> bool:
     if not isinstance(interface, str) or INTERFACE_RE.fullmatch(interface) is None:
         raise AwgctlError("invalid service interface")
-    current = load_transition_document(required=False)
-    transition_id = current["transaction_id"] if current is not None else None
-    issued_at = dt.datetime.now(dt.timezone.utc).replace(microsecond=0)
-    expires_at = issued_at + dt.timedelta(seconds=60)
-    if operation_id is None:
-        operation_id = secrets.token_hex(16)
-    operation_id = validate_transaction_id(operation_id)
-    generation = managed_transition_prestate_digest()
-    for action in actions:
-        authorization_path, consumed_path = _firewall_hook_paths(action)
-        if (
-            authorization_path.exists()
-            or authorization_path.is_symlink()
-            or consumed_path.exists()
-            or consumed_path.is_symlink()
-        ):
-            raise AwgctlError("firewall hook authorization state is not empty")
-    created: list[str] = []
-    try:
-        for action in actions:
-            authorization_path, _ = _firewall_hook_paths(action)
-            document = {
-                "schema_version": 1,
-                "operation_id": operation_id,
-                "service_action": service_operation,
-                "firewall_action": action,
-                "interface": interface,
-                "transition_id": transition_id,
-                "generation_sha256": generation,
-                "issued_at": issued_at.isoformat().replace("+00:00", "Z"),
-                "expires_at": expires_at.isoformat().replace("+00:00", "Z"),
-            }
-            atomic_json(authorization_path, document, 0o600)
-            created.append(action)
-            persisted = _read_protected_json(authorization_path)
-            if _normalize_firewall_hook_authorization(
-                persisted,
-                expected_action=action,
-                now=issued_at,
-            ) != document:
-                raise AwgctlError("firewall hook authorization could not be verified")
-    except Exception:
-        cleanup_firewall_hook_authorizations(created)
-        raise
-    return actions
-
-
-def cleanup_firewall_hook_authorizations(actions: Sequence[str]) -> None:
-    changed = False
-    for action in actions:
-        for path in _firewall_hook_paths(action):
-            try:
-                path.unlink()
-                changed = True
-            except FileNotFoundError:
-                pass
-            except OSError as exc:
-                raise AwgctlError("firewall hook authorization cleanup failed") from exc
-    if changed:
-        fsync_directory(RUNTIME_DIR)
-
-
-def consume_firewall_hook_authorization(action: str, operation_id: str) -> None:
-    try:
-        operation_id = validate_transaction_id(operation_id)
-    except AwgctlError as exc:
-        raise AwgctlError("firewall hook authorization context is invalid") from exc
-    authorization_path, consumed_path = _firewall_hook_paths(action)
-    all_paths = {
-        candidate
-        for candidate_action in ("up", "down")
-        for candidate in _firewall_hook_paths(candidate_action)
-        if candidate.exists() or candidate.is_symlink()
-    }
-    if authorization_path not in all_paths:
-        if consumed_path in all_paths:
-            raise AwgctlError("firewall hook authorization was already consumed")
-        if all_paths:
-            raise AwgctlError("firewall hook authorization does not match the requested action")
-        raise AwgctlError("firewall hook authorization is unavailable")
-    if consumed_path in all_paths:
-        raise AwgctlError("firewall hook authorization was already consumed")
-    value = _read_protected_json(authorization_path)
-    normalized = _normalize_firewall_hook_authorization(
-        value,
-        expected_action=action,
-        now=dt.datetime.now(dt.timezone.utc),
+    result = run(
+        ["systemctl", "is-active", SERVICE_TEMPLATE.format(interface=interface)],
+        check=False,
+        timeout=15,
     )
-    if not secrets.compare_digest(normalized["operation_id"], operation_id):
-        raise AwgctlError("firewall hook authorization context does not match")
-    current = load_transition_document(required=False)
-    current_transition = current["transaction_id"] if current is not None else None
-    if normalized["transition_id"] != current_transition:
-        raise AwgctlError("firewall hook authorization transition changed")
-    if normalized["generation_sha256"] != managed_transition_prestate_digest():
-        raise AwgctlError("firewall hook authorization generation changed")
-    try:
-        os.link(authorization_path, consumed_path, follow_symlinks=False)
-        authorization_path.unlink()
-        fsync_directory(RUNTIME_DIR)
-    except OSError as exc:
-        raise AwgctlError("firewall hook authorization could not be consumed") from exc
-    consumed = _normalize_firewall_hook_authorization(
-        _read_protected_json(consumed_path),
-        expected_action=action,
-        now=dt.datetime.now(dt.timezone.utc),
+    if result.returncode == 0:
+        return True
+    if result.returncode in {3, 4}:
+        return False
+    raise AwgctlError("cannot verify service lifecycle state")
+
+
+def current_firewall_up() -> bool:
+    if firewall_action_postcondition("up"):
+        return True
+    if firewall_action_postcondition("down"):
+        return False
+    raise AwgctlError("firewall lifecycle state is inconsistent")
+
+
+def _service_intent_with(
+    intent: dict[str, Any],
+    *,
+    phase: str,
+    goal: str | None = None,
+    owner: tuple[int, int] | None | object = ...,
+) -> dict[str, Any]:
+    updated = copy.deepcopy(intent)
+    updated["phase"] = phase
+    if goal is not None:
+        updated["goal"] = goal
+        updated["expected_actions"] = (
+            ["down"]
+            if goal == "stopped"
+            else {
+                "start": ["up"],
+                "stop": ["down"],
+                "restart": ["down", "up"],
+            }[updated["service_action"]]
+        )
+        updated["next_action"] = min(
+            updated["next_action"],
+            len(updated["expected_actions"]),
+        )
+    if owner is not ...:
+        if owner is None:
+            updated["owner_pid"] = None
+            updated["owner_start_ticks"] = None
+        else:
+            updated["owner_pid"], updated["owner_start_ticks"] = owner
+    updated["updated_at"] = _utc_z(
+        dt.datetime.now(dt.timezone.utc).replace(microsecond=0)
     )
-    if consumed != normalized:
-        raise AwgctlError("firewall hook authorization changed while being consumed")
+    return normalize_service_operation_intent(updated)
 
 
-def presented_firewall_hook_operation_id(args: argparse.Namespace) -> str | None:
-    if getattr(args, "_entrypoint", None) != "internal":
-        return None
-    operation_id = os.environ.get(FIREWALL_HOOK_OPERATION_ENV)
-    if operation_id is None:
-        return None
+def _service_requested_postcondition(intent: dict[str, Any]) -> bool:
+    desired_active = intent["service_action"] in {"start", "restart"}
+    if service_is_active_exact(intent["interface"]) != desired_active:
+        return False
+    desired_firewall = "up" if desired_active else "down"
+    if not firewall_action_postcondition(desired_firewall):
+        return False
+    if intent["next_action"] == len(intent["expected_actions"]):
+        return True
+    return (
+        intent["service_action"] == "start"
+        and intent["pre_service_active"]
+        and intent["pre_firewall_up"]
+        and desired_active
+    ) or (
+        intent["service_action"] == "stop"
+        and not intent["pre_service_active"]
+        and not intent["pre_firewall_up"]
+        and not desired_active
+    )
+
+
+def _service_prestate_postcondition(intent: dict[str, Any]) -> bool:
+    if service_is_active_exact(intent["interface"]) != intent["pre_service_active"]:
+        return False
+    firewall_action = "up" if intent["pre_firewall_up"] else "down"
+    return firewall_action_postcondition(firewall_action)
+
+
+def _service_stopped_postcondition(intent: dict[str, Any]) -> bool:
+    return (
+        not service_is_active_exact(intent["interface"])
+        and firewall_action_postcondition("down")
+    )
+
+
+def compensate_service_operation_locked(intent: dict[str, Any]) -> None:
+    if not mutation_lock_is_held():
+        raise AwgctlError("service compensation requires the mutation lock")
+    operation_id = intent["operation_id"]
     try:
-        return validate_transaction_id(operation_id)
-    except AwgctlError as exc:
-        raise AwgctlError("firewall hook authorization context is invalid") from exc
+        if intent["phase"] != "compensating":
+            current_transition = load_transition_document(required=False)
+            compensating = _service_intent_with(
+                intent,
+                phase="compensating",
+                goal="stopped",
+            )
+            compensating["next_action"] = 0
+            compensating["transition_id"] = (
+                current_transition["transaction_id"]
+                if current_transition is not None
+                else None
+            )
+            compensating["generation_sha256"] = managed_transition_prestate_digest()
+            compare_and_swap_service_operation_intent(
+                compensating,
+                expected_operation_id=operation_id,
+                expected_phase=intent["phase"],
+            )
+            intent = compensating
+        if intent["next_action"] == 0:
+            run_firewall_action_locked("down")
+            intent = load_service_operation_intent()
+        if service_is_active_exact(intent["interface"]):
+            with temporarily_release_mutation_lock():
+                run(
+                    [
+                        "systemctl",
+                        "stop",
+                        SERVICE_TEMPLATE.format(interface=intent["interface"]),
+                    ],
+                    timeout=45,
+                )
+            intent = load_service_operation_intent()
+        if not _service_stopped_postcondition(intent):
+            raise AwgctlError("stopped service postcondition was not proven")
+        verified = _service_intent_with(intent, phase="verified", owner=None)
+        compare_and_swap_service_operation_intent(
+            verified,
+            expected_operation_id=operation_id,
+            expected_phase="compensating",
+        )
+        delete_service_operation_intent(operation_id)
+    except BaseException as exc:
+        raise AwgctlError("fail-safe service compensation failed") from exc
+
+
+def reconcile_service_operation_locked() -> None:
+    if not mutation_lock_is_held():
+        raise AwgctlError("service recovery requires the mutation lock")
+    intent = load_service_operation_intent(required=False)
+    if intent is None:
+        return
+    operation_id = intent["operation_id"]
+    if intent["phase"] == "verified":
+        delete_service_operation_intent(operation_id)
+        return
+    current_transition = load_transition_document(required=False)
+    current_transition_id = (
+        current_transition["transaction_id"] if current_transition is not None else None
+    )
+    generation_matches = (
+        intent["transition_id"] == current_transition_id
+        and intent["generation_sha256"] == managed_transition_prestate_digest()
+    )
+    if (
+        intent["phase"] == "prepared"
+        and generation_matches
+        and _service_prestate_postcondition(intent)
+    ):
+        delete_service_operation_intent(operation_id)
+        return
+    if (
+        intent["phase"] == "invoking"
+        and generation_matches
+        and _service_requested_postcondition(intent)
+    ):
+        verified = _service_intent_with(intent, phase="verified", owner=None)
+        compare_and_swap_service_operation_intent(
+            verified,
+            expected_operation_id=operation_id,
+            expected_phase=intent["phase"],
+        )
+        delete_service_operation_intent(operation_id)
+        return
+    claimed = _service_intent_with(
+        intent,
+        phase=intent["phase"],
+        owner=current_process_identity(),
+    )
+    compare_and_swap_service_operation_intent(
+        claimed,
+        expected_operation_id=operation_id,
+        expected_phase=intent["phase"],
+    )
+    compensate_service_operation_locked(claimed)
 
 
 def service_action(action: str, interface: str) -> None:
     if action not in {"start", "stop", "restart", "reload"}:
         raise AwgctlError("invalid service action")
+    if not isinstance(interface, str) or INTERFACE_RE.fullmatch(interface) is None:
+        raise AwgctlError("invalid service interface")
+    if not mutation_lock_is_held():
+        raise AwgctlError("service action requires the protected mutation lock")
     service = SERVICE_TEMPLATE.format(interface=interface)
-    hook_actions = _firewall_hook_actions(action)
-    operation_id = validate_transaction_id(secrets.token_hex(16)) if hook_actions else None
-    authorizations = issue_firewall_hook_authorizations(
-        action,
-        interface,
-        operation_id=operation_id,
-    )
-    operation_error: BaseException | None = None
-    try:
-        if operation_id is not None:
-            result = run(
-                [
-                    "systemctl",
-                    "import-environment",
-                    FIREWALL_HOOK_OPERATION_ENV,
-                ],
-                environment={FIREWALL_HOOK_OPERATION_ENV: operation_id},
-                check=False,
-                timeout=15,
-            )
-            if result.returncode != 0:
-                raise AwgctlError("firewall hook environment setup failed")
+    if action == "reload":
         run(["systemctl", action, service], timeout=45)
-        if action in {"start", "restart", "reload"} and not is_service_active(interface):
-            raise AwgctlError(f"service did not remain active after {action}")
-    except BaseException as exc:
-        operation_error = exc
-    finally:
-        cleanup_error: BaseException | None = None
-        try:
-            cleanup_firewall_hook_authorizations(authorizations)
-        except BaseException as exc:
-            cleanup_error = exc
-        environment_error: BaseException | None = None
-        if operation_id is not None:
+        if not service_is_active_exact(interface):
+            raise AwgctlError("service did not remain active after reload")
+        return
+
+    owner = current_process_identity()
+    current = load_transition_document(required=False)
+    now = dt.datetime.now(dt.timezone.utc).replace(microsecond=0)
+    expected_actions = {
+        "start": ["up"],
+        "stop": ["down"],
+        "restart": ["down", "up"],
+    }[action]
+    operation_id = validate_transaction_id(secrets.token_hex(16))
+    document = {
+        "schema_version": 1,
+        "operation_id": operation_id,
+        "service_action": action,
+        "interface": interface,
+        "phase": "prepared",
+        "goal": "requested",
+        "expected_actions": expected_actions,
+        "next_action": 0,
+        "transition_id": current["transaction_id"] if current is not None else None,
+        "generation_sha256": managed_transition_prestate_digest(),
+        "owner_pid": owner[0],
+        "owner_start_ticks": owner[1],
+        "pre_service_active": service_is_active_exact(interface),
+        "pre_firewall_up": current_firewall_up(),
+        "created_at": _utc_z(now),
+        "updated_at": _utc_z(now),
+    }
+    compare_and_swap_service_operation_intent(
+        document,
+        expected_operation_id=None,
+        expected_phase=None,
+    )
+    invoking = _service_intent_with(document, phase="invoking")
+    compare_and_swap_service_operation_intent(
+        invoking,
+        expected_operation_id=operation_id,
+        expected_phase="prepared",
+    )
+    try:
+        with temporarily_release_mutation_lock():
+            run(["systemctl", action, service], timeout=45)
+        latest = load_service_operation_intent()
+        if not _service_requested_postcondition(latest):
+            raise AwgctlError("service action postcondition was not proven")
+        verified = _service_intent_with(latest, phase="verified", owner=None)
+        compare_and_swap_service_operation_intent(
+            verified,
+            expected_operation_id=operation_id,
+            expected_phase="invoking",
+        )
+        delete_service_operation_intent(operation_id)
+    except BaseException as original:
+        if not mutation_lock_is_held():
+            raise original
+        current_intent = load_service_operation_intent(required=False)
+        if (
+            current_intent is not None
+            and current_intent["operation_id"] == operation_id
+            and current_intent["phase"] != "verified"
+        ):
             try:
-                result = run(
-                    ["systemctl", "unset-environment", FIREWALL_HOOK_OPERATION_ENV],
-                    check=False,
-                    timeout=15,
-                )
-                if result.returncode != 0:
-                    raise AwgctlError("firewall hook environment cleanup failed")
-            except BaseException as exc:
-                environment_error = exc
-        if operation_error is not None:
-            if cleanup_error is not None or environment_error is not None:
-                raise AwgctlError(
-                    "service action failed and firewall hook cleanup could not be verified"
-                ) from operation_error
-            raise operation_error
-        if cleanup_error is not None:
-            raise cleanup_error
-        if environment_error is not None:
-            raise environment_error
+                compensate_service_operation_locked(current_intent)
+            except BaseException as compensation_error:
+                raise AwgctlError("fail-safe service compensation failed") from compensation_error
+        raise original
 
 
 def commit_server_config(
@@ -7684,10 +8014,7 @@ def cmd_firewall(args: argparse.Namespace) -> int:
     require_root()
     if os.environ.get("SUDO_USER"):
         raise AwgctlError("internal firewall lifecycle commands cannot be invoked through sudo")
-    if args.firewall_action == "up":
-        apply_firewall()
-    else:
-        firewall_cleanup()
+    run_firewall_action_locked(args.firewall_action)
     return 0
 
 
@@ -7903,7 +8230,6 @@ def build_parser(*, entrypoint: str = "public") -> argparse.ArgumentParser:
     if entrypoint not in {"public", "internal"}:
         raise ValueError("entrypoint must be public or internal")
     parser = argparse.ArgumentParser(prog="awgctl", description="Manage the host's AmneziaWG installation")
-    parser.set_defaults(_entrypoint=entrypoint)
     parser.add_argument("--version", action="version", version=f"awgctl {VERSION}")
     parser.add_argument("--json", action="store_true", help="emit a stable machine-readable response")
     subcommands = parser.add_subparsers(dest="command", required=True)
@@ -8139,11 +8465,7 @@ def dispatch(args: argparse.Namespace) -> int:
         }
         return handlers[args.obfuscation_command](args)
     if args.command == "_firewall":
-        operation_id = presented_firewall_hook_operation_id(args)
-        if operation_id is not None:
-            consume_firewall_hook_authorization(args.firewall_action, operation_id)
-            return cmd_firewall(args)
-        with mutation_lock():
+        with mutation_lock(service_lifecycle=True):
             return cmd_firewall(args)
     if args.command == "_migrate-existing":
         return cmd_migrate_existing(args)

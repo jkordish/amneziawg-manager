@@ -82,7 +82,6 @@ class SystemdSandboxTests(unittest.TestCase):
             "RuntimeDirectory=awgctl",
             "RuntimeDirectoryMode=0700",
             "RuntimeDirectoryPreserve=yes",
-            "PassEnvironment=AWGCTL_FIREWALL_HOOK_OPERATION_ID",
             "ProtectHome=yes",
             "PrivateDevices=yes",
             "ProtectKernelModules=yes",
@@ -91,6 +90,7 @@ class SystemdSandboxTests(unittest.TestCase):
             self.assertIn(directive, rendered)
         self.assertNotIn("CapabilityBoundingSet=", rendered)
         self.assertNotIn("ProtectKernelTunables=yes", rendered)
+        self.assertNotIn("PassEnvironment=", rendered)
 
     def test_hardening_can_be_explicitly_disabled(self):
         from awginstall.sandbox import render_service_hardening
