@@ -179,10 +179,30 @@ def _run_local_probe(argv: Sequence[str]) -> subprocess.CompletedProcess[bytes]:
         raise HostConfigurationError(f"could not query host command: {argv[0]}") from exc
 
 
-def _snapshot_expiry_timer_state(runner: Runner) -> ExpiryTimerState:
+def _probe_expiry_timer_state(
+    runner: Runner,
+    *,
+    allow_loaded_not_found: bool = False,
+) -> ExpiryTimerState:
     probe = _run_local_probe if runner is _run_local else runner
     unit = "amneziawg-client-expiry.timer"
-    enabled_result = probe(("systemctl", "is-enabled", unit))
+    probe_errors: list[str] = []
+    enabled_result: subprocess.CompletedProcess[bytes] | None = None
+    active_result: subprocess.CompletedProcess[bytes] | None = None
+    try:
+        enabled_result = probe(("systemctl", "is-enabled", unit))
+    except Exception as exc:
+        probe_errors.append(f"unit-file state: {exc}")
+    try:
+        active_result = probe(("systemctl", "is-active", unit))
+    except Exception as exc:
+        probe_errors.append(f"active state: {exc}")
+    if probe_errors:
+        raise HostConfigurationError(
+            "could not query expiry timer state: " + "; ".join(probe_errors)
+        )
+    if enabled_result is None or active_result is None:
+        raise HostConfigurationError("expiry timer probes returned no result")
     enabled_states = {
         (0, b"enabled\n"): "enabled",
         (0, b"enabled-runtime\n"): "enabled-runtime",
@@ -197,7 +217,6 @@ def _snapshot_expiry_timer_state(runner: Runner) -> ExpiryTimerState:
             "could not determine a supported expiry timer unit-file state "
             f"(exit {enabled_result.returncode})"
         )
-    active_result = probe(("systemctl", "is-active", unit))
     active_states = {
         (0, b"active\n"): "active",
         (3, b"inactive\n"): "inactive",
@@ -208,7 +227,11 @@ def _snapshot_expiry_timer_state(runner: Runner) -> ExpiryTimerState:
             "could not determine a supported expiry timer active state "
             f"(exit {active_result.returncode})"
         )
-    if unit_file_state == "not-found" and active_state != "inactive":
+    if (
+        unit_file_state == "not-found"
+        and active_state != "inactive"
+        and not allow_loaded_not_found
+    ):
         raise HostConfigurationError(
             "expiry timer not-found unit-file state must be inactive"
         )
@@ -216,6 +239,44 @@ def _snapshot_expiry_timer_state(runner: Runner) -> ExpiryTimerState:
         unit_file_state=unit_file_state,
         active_state=active_state,
     )
+
+
+def _snapshot_expiry_timer_state(runner: Runner) -> ExpiryTimerState:
+    return _probe_expiry_timer_state(runner)
+
+
+def _validate_expiry_timer_snapshot(
+    timer_file: _FileSnapshot,
+    state: ExpiryTimerState,
+) -> None:
+    if timer_file.exists and state.unit_file_state == "not-found":
+        raise HostConfigurationError(
+            "present expiry timer file has not-found systemd state before reload"
+        )
+
+
+def _quiesce_expiry_timer(runner: Runner) -> None:
+    unit = "amneziawg-client-expiry.timer"
+    current = _probe_expiry_timer_state(runner, allow_loaded_not_found=True)
+    errors: list[str] = []
+    if current.active_state == "active":
+        try:
+            runner(("systemctl", "stop", unit))
+        except Exception as exc:
+            errors.append(f"stop: {exc}")
+    if current.unit_file_state != "not-found":
+        for label, command in (
+            ("persistent disable", ("systemctl", "disable", unit)),
+            ("runtime disable", ("systemctl", "disable", "--runtime", unit)),
+        ):
+            try:
+                runner(command)
+            except Exception as exc:
+                errors.append(f"{label}: {exc}")
+    if errors:
+        raise HostConfigurationError(
+            "expiry timer quiesce actions failed: " + "; ".join(errors)
+        )
 
 
 def _restore_expiry_timer_state(state: ExpiryTimerState, runner: Runner) -> None:
@@ -226,22 +287,47 @@ def _restore_expiry_timer_state(state: ExpiryTimerState, runner: Runner) -> None
         raise HostConfigurationError("unsupported expiry timer rollback unit-file state")
     if state.active_state not in {"active", "inactive"}:
         raise HostConfigurationError("unsupported expiry timer rollback active state")
-    if state.unit_file_state == "not-found":
-        if state.active_state != "inactive":
-            raise HostConfigurationError("a not-found expiry timer cannot be active")
-        return
+    if state.unit_file_state == "not-found" and state.active_state != "inactive":
+        raise HostConfigurationError("a not-found expiry timer cannot be active")
 
-    runner(("systemctl", "disable", unit))
-    runner(("systemctl", "disable", "--runtime", unit))
+    errors: list[str] = []
+
+    def attempt(label: str, command: tuple[str, ...]) -> None:
+        try:
+            runner(command)
+        except Exception as exc:
+            errors.append(f"{label}: {exc}")
+
     if state.unit_file_state == "enabled":
-        runner(("systemctl", "enable", unit))
+        attempt("persistent enable", ("systemctl", "enable", unit))
     elif state.unit_file_state == "enabled-runtime":
-        runner(("systemctl", "enable", "--runtime", unit))
-    runner((
-        "systemctl",
-        "start" if state.active_state == "active" else "stop",
-        unit,
-    ))
+        attempt(
+            "runtime enable",
+            ("systemctl", "enable", "--runtime", unit),
+        )
+    elif state.unit_file_state == "disabled":
+        attempt("persistent disable", ("systemctl", "disable", unit))
+        attempt(
+            "runtime disable",
+            ("systemctl", "disable", "--runtime", unit),
+        )
+    if state.unit_file_state != "not-found":
+        action = "start" if state.active_state == "active" else "stop"
+        attempt(action, ("systemctl", action, unit))
+
+    try:
+        observed = _probe_expiry_timer_state(runner, allow_loaded_not_found=True)
+    except Exception as exc:
+        errors.append(f"expiry timer rollback postcondition probe failed: {exc}")
+    else:
+        if observed != state:
+            errors.append(
+                "expiry timer rollback postcondition failed: "
+                f"expected {state.unit_file_state}/{state.active_state}, "
+                f"got {observed.unit_file_state}/{observed.active_state}"
+            )
+    if errors:
+        raise HostConfigurationError("; ".join(errors))
 
 
 def _password_locked(name: str, runner: Runner) -> bool:
@@ -369,19 +455,18 @@ def _rollback_identities(plan: IdentityPlan, runner: Runner) -> None:
             pass
 
 
-def rollback_host_configuration(
-    report: HostConfigurationReport,
-    *,
-    runner: Runner | None = None,
-) -> None:
-    """Compensate a successful host step when a later outer transaction fails."""
-    runner = runner or _run_local
-    if report.rollback_files is None:
-        raise HostConfigurationError("host configuration report has no rollback snapshot")
+def _restore_managed_host_state(
+    rollback_files: Mapping[pathlib.Path, _FileSnapshot],
+    expiry_timer_state: ExpiryTimerState,
+    runner: Runner,
+) -> list[str]:
+    """Best-effort exact restoration with a verified timer postcondition."""
     errors: list[str] = []
-    if report.expiry_timer_state is None:
-        raise HostConfigurationError("host configuration report has no expiry timer snapshot")
-    for path, previous in report.rollback_files.items():
+    try:
+        _quiesce_expiry_timer(runner)
+    except Exception as exc:
+        errors.append(f"quiesce expiry timer: {exc}")
+    for path, previous in rollback_files.items():
         try:
             _restore_file(path, previous)
         except Exception as exc:
@@ -391,9 +476,28 @@ def rollback_host_configuration(
     except Exception as exc:
         errors.append(f"daemon-reload: {exc}")
     try:
-        _restore_expiry_timer_state(report.expiry_timer_state, runner)
+        _restore_expiry_timer_state(expiry_timer_state, runner)
     except Exception as exc:
         errors.append(f"restore expiry timer state: {exc}")
+    return errors
+
+
+def rollback_host_configuration(
+    report: HostConfigurationReport,
+    *,
+    runner: Runner | None = None,
+) -> None:
+    """Compensate a successful host step when a later outer transaction fails."""
+    runner = runner or _run_local
+    if report.rollback_files is None:
+        raise HostConfigurationError("host configuration report has no rollback snapshot")
+    if report.expiry_timer_state is None:
+        raise HostConfigurationError("host configuration report has no expiry timer snapshot")
+    errors = _restore_managed_host_state(
+        report.rollback_files,
+        report.expiry_timer_state,
+        runner,
+    )
     _rollback_identities(report.identity, runner)
     if errors:
         raise HostConfigurationError("host rollback was incomplete: " + "; ".join(errors))
@@ -440,6 +544,10 @@ def configure_host(
     )
     file_snapshots = {path: _file_snapshot(path) for path in managed_paths}
     expiry_timer_state = _snapshot_expiry_timer_state(runner)
+    _validate_expiry_timer_snapshot(
+        file_snapshots[paths.expiry_timer],
+        expiry_timer_state,
+    )
     report = replace(
         report,
         rollback_files=file_snapshots,
@@ -487,21 +595,18 @@ def configure_host(
         runner(("systemctl", "start", "amneziawg-client-expiry.timer"))
         return report
     except Exception as exc:
-        for path, previous in file_snapshots.items():
-            try:
-                _restore_file(path, previous)
-            except Exception:
-                pass
-        try:
-            runner(("systemctl", "daemon-reload"))
-        except Exception:
-            pass
-        try:
-            _restore_expiry_timer_state(expiry_timer_state, runner)
-        except Exception:
-            pass
+        restoration_errors = _restore_managed_host_state(
+            file_snapshots,
+            expiry_timer_state,
+            runner,
+        )
         if commands_started:
             _rollback_identities(identity_plan, runner)
+        if restoration_errors:
+            raise HostConfigurationError(
+                f"{exc}; host compensation was incomplete: "
+                + "; ".join(restoration_errors)
+            ) from exc
         if isinstance(exc, HostConfigurationError):
             raise
         raise HostConfigurationError(str(exc)) from exc
