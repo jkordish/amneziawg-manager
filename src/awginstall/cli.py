@@ -20,6 +20,7 @@ from awgctl.version import VERSION
 
 from .host import (
     HostConfigurationError,
+    HostConfigurationReport,
     HostPaths,
     configure_host,
     rollback_host_configuration,
@@ -270,7 +271,20 @@ def _deploy_source_release(
             share_files=_share_files(repo_root),
             health_check=_health_check if health else None,
         )
-    _install_entrypoints(root, repo_root)
+
+
+def _rollback_host_reports(reports: Sequence[HostConfigurationReport]) -> None:
+    """Roll completed host steps back in reverse transaction order."""
+    errors: list[str] = []
+    for report in reversed(reports):
+        try:
+            rollback_host_configuration(report)
+        except Exception as exc:
+            errors.append(str(exc))
+    if errors:
+        raise HostConfigurationError(
+            "host rollback was incomplete: " + "; ".join(errors)
+        )
 
 
 def _adoption_backup(root: pathlib.Path, server: pathlib.Path, client: pathlib.Path) -> pathlib.Path:
@@ -648,27 +662,28 @@ def main(
             if not args.yes:
                 raise InstallerError("upgrade is mutating; rerun with --yes after reviewing --dry-run")
             existing_settings = _persisted_settings(root)
-            final_configuration_needed = True
-            if existing_settings is None:
-                build_settings = _bootstrap_settings(settings)
-                bootstrap_report = _configure_host_for_command(args, root=root, settings=build_settings)
-            elif existing_settings.ingress_boundary is None:
-                # Persist the explicit legacy-upgrade attestation before the new
-                # executable's health gate, and compensate it if deployment fails.
-                build_settings = settings
-                bootstrap_report = _configure_host_for_command(args, root=root, settings=settings)
-                final_configuration_needed = False
-            else:
-                build_settings = existing_settings
-                bootstrap_report = None
+            host_reports: list[HostConfigurationReport] = []
             try:
-                _deploy_source_release(root, repo_root, health=True, settings=build_settings)
+                if existing_settings is None:
+                    bootstrap = _bootstrap_settings(settings)
+                    host_reports.append(
+                        _configure_host_for_command(
+                            args,
+                            root=root,
+                            settings=bootstrap,
+                        )
+                    )
+                host_reports.append(
+                    _configure_host_for_command(
+                        args,
+                        root=root,
+                        settings=settings,
+                    )
+                )
+                _deploy_source_release(root, repo_root, health=True, settings=settings)
             except Exception:
-                if bootstrap_report is not None:
-                    rollback_host_configuration(bootstrap_report)
+                _rollback_host_reports(host_reports)
                 raise
-            if final_configuration_needed:
-                _configure_host_for_command(args, root=root, settings=settings)
             _apply_requested_runtime_settings(args, root=root, settings=settings)
             _emit(
                 output,

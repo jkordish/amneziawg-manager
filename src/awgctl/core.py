@@ -51,6 +51,7 @@ from .releases import ReleaseError, discover_release_tag, fetch_verified_release
 from .selftest import SelfTestError, run_namespace_selftest
 from .version import VERSION
 from awginstall.installer import InstallerError, upgrade_product
+from awginstall.host import render_expiry_service, render_expiry_timer
 from awginstall.platform import PlatformError, read_os_release, validate_platform
 from awginstall.identity import effective_group_members, render_sudoers
 from awginstall.sandbox import render_module_load, render_service_hardening
@@ -93,6 +94,12 @@ SERVICE_HARDENING = pathlib.Path(
     "/etc/systemd/system/awg-quick@awg0.service.d/20-awgctl-hardening.conf"
 )
 MODULE_LOAD_CONFIG = pathlib.Path("/etc/modules-load.d/amneziawg-manager.conf")
+EXPIRY_SERVICE_CONFIG = pathlib.Path(
+    "/etc/systemd/system/amneziawg-client-expiry.service"
+)
+EXPIRY_TIMER_CONFIG = pathlib.Path(
+    "/etc/systemd/system/amneziawg-client-expiry.timer"
+)
 SYSCTL_CONFIG = pathlib.Path("/etc/sysctl.d/90-amneziawg-forward.conf")
 SERVICE_TEMPLATE = "awg-quick@{interface}.service"
 OBFUSCATION_FIELDS = ("Jc", "Jmin", "Jmax", "S1", "S2", "H1", "H2", "H3", "H4")
@@ -4453,6 +4460,87 @@ def permission_problem(path: pathlib.Path, expected_mode: int, *, secret: bool =
     return None
 
 
+def expiry_host_asset_checks(
+    *,
+    product_root: pathlib.Path | None = None,
+    service_path: pathlib.Path | None = None,
+    timer_path: pathlib.Path | None = None,
+    permission_checker: Any = None,
+    command_runner: Any = None,
+) -> list[tuple[str, str, str]]:
+    """Read-only health checks for the manager-owned client-expiry units."""
+    product_root = ROOT if product_root is None else product_root
+    service_path = EXPIRY_SERVICE_CONFIG if service_path is None else service_path
+    timer_path = EXPIRY_TIMER_CONFIG if timer_path is None else timer_path
+    permission_checker = (
+        permission_problem if permission_checker is None else permission_checker
+    )
+    command_runner = run if command_runner is None else command_runner
+    checks: list[tuple[str, str, str]] = []
+
+    for path, expected, name in (
+        (
+            service_path,
+            render_expiry_service(product_root),
+            "client expiry service unit",
+        ),
+        (timer_path, render_expiry_timer(), "client expiry timer unit"),
+    ):
+        problem = permission_checker(path, 0o644)
+        if problem:
+            checks.append(("FAIL", name, problem))
+            continue
+        try:
+            if path.is_symlink() or not path.is_file():
+                checks.append(("FAIL", name, f"{path} is not a regular file"))
+                continue
+            actual = path.read_text(encoding="utf-8")
+        except (OSError, UnicodeError) as exc:
+            checks.append(("FAIL", name, f"could not read {path}: {exc}"))
+            continue
+        checks.append(
+            (
+                "PASS" if actual == expected else "FAIL",
+                name,
+                "root:root 0644 and canonical content"
+                if actual == expected
+                else "content drift",
+            )
+        )
+
+    timer_unit = "amneziawg-client-expiry.timer"
+    probes = (
+        (
+            ("systemctl", "is-enabled", "--quiet", timer_unit),
+            "client expiry timer enablement",
+            "enabled",
+            "disabled or unavailable",
+        ),
+        (
+            ("systemctl", "is-active", "--quiet", timer_unit),
+            "client expiry timer activity",
+            "active",
+            "inactive or unavailable",
+        ),
+    )
+    for argv, name, passing_detail, failing_detail in probes:
+        try:
+            result = command_runner(argv, check=False)
+        except (AwgctlError, OSError, subprocess.SubprocessError) as exc:
+            checks.append(("FAIL", name, f"{failing_detail}: {exc}"))
+            continue
+        checks.append(
+            (
+                "PASS" if result.returncode == 0 else "FAIL",
+                name,
+                passing_detail
+                if result.returncode == 0
+                else f"{failing_detail} (exit {result.returncode})",
+            )
+        )
+    return checks
+
+
 def management_security_checks() -> list[tuple[str, str, str]]:
     """Validate the installed privilege boundary without exposing identity secrets."""
     if not INSTALLATION_CONFIG.is_file():
@@ -4588,6 +4676,7 @@ def management_security_checks() -> list[tuple[str, str, str]]:
         "module preload policy",
         "amneziawg" if actual_module_load == render_module_load() else "content drift",
     )
+    checks.extend(expiry_host_asset_checks())
     return checks
 
 

@@ -21,6 +21,13 @@ versioning while preserving explicit beta labels for unqualified host paths.
 - Add explicit Lightsail/equivalent external-ingress attestation, exact UTC
   client expiration with a daily systemd timer, and transaction-aware service
   and canonical nftables lifecycle proof.
+- Make expiry host assets part of management health: both canonical units must
+  be root-owned mode `0644`, and the timer must be enabled and active. Signed
+  code-only updates fail health and restore the prior selector on drift.
+- Apply requested/current host configuration before installer upgrade health,
+  with exact file and timer-state compensation on configuration, deployment,
+  or health failure. Beta.4 hosts migrate through `install.py upgrade --yes`
+  after reviewing its dry run.
 - Harden release workflow references, SemVer precedence, diagnostic directory
   creation, profile import, transition recovery, service/firewall coordination,
   and AWG 3.1 CPS redaction.

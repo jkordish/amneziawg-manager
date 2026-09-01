@@ -1,11 +1,13 @@
 import json
 import io
+import os
 import pathlib
 import platform
 import subprocess
 import sys
 import tempfile
 import unittest
+from contextlib import nullcontext, redirect_stderr
 from unittest import mock
 
 
@@ -54,7 +56,7 @@ class UpgradeTests(unittest.TestCase):
                     health=True,
                     settings=resolve_installation_settings(sudo_user=None),
                 )
-        self.assertEqual(events, ["entrypoints", "build", "upgrade", "entrypoints"])
+        self.assertEqual(events, ["entrypoints", "build", "upgrade"])
 
     def make_artifact(self, directory: pathlib.Path, content: bytes = b"new executable\n") -> pathlib.Path:
         artifact = directory / "artifact"
@@ -97,16 +99,84 @@ class UpgradeTests(unittest.TestCase):
             self.assertEqual(active_release(root), "legacy-import")
             self.assertEqual((root / "bin/awgctl").read_bytes(), b"legacy executable\n")
 
+    def test_public_signed_update_rolls_beta5_back_when_beta4_host_assets_are_missing(self):
+        from awgctl import core
+
+        with tempfile.TemporaryDirectory() as directory_text:
+            directory = pathlib.Path(directory_text)
+            root = directory / "opt/amneziawg"
+            beta4 = self.make_artifact(directory, b"beta4 executable\n")
+            upgrade_product(root=root, artifact=beta4, version="0.1.0-beta.4")
+            beta5 = b"beta5 executable\n"
+            health_commands = []
+
+            def command_runner(argv, **_kwargs):
+                command = tuple(argv)
+                health_commands.append(command)
+                if len(command) >= 2 and command[1] == "health":
+                    self.assertFalse(
+                        (directory / "etc/systemd/system/amneziawg-client-expiry.timer").exists()
+                    )
+                    return subprocess.CompletedProcess(argv, 3, b"", b"host assets missing")
+                return subprocess.CompletedProcess(argv, 0, b"", b"")
+
+            with (
+                mock.patch.object(core, "ROOT", root),
+                mock.patch.object(core, "VERSION", "0.1.0-beta.4"),
+                mock.patch.object(core, "require_root"),
+                mock.patch.object(core, "load_transition_document", return_value=None),
+                mock.patch.object(core, "mutation_lock", side_effect=lambda **_kwargs: nullcontext()),
+                mock.patch.object(core, "read_os_release", return_value={}),
+                mock.patch.object(
+                    core,
+                    "validate_platform",
+                    return_value={"version": "24.04", "architecture": "amd64"},
+                ),
+                mock.patch.object(core, "discover_release_tag", return_value="v0.1.0-beta.5"),
+                mock.patch.object(
+                    core,
+                    "fetch_verified_release",
+                    return_value=({"version": "0.1.0-beta.5"}, beta5),
+                ),
+                mock.patch.object(core, "create_backup", return_value=root / "backups/pre-update"),
+                mock.patch.object(core, "run", side_effect=command_runner),
+                mock.patch.object(core, "audit"),
+                redirect_stderr(io.StringIO()),
+            ):
+                result = core.main(["update", "apply"])
+
+            self.assertEqual(result, 1)
+            self.assertEqual(active_release(root), "0.1.0-beta.4")
+            self.assertEqual((root / "bin/awgctl").read_bytes(), b"beta4 executable\n")
+            self.assertEqual(
+                len([command for command in health_commands if command[1:] == ("health", "--json")]),
+                1,
+            )
+
     def test_upgrade_dry_run_does_not_create_installation_root(self):
         with tempfile.TemporaryDirectory() as directory_text:
             root = pathlib.Path(directory_text) / "opt/amneziawg"
             output = io.StringIO()
-            result = installer_main(
-                ["upgrade", "--dry-run"],
-                root=root,
-                repo_root=REPO_ROOT,
-                output=output,
-            )
+            with (
+                mock.patch(
+                    "awginstall.cli._configure_host_for_command",
+                    side_effect=AssertionError("must not configure"),
+                ),
+                mock.patch(
+                    "awginstall.cli._deploy_source_release",
+                    side_effect=AssertionError("must not deploy"),
+                ),
+                mock.patch(
+                    "awginstall.cli._run",
+                    side_effect=AssertionError("must not run commands"),
+                ),
+            ):
+                result = installer_main(
+                    ["upgrade", "--dry-run"],
+                    root=root,
+                    repo_root=REPO_ROOT,
+                    output=output,
+                )
             self.assertEqual(result, 0)
             self.assertFalse(root.exists())
             self.assertIn(f"would install awgctl {VERSION}", output.getvalue())
@@ -268,17 +338,22 @@ class UpgradeTests(unittest.TestCase):
         self.assertEqual([value.sudo_policy for value in configured], ["none", "scoped-nopasswd"])
         self.assertEqual(configured[0].operators, ())
         self.assertEqual(configured[0].systemd_hardening, "off")
-        self.assertEqual(deployed, [configured[0]])
+        self.assertEqual(deployed, [configured[1]])
 
     def test_first_upgrade_rolls_back_bootstrap_when_release_validation_fails(self):
         from awginstall import cli
 
         bootstrap_report = object()
+        final_report = object()
         with tempfile.TemporaryDirectory() as directory:
             root = pathlib.Path(directory) / "opt/amneziawg"
             errors = io.StringIO()
             with (
-                mock.patch.object(cli, "_configure_host_for_command", return_value=bootstrap_report),
+                mock.patch.object(
+                    cli,
+                    "_configure_host_for_command",
+                    side_effect=[bootstrap_report, final_report],
+                ),
                 mock.patch.object(cli, "_deploy_source_release", side_effect=InstallerError("health failed")),
                 mock.patch.object(cli, "rollback_host_configuration") as rollback,
                 mock.patch("sys.stderr", errors),
@@ -290,8 +365,191 @@ class UpgradeTests(unittest.TestCase):
                     output=io.StringIO(),
                 )
         self.assertEqual(result, 1)
-        rollback.assert_called_once_with(bootstrap_report)
+        self.assertEqual(
+            rollback.call_args_list,
+            [mock.call(final_report), mock.call(bootstrap_report)],
+        )
         self.assertIn("health failed", errors.getvalue())
+
+    def test_first_upgrade_rolls_back_bootstrap_when_final_host_configuration_fails(self):
+        from awginstall import cli
+        from awginstall.host import HostConfigurationError
+
+        bootstrap_report = object()
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory) / "opt/amneziawg"
+            errors = io.StringIO()
+            with (
+                mock.patch.object(
+                    cli,
+                    "_configure_host_for_command",
+                    side_effect=[bootstrap_report, HostConfigurationError("unit install failed")],
+                ),
+                mock.patch.object(cli, "_deploy_source_release") as deploy,
+                mock.patch.object(cli, "rollback_host_configuration") as rollback,
+                mock.patch("sys.stderr", errors),
+            ):
+                result = installer_main(
+                    ["upgrade", "--yes", "--ingress-boundary", "lightsail"],
+                    root=root,
+                    repo_root=REPO_ROOT,
+                    output=io.StringIO(),
+                )
+
+        self.assertEqual(result, 1)
+        deploy.assert_not_called()
+        rollback.assert_called_once_with(bootstrap_report)
+        self.assertIn("unit install failed", errors.getvalue())
+
+    def test_existing_upgrade_rolls_back_host_configuration_when_release_health_fails(self):
+        from awginstall import cli
+        from awginstall.settings import resolve_installation_settings
+
+        final_report = object()
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory) / "opt/amneziawg"
+            settings_path = root / "config/installation.json"
+            settings_path.parent.mkdir(parents=True)
+            settings_path.write_text(
+                json.dumps(
+                    resolve_installation_settings(
+                        sudo_user=None,
+                        overrides={"ingress_boundary": "lightsail"},
+                    ).to_dict()
+                )
+            )
+            with (
+                mock.patch.object(
+                    cli, "_configure_host_for_command", return_value=final_report
+                ) as configure,
+                mock.patch.object(
+                    cli,
+                    "_deploy_source_release",
+                    side_effect=InstallerError("health failed"),
+                ),
+                mock.patch.object(cli, "rollback_host_configuration") as rollback,
+                mock.patch("sys.stderr", io.StringIO()),
+            ):
+                result = installer_main(
+                    ["upgrade", "--yes"],
+                    root=root,
+                    repo_root=REPO_ROOT,
+                    output=io.StringIO(),
+                )
+
+        self.assertEqual(result, 1)
+        configure.assert_called_once()
+        rollback.assert_called_once_with(final_report)
+
+    def test_existing_upgrade_health_failure_restores_selector_files_and_timer_state(self):
+        from awginstall import cli, host
+        from awginstall.host import HostPaths
+        from awginstall.identity import IdentitySnapshot, UserRecord
+        from awginstall.settings import resolve_installation_settings
+
+        with tempfile.TemporaryDirectory() as directory:
+            test_root = pathlib.Path(directory)
+            root = test_root / "opt/amneziawg"
+            beta4 = test_root / "beta4"
+            beta4.write_bytes(b"beta4 executable\n")
+            upgrade_product(root=root, artifact=beta4, version="0.1.0-beta.4")
+
+            settings = resolve_installation_settings(
+                sudo_user=None,
+                overrides={"ingress_boundary": "lightsail"},
+            )
+            paths = HostPaths.under(test_root)
+            installation = root / "config/installation.json"
+            prior = {
+                paths.sudoers: (b"prior sudoers\n", 0o440),
+                paths.service_dropin: (b"prior hardening\n", 0o644),
+                paths.module_load: (b"prior module\n", 0o644),
+                paths.expiry_service: (b"prior expiry service\n", 0o644),
+                paths.expiry_timer: (b"prior expiry timer\n", 0o644),
+                installation: (
+                    (json.dumps(settings.to_dict(), sort_keys=True) + "\n").encode(),
+                    0o600,
+                ),
+            }
+            for path, (data, mode) in prior.items():
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(data)
+                path.chmod(mode)
+
+            timer_state = {"enabled": False, "active": True}
+
+            def runner(argv):
+                command = tuple(argv)
+                if command[:3] == ("systemctl", "is-enabled", "--quiet"):
+                    code = 0 if timer_state["enabled"] else 1
+                    return subprocess.CompletedProcess(argv, code, b"", b"")
+                if command[:3] == ("systemctl", "is-active", "--quiet"):
+                    code = 0 if timer_state["active"] else 3
+                    return subprocess.CompletedProcess(argv, code, b"", b"")
+                if command[:2] == ("systemctl", "enable"):
+                    timer_state["enabled"] = True
+                elif command[:2] == ("systemctl", "disable"):
+                    timer_state["enabled"] = False
+                elif command[:2] == ("systemctl", "start"):
+                    timer_state["active"] = True
+                elif command[:2] == ("systemctl", "stop"):
+                    timer_state["active"] = False
+                return subprocess.CompletedProcess(argv, 0, b"", b"")
+
+            snapshot = IdentitySnapshot(
+                users={}, groups={}, locked_users=set(), supplementary_groups={}
+            )
+
+            def configure(_args, *, settings, **_kwargs):
+                return host.configure_host(
+                    settings,
+                    product_root=root,
+                    paths=paths,
+                    allow_existing=False,
+                    dry_run=False,
+                    snapshot=snapshot,
+                    runner=runner,
+                )
+
+            def rollback(report):
+                host.rollback_host_configuration(report, runner=runner)
+
+            def build(_repo_root, artifact, **_kwargs):
+                artifact.write_bytes(b"beta5 executable\n")
+
+            with (
+                mock.patch.object(
+                    host,
+                    "_resolve_created_user",
+                    return_value=UserRecord(
+                        "awgctl",
+                        os.getuid(),
+                        os.getgid(),
+                        str(settings.staging_root),
+                        "/usr/sbin/nologin",
+                    ),
+                ),
+                mock.patch.object(host, "_prepare_staging_root"),
+                mock.patch.object(cli, "_configure_host_for_command", side_effect=configure),
+                mock.patch.object(cli, "rollback_host_configuration", side_effect=rollback),
+                mock.patch.object(cli, "_build_artifact", side_effect=build),
+                mock.patch.object(cli, "_health_check", return_value=3),
+                mock.patch("sys.stderr", io.StringIO()),
+            ):
+                result = installer_main(
+                    ["upgrade", "--yes"],
+                    root=root,
+                    repo_root=REPO_ROOT,
+                    output=io.StringIO(),
+                )
+
+            self.assertEqual(result, 1)
+            self.assertEqual(active_release(root), "0.1.0-beta.4")
+            self.assertEqual((root / "bin/awgctl").read_bytes(), b"beta4 executable\n")
+            for path, (data, mode) in prior.items():
+                self.assertEqual(path.read_bytes(), data)
+                self.assertEqual(path.stat().st_mode & 0o777, mode)
+            self.assertEqual(timer_state, {"enabled": False, "active": True})
 
     def test_top_level_installer_help_is_runnable_without_pip(self):
         result = subprocess.run(

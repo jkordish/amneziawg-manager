@@ -278,6 +278,29 @@ sudo awgctl update apply --dry-run
 sudo awgctl update apply
 ```
 
+`update apply` is code-only. It installs a verified immutable executable and
+runs that executable's health check; it does not install or repair host-managed
+systemd units. Health requires the canonical client-expiry service and timer to
+be root-owned mode `0644`, and requires the timer to be enabled and active. If
+either unit is missing, stale, incorrectly permissioned, disabled, or inactive,
+the update fails and restores the previous release selector.
+
+Beta.4 does not have the complete beta.5 host-asset contract. Upgrade a beta.4
+host from a verified beta.5 source checkout with the installer so the expiry
+units are migrated before the beta.5 executable is health-checked:
+
+```bash
+python3 install.py upgrade --dry-run --ingress-boundary lightsail
+sudo python3 install.py upgrade --yes --ingress-boundary lightsail
+sudo awgctl health
+```
+
+Use `equivalent-external-firewall` instead of `lightsail` only when that is the
+host's real attested boundary. A direct beta.4 `awgctl update apply` to beta.5
+is expected to refuse the cutover and roll back when those assets are absent or
+stale. After the host contract has been installed, signed code-only updates may
+use the normal commands above.
+
 Updates are operator-triggered. The CLI verifies the Ed25519 signature,
 platform, tag/version, artifact size, and SHA-256 before activating an immutable
 release. It runs health and restores the previous release selector on failure;

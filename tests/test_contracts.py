@@ -215,6 +215,11 @@ class JsonContractTests(unittest.TestCase):
                 mock.patch.object(core, "PUBLIC_ENTRYPOINT", root / "public"),
                 mock.patch.object(core, "INTERNAL_ENTRYPOINT", root / "internal"),
                 mock.patch.object(core, "permission_problem", return_value=None),
+                mock.patch.object(
+                    core,
+                    "run",
+                    return_value=mock.Mock(returncode=4, stdout=b"", stderr=b""),
+                ),
             ):
                 checks = core.management_security_checks()
 
@@ -226,6 +231,144 @@ class JsonContractTests(unittest.TestCase):
             ),
             checks,
         )
+
+    def test_expiry_host_health_accepts_only_exact_units_and_enabled_active_timer(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            product_root = root / "opt/amneziawg"
+            service = root / "etc/systemd/system/amneziawg-client-expiry.service"
+            timer = root / "etc/systemd/system/amneziawg-client-expiry.timer"
+            service.parent.mkdir(parents=True)
+            service.write_text(
+                "# Managed by AmneziaWG Manager\n"
+                "[Unit]\n"
+                "Description=Expire due AmneziaWG clients\n"
+                "After=awg-quick@awg0.service\n\n"
+                "[Service]\n"
+                "Type=oneshot\n"
+                f"ExecStart={product_root / 'libexec/awgctl-internal'} _expire-clients\n"
+                "User=root\n"
+                "Group=root\n"
+                "UMask=0077\n"
+            )
+            timer.write_text(
+                "# Managed by AmneziaWG Manager\n"
+                "[Unit]\n"
+                "Description=Run AmneziaWG client expiry daily\n\n"
+                "[Timer]\n"
+                "OnCalendar=*-*-* 00:00:00 UTC\n"
+                "Persistent=true\n"
+                "Unit=amneziawg-client-expiry.service\n\n"
+                "[Install]\n"
+                "WantedBy=timers.target\n"
+            )
+            commands = []
+
+            def runner(argv, **kwargs):
+                commands.append((tuple(argv), kwargs))
+                return mock.Mock(returncode=0, stdout=b"", stderr=b"")
+
+            checks = core.expiry_host_asset_checks(
+                product_root=product_root,
+                service_path=service,
+                timer_path=timer,
+                permission_checker=lambda _path, _mode: None,
+                command_runner=runner,
+            )
+
+        self.assertEqual(
+            checks,
+            [
+                ("PASS", "client expiry service unit", "root:root 0644 and canonical content"),
+                ("PASS", "client expiry timer unit", "root:root 0644 and canonical content"),
+                ("PASS", "client expiry timer enablement", "enabled"),
+                ("PASS", "client expiry timer activity", "active"),
+            ],
+        )
+        self.assertEqual(
+            commands,
+            [
+                (("systemctl", "is-enabled", "--quiet", "amneziawg-client-expiry.timer"), {"check": False}),
+                (("systemctl", "is-active", "--quiet", "amneziawg-client-expiry.timer"), {"check": False}),
+            ],
+        )
+
+    def test_expiry_host_health_rejects_missing_stale_or_wrong_mode_units_without_mutation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            product_root = root / "opt/amneziawg"
+            service = root / "expiry.service"
+            timer = root / "expiry.timer"
+            missing_checks = core.expiry_host_asset_checks(
+                product_root=product_root,
+                service_path=service,
+                timer_path=timer,
+                permission_checker=lambda path, _mode: f"missing {path}",
+                command_runner=lambda _argv, **_kwargs: mock.Mock(
+                    returncode=4, stdout=b"", stderr=b""
+                ),
+            )
+            self.assertFalse(service.exists())
+            self.assertFalse(timer.exists())
+
+            service.write_text("stale service\n")
+            timer.write_text("stale timer\n")
+            stale_checks = core.expiry_host_asset_checks(
+                product_root=product_root,
+                service_path=service,
+                timer_path=timer,
+                permission_checker=lambda _path, _mode: None,
+                command_runner=lambda _argv, **_kwargs: mock.Mock(
+                    returncode=0, stdout=b"", stderr=b""
+                ),
+            )
+            wrong_mode_checks = core.expiry_host_asset_checks(
+                product_root=product_root,
+                service_path=service,
+                timer_path=timer,
+                permission_checker=lambda path, _mode: (
+                    f"{path} mode is 0666, expected 0644" if path == service else None
+                ),
+                command_runner=lambda _argv, **_kwargs: mock.Mock(
+                    returncode=0, stdout=b"", stderr=b""
+                ),
+            )
+
+        self.assertEqual([check[0] for check in missing_checks[:2]], ["FAIL", "FAIL"])
+        self.assertIn("missing", missing_checks[0][2])
+        self.assertEqual([check[2] for check in stale_checks[:2]], ["content drift", "content drift"])
+        self.assertEqual(wrong_mode_checks[0][0], "FAIL")
+        self.assertIn("0666", wrong_mode_checks[0][2])
+
+    def test_expiry_host_health_rejects_disabled_or_inactive_timer(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            product_root = root / "opt/amneziawg"
+            service = root / "expiry.service"
+            timer = root / "expiry.timer"
+            service.write_text("stale but permissions are independently controlled\n")
+            timer.write_text("stale but permissions are independently controlled\n")
+            def states(enabled_code, active_code):
+                def runner(argv, **_kwargs):
+                    return mock.Mock(
+                        returncode=enabled_code if argv[1] == "is-enabled" else active_code,
+                        stdout=b"",
+                        stderr=b"",
+                    )
+
+                return core.expiry_host_asset_checks(
+                    product_root=product_root,
+                    service_path=service,
+                    timer_path=timer,
+                    permission_checker=lambda _path, _mode: None,
+                    command_runner=runner,
+                )
+
+            disabled = states(1, 0)
+            inactive = states(0, 3)
+
+        self.assertEqual(disabled[2], ("FAIL", "client expiry timer enablement", "disabled or unavailable (exit 1)"))
+        self.assertEqual(inactive[3], ("FAIL", "client expiry timer activity", "inactive or unavailable (exit 3)"))
 
     def test_management_health_rejects_primary_gid_operator_member(self):
         from types import SimpleNamespace

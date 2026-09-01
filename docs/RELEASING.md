@@ -26,9 +26,33 @@ The private key must exist only as the GitHub Actions secret
 4. Push the signed/annotated tag. The release workflow rebuilds and retests the
    artifact, verifies tag/version equality, signs `release.json`, and publishes
    all three assets.
-5. On a managed beta host, run `sudo awgctl update check`, then a dry run, then
-   `sudo awgctl update apply --dry-run`, then
-   `sudo awgctl update apply` and health.
+5. On a managed host whose required host assets are already current, run
+   `sudo awgctl update check`, then `sudo awgctl update apply --dry-run`, then
+   `sudo awgctl update apply` and health. This path updates code only.
+
+### Beta.4 to beta.5 host migration
+
+Beta.5 adds a health-enforced client-expiry service/timer contract that the
+signed updater cannot install. From a verified beta.5 source checkout, migrate
+the host before relying on beta.5 code:
+
+```bash
+python3 install.py upgrade --dry-run --ingress-boundary lightsail
+sudo python3 install.py upgrade --yes --ingress-boundary lightsail
+sudo awgctl health
+```
+
+Use the `equivalent-external-firewall` choice only for a host that actually has
+that attested boundary. The installer transaction writes and starts the exact
+host units before it deploys and health-checks the new executable. A deploy or
+health failure restores the prior release selector, exact prior managed files,
+and the prior timer enabled/active state.
+
+`awgctl update apply` remains compatible and fail closed across this boundary:
+when beta.4 attempts a beta.5 code-only update without exact active expiry
+assets, beta.5 health fails and the selector returns to beta.4. Do not describe
+that refusal as a completed host migration, and do not tell operators to bypass
+health or install units by hand.
 
 The release and installation manifest schemas stay at 1 because AWG 3.1 does
 not change either serialized shape. Server configuration is separately schema
