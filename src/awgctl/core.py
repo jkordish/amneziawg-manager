@@ -26,6 +26,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import urllib.request
 from dataclasses import dataclass
@@ -146,6 +147,7 @@ LEGACY_FIREWALL_MARKERS = (
 FIREWALL_MARKER_PREFIX = "awgctl-"
 
 os.umask(0o077)
+_MUTATION_LOCK_STATE = threading.local()
 
 
 class AwgctlError(RuntimeError):
@@ -350,6 +352,8 @@ def mutation_lock(
     parent = _open_protected_runtime_directory()
     fd = -1
     acquired = False
+    marked = False
+    previous_depth = int(getattr(_MUTATION_LOCK_STATE, "depth", 0))
     try:
         try:
             fd = os.open(
@@ -388,6 +392,8 @@ def mutation_lock(
                     if remaining <= 0:
                         raise AwgctlError("mutation lock acquisition timeout")
                     time.sleep(min(0.05, remaining))
+        _MUTATION_LOCK_STATE.depth = previous_depth + 1
+        marked = True
         reconcile_transition_recovery_locked()
         if not transition_lifecycle and load_transition_document(required=False) is not None:
             raise AwgctlError(
@@ -395,11 +401,17 @@ def mutation_lock(
             )
         yield
     finally:
+        if marked:
+            _MUTATION_LOCK_STATE.depth = previous_depth
         if acquired:
             fcntl.flock(fd, fcntl.LOCK_UN)
         if fd >= 0:
             os.close(fd)
         os.close(parent)
+
+
+def mutation_lock_is_held() -> bool:
+    return int(getattr(_MUTATION_LOCK_STATE, "depth", 0)) > 0
 
 
 def fsync_directory(path: pathlib.Path) -> None:
@@ -2183,16 +2195,221 @@ def apply_firewall() -> None:
             integration_path.unlink()
 
 
+def _firewall_hook_paths(action: str) -> tuple[pathlib.Path, pathlib.Path]:
+    if action not in {"up", "down"}:
+        raise AwgctlError("invalid firewall hook action")
+    return (
+        RUNTIME_DIR / f"firewall-hook-{action}.json",
+        RUNTIME_DIR / f"firewall-hook-{action}.consumed.json",
+    )
+
+
+def _normalize_firewall_hook_authorization(
+    value: Any,
+    *,
+    expected_action: str,
+    now: dt.datetime,
+) -> dict[str, Any]:
+    fields = {
+        "schema_version",
+        "operation_id",
+        "service_action",
+        "firewall_action",
+        "interface",
+        "transition_id",
+        "generation_sha256",
+        "issued_at",
+        "expires_at",
+    }
+    if not isinstance(value, dict) or set(value) != fields:
+        raise AwgctlError("firewall hook authorization is invalid")
+    schema = value["schema_version"]
+    if not isinstance(schema, int) or isinstance(schema, bool) or schema != 1:
+        raise AwgctlError("firewall hook authorization is invalid")
+    operation_id = validate_transaction_id(value["operation_id"])
+    service_operation = value["service_action"]
+    firewall_action = value["firewall_action"]
+    expected = {
+        "start": {"up"},
+        "stop": {"down"},
+        "restart": {"down", "up"},
+    }
+    if (
+        not isinstance(service_operation, str)
+        or service_operation not in expected
+        or not isinstance(firewall_action, str)
+        or firewall_action != expected_action
+        or firewall_action not in expected[service_operation]
+    ):
+        raise AwgctlError("firewall hook authorization does not match the service operation")
+    interface = value["interface"]
+    if not isinstance(interface, str) or INTERFACE_RE.fullmatch(interface) is None:
+        raise AwgctlError("firewall hook authorization is invalid")
+    transition_id = value["transition_id"]
+    if transition_id is not None:
+        transition_id = validate_transaction_id(transition_id)
+    generation = value["generation_sha256"]
+    if not isinstance(generation, str) or SHA256_RE.fullmatch(generation) is None:
+        raise AwgctlError("firewall hook authorization is invalid")
+    issued_at = _transition_time(value["issued_at"], "issued_at")
+    expires_at = _transition_time(value["expires_at"], "expires_at")
+    if (
+        now.tzinfo is None
+        or issued_at > now
+        or now >= expires_at
+        or not dt.timedelta(0) < expires_at - issued_at <= dt.timedelta(seconds=60)
+    ):
+        raise AwgctlError("firewall hook authorization is stale")
+    normalized = copy.deepcopy(value)
+    normalized.update(
+        operation_id=operation_id,
+        service_action=service_operation,
+        firewall_action=firewall_action,
+        interface=interface,
+        transition_id=transition_id,
+        generation_sha256=generation,
+    )
+    return normalized
+
+
+def _firewall_hook_actions(service_operation: str) -> tuple[str, ...]:
+    return {
+        "start": ("up",),
+        "stop": ("down",),
+        "restart": ("down", "up"),
+        "reload": (),
+    }[service_operation]
+
+
+def issue_firewall_hook_authorizations(
+    service_operation: str,
+    interface: str,
+) -> tuple[str, ...]:
+    actions = _firewall_hook_actions(service_operation)
+    if not actions:
+        return actions
+    if not mutation_lock_is_held():
+        raise AwgctlError("service firewall hooks require the protected mutation lock")
+    if not isinstance(interface, str) or INTERFACE_RE.fullmatch(interface) is None:
+        raise AwgctlError("invalid service interface")
+    current = load_transition_document(required=False)
+    transition_id = current["transaction_id"] if current is not None else None
+    issued_at = dt.datetime.now(dt.timezone.utc).replace(microsecond=0)
+    expires_at = issued_at + dt.timedelta(seconds=60)
+    operation_id = validate_transaction_id(secrets.token_hex(16))
+    generation = managed_transition_prestate_digest()
+    for action in actions:
+        authorization_path, consumed_path = _firewall_hook_paths(action)
+        if (
+            authorization_path.exists()
+            or authorization_path.is_symlink()
+            or consumed_path.exists()
+            or consumed_path.is_symlink()
+        ):
+            raise AwgctlError("firewall hook authorization state is not empty")
+    created: list[str] = []
+    try:
+        for action in actions:
+            authorization_path, _ = _firewall_hook_paths(action)
+            document = {
+                "schema_version": 1,
+                "operation_id": operation_id,
+                "service_action": service_operation,
+                "firewall_action": action,
+                "interface": interface,
+                "transition_id": transition_id,
+                "generation_sha256": generation,
+                "issued_at": issued_at.isoformat().replace("+00:00", "Z"),
+                "expires_at": expires_at.isoformat().replace("+00:00", "Z"),
+            }
+            atomic_json(authorization_path, document, 0o600)
+            created.append(action)
+            persisted = _read_protected_json(authorization_path)
+            if _normalize_firewall_hook_authorization(
+                persisted,
+                expected_action=action,
+                now=issued_at,
+            ) != document:
+                raise AwgctlError("firewall hook authorization could not be verified")
+    except Exception:
+        cleanup_firewall_hook_authorizations(created)
+        raise
+    return actions
+
+
+def cleanup_firewall_hook_authorizations(actions: Sequence[str]) -> None:
+    changed = False
+    for action in actions:
+        for path in _firewall_hook_paths(action):
+            try:
+                path.unlink()
+                changed = True
+            except FileNotFoundError:
+                pass
+            except OSError as exc:
+                raise AwgctlError("firewall hook authorization cleanup failed") from exc
+    if changed:
+        fsync_directory(RUNTIME_DIR)
+
+
+def consume_firewall_hook_authorization(action: str) -> bool:
+    authorization_path, consumed_path = _firewall_hook_paths(action)
+    all_paths = {
+        candidate
+        for candidate_action in ("up", "down")
+        for candidate in _firewall_hook_paths(candidate_action)
+        if candidate.exists() or candidate.is_symlink()
+    }
+    if authorization_path not in all_paths:
+        if consumed_path in all_paths:
+            raise AwgctlError("firewall hook authorization was already consumed")
+        if all_paths:
+            raise AwgctlError("firewall hook authorization does not match the requested action")
+        return False
+    if consumed_path in all_paths:
+        raise AwgctlError("firewall hook authorization was already consumed")
+    try:
+        os.link(authorization_path, consumed_path, follow_symlinks=False)
+        authorization_path.unlink()
+        fsync_directory(RUNTIME_DIR)
+    except OSError as exc:
+        raise AwgctlError("firewall hook authorization could not be consumed") from exc
+    value = _read_protected_json(consumed_path)
+    normalized = _normalize_firewall_hook_authorization(
+        value,
+        expected_action=action,
+        now=dt.datetime.now(dt.timezone.utc),
+    )
+    current = load_transition_document(required=False)
+    current_transition = current["transaction_id"] if current is not None else None
+    if normalized["transition_id"] != current_transition:
+        raise AwgctlError("firewall hook authorization transition changed")
+    if normalized["generation_sha256"] != managed_transition_prestate_digest():
+        raise AwgctlError("firewall hook authorization generation changed")
+    return True
+
+
 def service_action(action: str, interface: str) -> None:
     if action not in {"start", "stop", "restart", "reload"}:
         raise AwgctlError("invalid service action")
     service = SERVICE_TEMPLATE.format(interface=interface)
-    run(["systemctl", action, service], timeout=45)
-    if action in {"start", "restart", "reload"} and not is_service_active(interface):
-        raise AwgctlError(f"service did not remain active after {action}")
+    authorizations = issue_firewall_hook_authorizations(action, interface)
+    try:
+        run(["systemctl", action, service], timeout=45)
+        if action in {"start", "restart", "reload"} and not is_service_active(interface):
+            raise AwgctlError(f"service did not remain active after {action}")
+    finally:
+        cleanup_firewall_hook_authorizations(authorizations)
 
 
-def commit_server_config(text: str, *, runtime_action: str | None = "reload") -> bool:
+def commit_server_config(
+    text: str,
+    *,
+    runtime_action: str | None = "reload",
+    before_runtime_action: Any | None = None,
+) -> bool:
+    if before_runtime_action is not None and not callable(before_runtime_action):
+        raise AwgctlError("server configuration runtime callback is invalid")
     validate_native_server(text)
     old_generated = GENERATED_CONFIG.read_bytes() if GENERATED_CONFIG.exists() else None
     old_runtime = RUNTIME_CONFIG.read_bytes()
@@ -2202,6 +2419,8 @@ def commit_server_config(text: str, *, runtime_action: str | None = "reload") ->
     atomic_write(RUNTIME_CONFIG, text, 0o600)
     try:
         if active and runtime_action:
+            if before_runtime_action is not None:
+                before_runtime_action()
             service_action(runtime_action, config["interface"])
     except Exception as original:
         atomic_write(RUNTIME_CONFIG, old_runtime, 0o600)
@@ -2916,6 +3135,7 @@ class PendingTransitionSnapshot:
     server_config: bytes
     header_key: bytes
     profiles: tuple[tuple[str, bytes, bytes], ...]
+    peer_public_keys: frozenset[str]
 
     def profile_bytes(self, name: str) -> bytes:
         for candidate, profile, _ in self.profiles:
@@ -4022,15 +4242,12 @@ def ensure_activation_window(
     *,
     now: dt.datetime,
     deadline: dt.datetime,
+    installed_public_keys: set[str] | frozenset[str] | None = None,
 ) -> None:
     if now.tzinfo is None or deadline.tzinfo is None or deadline <= now:
         raise AwgctlError("activation rollback window is invalid")
     for client in clients:
-        if (
-            client.get("management", "managed") != "managed"
-            or not client_is_server_eligible(client, now=now)
-            or client.get("expires") is None
-        ):
+        if client.get("management", "managed") != "managed" or client.get("expires") is None:
             continue
         try:
             expiry = dt.datetime.combine(
@@ -4040,6 +4257,14 @@ def ensure_activation_window(
             )
         except (TypeError, ValueError) as exc:
             raise AwgctlError("managed client expiry is invalid") from exc
+        installed = (
+            installed_public_keys is not None
+            and client.get("public_key") in installed_public_keys
+        )
+        if not client_is_server_eligible(client, now=now) and not installed:
+            continue
+        if installed and expiry <= now.astimezone(dt.timezone.utc):
+            raise AwgctlError("installed managed client crossed its expiry boundary")
         if expiry <= deadline.astimezone(dt.timezone.utc):
             raise AwgctlError(
                 "managed client expiry is at or before the rollback deadline"
@@ -4189,6 +4414,11 @@ def validate_pending_transition_artifacts(
         server_config=pending_server_bytes,
         header_key=header,
         profiles=tuple(profile_snapshots),
+        peer_public_keys=frozenset(
+            client["public_key"]
+            for client in clients
+            if client_is_server_eligible(client, now=now)
+        ),
     )
 
 
@@ -4486,6 +4716,52 @@ def schedule_transition_timeout(
         ],
         timeout=15,
     )
+
+
+def verify_transition_timeout(transaction_id: str, *, deadline_at: str) -> None:
+    deadline = _transition_time(deadline_at, "deadline_at")
+    timer, _ = transition_unit_names(transaction_id)
+    argv = [
+        "systemctl",
+        "show",
+        "--no-pager",
+        "--property=ActiveState",
+        "--property=NextElapseUSecRealtime",
+        "--timestamp=unix",
+        timer,
+    ]
+    try:
+        result = run(argv, check=False, timeout=15)
+        if result.returncode != 0:
+            raise AwgctlError("automatic rollback timer could not be verified")
+        lines = result.stdout.decode("ascii").splitlines()
+        properties: dict[str, str] = {}
+        for line in lines:
+            if line.count("=") != 1:
+                raise AwgctlError("automatic rollback timer could not be verified")
+            name, value = line.split("=", 1)
+            if name in properties:
+                raise AwgctlError("automatic rollback timer could not be verified")
+            properties[name] = value
+        if set(properties) != {"ActiveState", "NextElapseUSecRealtime"}:
+            raise AwgctlError("automatic rollback timer could not be verified")
+        timestamp = re.fullmatch(
+            r"@(?P<seconds>[0-9]{1,20})(?:\.(?P<fraction>[0-9]{1,6}))?",
+            properties["NextElapseUSecRealtime"],
+        )
+        if (
+            properties["ActiveState"] != "active"
+            or timestamp is None
+            or (timestamp.group("fraction") or "").strip("0")
+            or int(timestamp.group("seconds")) != int(deadline.timestamp())
+        ):
+            raise AwgctlError("automatic rollback timer could not be verified")
+    except AwgctlError as exc:
+        if str(exc) == "automatic rollback timer could not be verified":
+            raise
+        raise AwgctlError("automatic rollback timer could not be verified") from exc
+    except (OSError, UnicodeError, ValueError) as exc:
+        raise AwgctlError("automatic rollback timer could not be verified") from exc
 
 
 def transition_unit_names(transaction_id: str) -> tuple[str, str]:
@@ -4990,8 +5266,11 @@ def _install_active_transition(
             created_at=created_at,
         )
         pending_server = snapshot.server_config.decode("utf-8")
-        reservation.release()
-        if not commit_server_config(pending_server, runtime_action="reload"):
+        if not commit_server_config(
+            pending_server,
+            runtime_action="reload",
+            before_runtime_action=reservation.release,
+        ):
             raise AwgctlError("activation requires an active reloaded interface")
         write_activation_journal(
             transaction_id,
@@ -5017,10 +5296,19 @@ def _install_active_transition(
             document["client_name"],
             now=activation_now,
         )
+        verify_active_transition_postcondition(
+            snapshot.config,
+            pending_server,
+            current_clients,
+            now=activation_now,
+            document=document,
+            snapshot=snapshot,
+        )
         ensure_activation_window(
             current_clients,
             now=activation_now,
             deadline=deadline,
+            installed_public_keys=snapshot.peer_public_keys,
         )
         handshakes = handshake_map(snapshot.config["interface"])
         counters = transfer_map(snapshot.config["interface"])
@@ -5052,6 +5340,12 @@ def _install_active_transition(
         schedule_transition_timeout(
             transaction_id,
             timeout,
+            deadline_at=active["deadline_at"],
+        )
+        if dt.datetime.now(dt.timezone.utc) >= deadline:
+            raise AwgctlError("automatic rollback timer was armed after its deadline")
+        verify_transition_timeout(
+            transaction_id,
             deadline_at=active["deadline_at"],
         )
         write_activation_journal(
@@ -7706,14 +8000,6 @@ def dispatch(args: argparse.Namespace) -> int:
             print(f"awgctl {VERSION}")
         return 0
     require_root()
-    if args.command == "_firewall" and load_transition_document(required=False) is not None:
-        # Service start/restart already holds the manager lock while its trusted
-        # PostUp/PostDown hook runs, so the hook cannot acquire the same lock.
-        # This exact protected-state fence still prevents a direct lifecycle
-        # helper invocation from mutating firewall state mid-transition.
-        raise AwgctlError(
-            "obfuscation transition is pending; complete its lifecycle first"
-        )
     if _requires_transition_interlock(args):
         if getattr(args, "dry_run", False):
             if load_transition_document(required=False) is not None:
@@ -7768,7 +8054,10 @@ def dispatch(args: argparse.Namespace) -> int:
         }
         return handlers[args.obfuscation_command](args)
     if args.command == "_firewall":
-        return cmd_firewall(args)
+        if consume_firewall_hook_authorization(args.firewall_action):
+            return cmd_firewall(args)
+        with mutation_lock():
+            return cmd_firewall(args)
     if args.command == "_migrate-existing":
         return cmd_migrate_existing(args)
     if args.command == "_initialize-fresh":
