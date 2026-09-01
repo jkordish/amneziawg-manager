@@ -5516,11 +5516,17 @@ def _transition_unit_text(
     )
     timer_name, service_name = names
     purpose = "activation recovery" if recovery else "unconfirmed activation rollback"
+    systemd_deadline = deadline.astimezone(dt.timezone.utc).strftime(
+        "%Y-%m-%d %H:%M:%S UTC"
+    )
     service = (
         "[Unit]\n"
-        f"Description=AmneziaWG {purpose} for {transaction_id}\n\n"
+        f"Description=AmneziaWG {purpose} for {transaction_id}\n"
+        "StartLimitIntervalSec=0\n\n"
         "[Service]\n"
         "Type=oneshot\n"
+        "Restart=on-failure\n"
+        "RestartSec=5s\n"
         f"ExecStart={INTERNAL_ENTRYPOINT} _obfuscation-timeout {transaction_id} "
         f"--origin {'recovery' if recovery else 'final'}\n"
     )
@@ -5528,7 +5534,7 @@ def _transition_unit_text(
         "[Unit]\n"
         f"Description=AmneziaWG {purpose} deadline for {transaction_id}\n\n"
         "[Timer]\n"
-        f"OnCalendar={_utc_z(deadline)}\n"
+        f"OnCalendar={systemd_deadline}\n"
         "AccuracySec=1s\n"
         "Persistent=true\n"
         f"Unit={service_name}\n\n"
@@ -6318,9 +6324,10 @@ def _install_active_transition(
     created_at = document["prepared_at"]
     try:
         recovery_now = dt.datetime.now(dt.timezone.utc).replace(microsecond=0)
+        recovery_deadline = recovery_now + dt.timedelta(minutes=10)
         schedule_transition_recovery(
             transaction_id,
-            deadline_at=_utc_z(recovery_now + dt.timedelta(minutes=10)),
+            deadline_at=_utc_z(recovery_deadline),
         )
         write_activation_journal(transaction_id, phase="intent", created_at=created_at)
         write_activation_journal(
@@ -6359,6 +6366,8 @@ def _install_active_transition(
         # been proven. Preserved classic statistics therefore become the proof
         # floor and can never satisfy confirmation by themselves.
         activation_now = dt.datetime.now(dt.timezone.utc).replace(microsecond=0)
+        if activation_now >= recovery_deadline:
+            raise AwgctlError("activation work exceeded the exact recovery deadline")
         deadline = activation_now + dt.timedelta(minutes=10)
         current_clients = load_clients(include_secrets=True)
         target, _ = _prepare_transition_clients(
@@ -6386,6 +6395,8 @@ def _install_active_transition(
             raise AwgctlError("cannot capture the managed client's activation counter floor")
         pre_rx, pre_tx = counters[target["public_key"]]
         pre_handshake = handshakes.get(target["public_key"], 0)
+        if dt.datetime.now(dt.timezone.utc) >= recovery_deadline:
+            raise AwgctlError("activation work exceeded the exact recovery deadline")
         active = copy.deepcopy(document)
         active.update(
             state="active",
@@ -6405,25 +6416,35 @@ def _install_active_transition(
             phase="active",
             created_at=created_at,
         )
-        if dt.datetime.now(dt.timezone.utc) >= deadline:
+        timer_now = dt.datetime.now(dt.timezone.utc)
+        if timer_now >= deadline:
             raise AwgctlError("activation work exceeded the exact rollback deadline")
+        if timer_now >= recovery_deadline:
+            raise AwgctlError("activation work exceeded the exact recovery deadline")
         schedule_transition_timeout(
             transaction_id,
             timeout,
             deadline_at=active["deadline_at"],
         )
-        if dt.datetime.now(dt.timezone.utc) >= deadline:
+        timer_now = dt.datetime.now(dt.timezone.utc)
+        if timer_now >= deadline:
             raise AwgctlError("automatic rollback timer was armed after its deadline")
+        if timer_now >= recovery_deadline:
+            raise AwgctlError("automatic rollback timer was armed after the recovery deadline")
         verify_transition_timeout(
             transaction_id,
             deadline_at=active["deadline_at"],
         )
+        if dt.datetime.now(dt.timezone.utc) >= recovery_deadline:
+            raise AwgctlError("automatic rollback proof exceeded the recovery deadline")
         write_activation_journal(
             transaction_id,
             phase="final-armed",
             created_at=created_at,
         )
         cancel_transition_recovery(transaction_id)
+        if dt.datetime.now(dt.timezone.utc) >= recovery_deadline:
+            raise AwgctlError("recovery cancellation exceeded the recovery deadline")
         delete_activation_journal(transaction_id)
         return active
     finally:

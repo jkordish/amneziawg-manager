@@ -37,7 +37,11 @@ def durable_systemd_runner(argv, **kwargs):
             for line in timer_text.splitlines()
             if line.startswith("OnCalendar=")
         )
-        epoch = int(core._transition_time(deadline, "deadline_at").timestamp())
+        parsed_deadline = dt.datetime.strptime(
+            deadline,
+            "%Y-%m-%d %H:%M:%S UTC",
+        ).replace(tzinfo=dt.timezone.utc)
+        epoch = int(parsed_deadline.timestamp())
         return subprocess.CompletedProcess(
             argv,
             0,
@@ -3125,7 +3129,7 @@ class ObfuscationActivateTests(unittest.TestCase):
                     service_text,
                 )
                 self.assertNotIn("%i", service_text)
-                self.assertIn(f"OnCalendar={deadline}", timer_text)
+                self.assertIn("OnCalendar=2026-09-01 10:11:00 UTC", timer_text)
                 self.assertIn("Persistent=true", timer_text)
                 self.assertIn("AccuracySec=1s", timer_text)
                 self.assertIn(f"Unit={base}.service", timer_text)
@@ -3136,6 +3140,56 @@ class ObfuscationActivateTests(unittest.TestCase):
                 timer = f"awgctl-obfuscation-{kind}-{TRANSACTION_ID}.timer"
                 self.assertIn(["systemctl", "enable", timer], commands)
                 self.assertIn(["systemctl", "restart", timer], commands)
+
+    def test_transition_timers_render_systemd_native_utc_calendar(self):
+        for recovery in (True, False):
+            with self.subTest(recovery=recovery):
+                _names, (timer, _service) = core._transition_unit_text(
+                    TRANSACTION_ID,
+                    deadline_at="2026-09-01T10:11:00Z",
+                    recovery=recovery,
+                )
+                self.assertIn(
+                    "OnCalendar=2026-09-01 10:11:00 UTC\n",
+                    timer,
+                )
+                self.assertNotIn("OnCalendar=2026-09-01T10:11:00Z", timer)
+
+    def test_transition_timer_calendar_is_accepted_by_systemd_analyze(self):
+        systemd_analyze = shutil.which("systemd-analyze")
+        if systemd_analyze is None:
+            self.skipTest("systemd-analyze is unavailable")
+        _names, (timer, _service) = core._transition_unit_text(
+            TRANSACTION_ID,
+            deadline_at="2026-09-01T10:11:00Z",
+            recovery=False,
+        )
+        expression = next(
+            line.removeprefix("OnCalendar=")
+            for line in timer.splitlines()
+            if line.startswith("OnCalendar=")
+        )
+        result = subprocess.run(
+            [systemd_analyze, "calendar", expression],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            check=False,
+            timeout=15,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_recovery_and_final_timeout_services_retry_lock_contention(self):
+        for recovery in (True, False):
+            with self.subTest(recovery=recovery):
+                _names, (_timer, service) = core._transition_unit_text(
+                    TRANSACTION_ID,
+                    deadline_at="2026-09-01T10:11:00Z",
+                    recovery=recovery,
+                )
+                self.assertIn("StartLimitIntervalSec=0\n", service)
+                self.assertIn("Restart=on-failure\n", service)
+                self.assertIn("RestartSec=5s\n", service)
 
     def test_durable_unit_proof_requires_literal_root_ownership(self):
         self.assertTrue(
@@ -3309,6 +3363,164 @@ class ObfuscationActivateTests(unittest.TestCase):
                         )
 
                 recovery_cancel.assert_not_called()
+
+    def test_activation_crossing_recovery_deadline_restores_classic_before_final_activation(self):
+        class SlowActivationClock(dt.datetime):
+            calls = 0
+
+            @classmethod
+            def now(cls, tz=None):
+                cls.calls += 1
+                minute = 12 if cls.calls >= 6 else 1
+                return cls(
+                    2026,
+                    9,
+                    1,
+                    10,
+                    minute,
+                    tzinfo=dt.timezone.utc,
+                )
+
+        args = argparse.Namespace(
+            transaction_id=TRANSACTION_ID,
+            ingress_ready=True,
+            timeout="10m",
+            json=True,
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            with patched_layout(root):
+                document, classic, client, awg31, server, profile, backup = prepared_state()
+                classic_server = core.GENERATED_CONFIG.read_bytes()
+                classic_profile = (
+                    core.CLIENTS / "kat-iphone/kat-iphone.conf"
+                ).read_bytes()
+                with mock.patch.object(core, "validate_native_server"):
+                    snapshot = core.validate_pending_transition_artifacts(
+                        document,
+                        [client],
+                        now=dt.datetime(
+                            2026,
+                            9,
+                            1,
+                            10,
+                            1,
+                            tzinfo=dt.timezone.utc,
+                        ),
+                    )
+                systemd_calls = []
+                restore_events = []
+
+                def commit(text, *, runtime_action, before_runtime_action):
+                    core.atomic_write(core.GENERATED_CONFIG, text, 0o600)
+                    core.atomic_write(core.RUNTIME_CONFIG, text, 0o600)
+                    before_runtime_action()
+                    return True
+
+                def runner(argv, **kwargs):
+                    systemd_calls.append(list(argv))
+                    return durable_systemd_runner(argv, **kwargs)
+
+                def restore(backup_name, expected_document, *, now):
+                    restore_events.append("classic-restored")
+                    self.assertEqual(backup_name, document["backup_name"])
+                    self.assertEqual(
+                        expected_document["transaction_id"],
+                        TRANSACTION_ID,
+                    )
+                    core.atomic_json(core.CONFIG_FILE, classic, 0o600)
+                    with contextlib.suppress(FileNotFoundError):
+                        core.HEADER_PROTECTION_KEY.unlink()
+                    core.atomic_write(core.GENERATED_CONFIG, classic_server, 0o600)
+                    core.atomic_write(core.RUNTIME_CONFIG, classic_server, 0o600)
+                    core.atomic_write(
+                        core.CLIENTS / "kat-iphone/kat-iphone.conf",
+                        classic_profile,
+                        0o600,
+                    )
+
+                patches = [
+                    mock.patch.object(core.dt, "datetime", SlowActivationClock),
+                    mock.patch.object(
+                        core,
+                        "mutation_lock",
+                        return_value=contextlib.nullcontext(),
+                    ),
+                    mock.patch.object(core, "ensure_no_drift"),
+                    mock.patch.object(
+                        core,
+                        "verify_transition_backup_precondition",
+                        return_value=backup,
+                    ),
+                    mock.patch.object(
+                        core,
+                        "managed_transition_prestate_digest",
+                        return_value="ab" * 32,
+                    ),
+                    mock.patch.object(
+                        core,
+                        "require_awg31_capability",
+                        return_value=document["capability"],
+                    ),
+                    mock.patch.object(
+                        core,
+                        "ingress_boundary_attestation",
+                        return_value="lightsail",
+                    ),
+                    mock.patch.object(core, "udp_port_is_listening", return_value=False),
+                    mock.patch.object(core, "is_service_active", return_value=True),
+                    mock.patch.object(
+                        core,
+                        "acquire_udp_port_reservation",
+                        return_value=mock.Mock(),
+                    ),
+                    mock.patch.object(core, "load_clients", return_value=[client]),
+                    mock.patch.object(
+                        core,
+                        "validate_pending_transition_artifacts",
+                        return_value=snapshot,
+                    ),
+                    mock.patch.object(core, "commit_server_config", side_effect=commit),
+                    mock.patch.object(core, "verify_active_transition_postcondition"),
+                    mock.patch.object(core, "handshake_map", return_value={key(3): 0}),
+                    mock.patch.object(
+                        core,
+                        "transfer_map",
+                        return_value={key(3): (100, 200)},
+                    ),
+                    mock.patch.object(core, "run", side_effect=runner),
+                    mock.patch.object(
+                        core,
+                        "restore_obfuscation_backup",
+                        side_effect=restore,
+                    ),
+                    mock.patch.object(core, "audit"),
+                    contextlib.redirect_stdout(io.StringIO()),
+                ]
+                with contextlib.ExitStack() as stack:
+                    for patcher in patches:
+                        stack.enter_context(patcher)
+                    with self.assertRaisesRegex(
+                        core.AwgctlError,
+                        "classic state restored",
+                    ):
+                        core.cmd_obfuscation_activate(args)
+
+                self.assertEqual(restore_events, ["classic-restored"])
+                self.assertEqual(core.load_config()["obfuscation"]["mode"], "classic")
+                self.assertIsNone(core.load_transition_document(required=False))
+                self.assertEqual(
+                    core.load_transition_outcome()["reason"],
+                    "activation-failed",
+                )
+                self.assertFalse(
+                    any(
+                        call[:2] == ["systemctl", "restart"]
+                        and "obfuscation-rollback" in call[-1]
+                        for call in systemd_calls
+                    ),
+                    "final activation timer must not be armed after recovery expiry",
+                )
 
     def test_delayed_final_clock_recheck_rejects_midnight_crossing_before_artifact_mutation(self):
         instants = iter(
@@ -3598,7 +3810,7 @@ class ObfuscationActivateTests(unittest.TestCase):
                         self.fail(f"activation is incomplete: {exc}")
 
                 self.assertEqual(result, 0)
-                self.assertEqual(ActivationClock.calls, 8)
+                self.assertEqual(ActivationClock.calls, 11)
                 self.assertEqual(reloads, ["reload"])
                 active = core.load_transition_document()
                 self.assertEqual(active["state"], "active")

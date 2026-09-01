@@ -573,6 +573,123 @@ class UpgradeTests(unittest.TestCase):
         self.assertIn("final identity authority remains", message)
         self.assertIn("bootstrap identity authority remains", message)
 
+    def test_fresh_deployment_failure_preserves_identity_rollback_failure(self):
+        from awginstall import cli
+        from awginstall.host import HostConfigurationError
+
+        bootstrap_report = object()
+        errors = io.StringIO()
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory) / "opt/amneziawg"
+            with (
+                mock.patch.object(
+                    cli,
+                    "validate_platform",
+                    return_value={"version": "24.04", "architecture": "amd64"},
+                ),
+                mock.patch.object(cli.pathlib.Path, "exists", return_value=False),
+                mock.patch.object(cli, "_install_amneziawg_packages"),
+                mock.patch.object(
+                    cli,
+                    "_configure_host_for_command",
+                    return_value=bootstrap_report,
+                ),
+                mock.patch.object(
+                    cli,
+                    "_deploy_source_release",
+                    side_effect=InstallerError("fresh deployment failed"),
+                ),
+                mock.patch.object(
+                    cli,
+                    "rollback_host_configuration",
+                    side_effect=HostConfigurationError("fresh identity authority remains"),
+                ) as rollback,
+                mock.patch("sys.stderr", errors),
+            ):
+                result = installer_main(
+                    [
+                        "install",
+                        "--yes",
+                        "--endpoint",
+                        "vpn.example.com",
+                        "--external-interface",
+                        "ens5",
+                        "--ingress-boundary",
+                        "lightsail",
+                    ],
+                    root=root,
+                    repo_root=REPO_ROOT,
+                    output=io.StringIO(),
+                )
+
+        self.assertEqual(result, 1)
+        rollback.assert_called_once_with(bootstrap_report)
+        message = errors.getvalue()
+        self.assertIn("fresh deployment failed", message)
+        self.assertIn("fresh identity authority remains", message)
+
+    def test_adopt_deployment_failure_preserves_identity_rollback_failure(self):
+        from awginstall import cli
+        from awginstall.host import HostConfigurationError
+
+        bootstrap_report = object()
+        errors = io.StringIO()
+        with tempfile.TemporaryDirectory() as directory:
+            directory_path = pathlib.Path(directory)
+            root = directory_path / "opt/amneziawg"
+            server = directory_path / "server.conf"
+            client = directory_path / "client.conf"
+            server.write_text("server\n")
+            client.write_text("client\n")
+            with (
+                mock.patch.object(
+                    cli,
+                    "validate_platform",
+                    return_value={"version": "24.04", "architecture": "amd64"},
+                ),
+                mock.patch.object(cli.shutil, "which", return_value="/usr/bin/tool"),
+                mock.patch.object(
+                    cli,
+                    "_configure_host_for_command",
+                    return_value=bootstrap_report,
+                ),
+                mock.patch.object(
+                    cli,
+                    "_deploy_source_release",
+                    side_effect=InstallerError("adopt deployment failed"),
+                ),
+                mock.patch.object(
+                    cli,
+                    "rollback_host_configuration",
+                    side_effect=HostConfigurationError("adopt identity authority remains"),
+                ) as rollback,
+                mock.patch("sys.stderr", errors),
+            ):
+                result = installer_main(
+                    [
+                        "adopt",
+                        "--yes",
+                        "--server-config",
+                        str(server),
+                        "--client-config",
+                        str(client),
+                        "--external-interface",
+                        "ens5",
+                        "--ingress-boundary",
+                        "lightsail",
+                    ],
+                    root=root,
+                    repo_root=REPO_ROOT,
+                    output=io.StringIO(),
+                )
+
+        self.assertEqual(result, 1)
+        rollback.assert_called_once_with(bootstrap_report)
+        message = errors.getvalue()
+        self.assertIn("adopt deployment failed", message)
+        self.assertIn("adopt identity authority remains", message)
+
     def test_first_upgrade_rolls_back_bootstrap_when_final_host_configuration_fails(self):
         from awginstall import cli
         from awginstall.host import HostConfigurationError

@@ -335,8 +335,11 @@ class RepositoryDryRunAcceptanceTests(unittest.TestCase):
                 f"_obfuscation-timeout {TRANSACTION_ID} --origin final",
                 service,
             )
-            self.assertIn(f"OnCalendar={deadline}", timer)
+            self.assertIn("OnCalendar=2026-09-01 10:11:00 UTC", timer)
             self.assertIn("Persistent=true", timer)
+            self.assertIn("StartLimitIntervalSec=0", service)
+            self.assertIn("Restart=on-failure", service)
+            self.assertIn("RestartSec=5s", service)
             commands = [call.args[0] for call in runner.call_args_list]
             self.assertIn(["systemctl", "enable", f"{base}.timer"], commands)
             self.assertIn(["systemctl", "restart", f"{base}.timer"], commands)
