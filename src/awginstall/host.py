@@ -41,6 +41,12 @@ class HostPaths:
         "/etc/systemd/system/awg-quick@awg0.service.d/20-awgctl-hardening.conf"
     )
     module_load: pathlib.Path = pathlib.Path("/etc/modules-load.d/amneziawg-manager.conf")
+    expiry_service: pathlib.Path = pathlib.Path(
+        "/etc/systemd/system/amneziawg-client-expiry.service"
+    )
+    expiry_timer: pathlib.Path = pathlib.Path(
+        "/etc/systemd/system/amneziawg-client-expiry.timer"
+    )
 
     @classmethod
     def under(cls, root: pathlib.Path) -> "HostPaths":
@@ -48,6 +54,8 @@ class HostPaths:
             sudoers=root / "etc/sudoers.d/amneziawg-manager",
             service_dropin=root / "etc/systemd/system/awg-quick@awg0.service.d/20-awgctl-hardening.conf",
             module_load=root / "etc/modules-load.d/amneziawg-manager.conf",
+            expiry_service=root / "etc/systemd/system/amneziawg-client-expiry.service",
+            expiry_timer=root / "etc/systemd/system/amneziawg-client-expiry.timer",
         )
 
 
@@ -103,6 +111,36 @@ def _restore_file(path: pathlib.Path, snapshot: _FileSnapshot) -> None:
         _atomic_write(path, snapshot.data, snapshot.mode)
     else:
         path.unlink(missing_ok=True)
+
+
+def _render_expiry_service(product_root: pathlib.Path) -> str:
+    return (
+        "# Managed by AmneziaWG Manager\n"
+        "[Unit]\n"
+        "Description=Expire due AmneziaWG clients\n"
+        "After=awg-quick@awg0.service\n\n"
+        "[Service]\n"
+        "Type=oneshot\n"
+        f"ExecStart={product_root / 'libexec/awgctl-internal'} _expire-clients\n"
+        "User=root\n"
+        "Group=root\n"
+        "UMask=0077\n"
+    )
+
+
+def _render_expiry_timer() -> str:
+    return (
+        "# Managed by AmneziaWG Manager\n"
+        "[Unit]\n"
+        "Description=Run AmneziaWG client expiry daily\n\n"
+        "[Timer]\n"
+        "OnCalendar=daily\n"
+        "Persistent=true\n"
+        "RandomizedDelaySec=15m\n"
+        "Unit=amneziawg-client-expiry.service\n\n"
+        "[Install]\n"
+        "WantedBy=timers.target\n"
+    )
 
 
 def _run_local(argv: Sequence[str]) -> subprocess.CompletedProcess[bytes]:
@@ -256,6 +294,19 @@ def rollback_host_configuration(
     if report.rollback_files is None:
         raise HostConfigurationError("host configuration report has no rollback snapshot")
     errors: list[str] = []
+    expiry_timer_snapshot = next(
+        (
+            previous
+            for path, previous in report.rollback_files.items()
+            if path.name == "amneziawg-client-expiry.timer"
+        ),
+        None,
+    )
+    if expiry_timer_snapshot is not None and not expiry_timer_snapshot.exists:
+        try:
+            runner(("systemctl", "disable", "--now", "amneziawg-client-expiry.timer"))
+        except Exception as exc:
+            errors.append(f"disable expiry timer: {exc}")
     for path, previous in report.rollback_files.items():
         try:
             _restore_file(path, previous)
@@ -301,7 +352,14 @@ def configure_host(
         return report
 
     installation_path = product_root / "config/installation.json"
-    managed_paths = (paths.sudoers, paths.service_dropin, paths.module_load, installation_path)
+    managed_paths = (
+        paths.sudoers,
+        paths.service_dropin,
+        paths.module_load,
+        paths.expiry_service,
+        paths.expiry_timer,
+        installation_path,
+    )
     file_snapshots = {path: _file_snapshot(path) for path in managed_paths}
     report = replace(report, rollback_files=file_snapshots)
     commands_started = False
@@ -324,12 +382,17 @@ def configure_host(
         else:
             paths.service_dropin.unlink(missing_ok=True)
         _atomic_write(paths.module_load, module_load.encode("utf-8"), 0o644)
+        _atomic_write(paths.expiry_service, _render_expiry_service(product_root).encode("utf-8"), 0o644)
+        _atomic_write(paths.expiry_timer, _render_expiry_timer().encode("utf-8"), 0o644)
         _atomic_write(
             installation_path,
             (json.dumps(settings_document, indent=2, sort_keys=True) + "\n").encode("utf-8"),
             0o600,
         )
-        runner(("systemd-analyze", "verify", "awg-quick@awg0.service"))
+        runner((
+            "systemd-analyze", "verify", "awg-quick@awg0.service",
+            "amneziawg-client-expiry.service", "amneziawg-client-expiry.timer",
+        ))
         runner(("systemctl", "daemon-reload"))
 
         if snapshot is None:
@@ -337,8 +400,14 @@ def configure_host(
             post_plan = build_identity_plan(settings, verified, allow_existing=True)
             if post_plan.commands:
                 raise HostConfigurationError("host identities did not converge to the requested policy")
+        runner(("systemctl", "enable", "--now", "amneziawg-client-expiry.timer"))
         return report
     except Exception as exc:
+        if not file_snapshots[paths.expiry_timer].exists:
+            try:
+                runner(("systemctl", "disable", "--now", "amneziawg-client-expiry.timer"))
+            except Exception:
+                pass
         for path, previous in file_snapshots.items():
             try:
                 _restore_file(path, previous)

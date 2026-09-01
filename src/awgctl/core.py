@@ -524,10 +524,12 @@ def generate_classic_obfuscation(random_source: Any | None = None) -> dict[str, 
     s2 = source.randint(15, 150)
     while s1 + 56 == s2:
         s2 = source.randint(15, 150)
-    headers: set[int] = set()
+    headers: list[int] = []
     while len(headers) < 4:
-        headers.add(source.randint(5, 2_147_483_647))
-    h1, h2, h3, h4 = sorted(headers)
+        candidate = source.randint(5, 2_147_483_647)
+        if candidate not in headers:
+            headers.append(candidate)
+    h1, h2, h3, h4 = headers
     return {
         "Jc": source.randint(4, 12),
         "Jmin": 8,
@@ -652,6 +654,30 @@ def find_duplicate_client_state(clients: Sequence[dict[str, Any]]) -> list[str]:
     return problems
 
 
+def effective_client_status(
+    client: dict[str, Any], *, now: dt.datetime | None = None
+) -> str:
+    """Return fail-closed runtime eligibility status at the current UTC instant."""
+    stored_status = str(client.get("status", "active"))
+    if stored_status != "active":
+        return stored_status
+    expires = client.get("expires")
+    if expires is None:
+        return "active"
+    current = now or dt.datetime.now(dt.timezone.utc)
+    if current.tzinfo is None:
+        current = current.replace(tzinfo=dt.timezone.utc)
+    expiry = dt.datetime.combine(dt.date.fromisoformat(expires), dt.time.min, dt.timezone.utc)
+    return "expired" if current.astimezone(dt.timezone.utc) >= expiry else "active"
+
+
+def client_is_server_eligible(
+    client: dict[str, Any], *, now: dt.datetime | None = None
+) -> bool:
+    """Central peer eligibility predicate for all server configuration renders."""
+    return effective_client_status(client, now=now) == "active"
+
+
 def render_server_config(
     config: dict[str, Any], server_private: str, clients: Sequence[dict[str, Any]]
 ) -> str:
@@ -674,6 +700,8 @@ def render_server_config(
         "PostDown = /opt/amneziawg/libexec/awgctl-internal _firewall down",
     ])
     for client in clients:
+        if not client_is_server_eligible(client):
+            continue
         validate_client_name(client["name"])
         validate_key(client["public_key"], "client public key")
         address = ipaddress.ip_interface(client["address"])
@@ -775,7 +803,7 @@ def load_clients(*, include_secrets: bool = False) -> list[dict[str, Any]]:
             metadata = normalize_client_metadata(metadata)
         except ContractError as exc:
             raise AwgctlError(f"invalid client metadata: {directory.name}: {exc}") from exc
-        if metadata.get("name") != directory.name or metadata.get("status") != "active":
+        if metadata.get("name") != directory.name or metadata.get("status") not in {"active", "expired"}:
             raise AwgctlError(f"invalid active client metadata: {directory.name}")
         validate_key(metadata.get("public_key", ""), "client public key")
         try:
@@ -1317,7 +1345,18 @@ def format_age(timestamp: int, *, now: int | None = None) -> str:
     return f"{hours // 24}d ago"
 
 
-def suspicious_wildcard_listeners(ss_output: str, *, vpn_port: int) -> list[str]:
+def suspicious_wildcard_listeners(
+    ss_output: str,
+    *,
+    vpn_port: int,
+    vpn_addresses: Iterable[str] = (),
+) -> list[str]:
+    managed_addresses: set[str] = set()
+    for value in vpn_addresses:
+        try:
+            managed_addresses.add(str(ipaddress.ip_interface(value).ip))
+        except ValueError:
+            continue
     listeners: list[str] = []
     for line in ss_output.splitlines():
         fields = line.split()
@@ -1326,7 +1365,20 @@ def suspicious_wildcard_listeners(ss_output: str, *, vpn_port: int) -> list[str]
         protocol = fields[0]
         local = fields[4]
         wildcard = local.startswith("0.0.0.0:") or local.startswith("[::]:") or local.startswith("*:")
-        if not wildcard:
+        host = local.rsplit(":", 1)[0].strip("[]")
+        try:
+            bound_address = ipaddress.ip_address(host)
+        except ValueError:
+            bound_address = None
+        vpn_reachable = (
+            wildcard
+            or (
+                bound_address is not None
+                and not bound_address.is_loopback
+                and str(bound_address) in managed_addresses
+            )
+        )
+        if not vpn_reachable:
             continue
         port_text = local.rsplit(":", 1)[-1]
         try:
@@ -1547,9 +1599,21 @@ def nft_table_active(table: str) -> bool:
     return run(["nft", "list", "table", "ip", table], check=False).returncode == 0
 
 
+def ingress_boundary_attestation() -> str | None:
+    try:
+        return resolve_installation_settings(
+            settings_path=INSTALLATION_CONFIG,
+            sudo_user=None,
+        ).ingress_boundary
+    except SettingsError:
+        return None
+
+
 def cmd_aws_rule(config: dict[str, Any] | None = None, *, as_json: bool = False) -> None:
     config = config or load_config()
+    boundary = ingress_boundary_attestation()
     data = {
+        "ingress_boundary": boundary,
         "type": "Custom",
         "protocol": "UDP",
         "port": config["listen_port"],
@@ -1558,12 +1622,13 @@ def cmd_aws_rule(config: dict[str, Any] | None = None, *, as_json: bool = False)
     if as_json:
         print(json.dumps(json_envelope("aws-rule", data=data), indent=2, sort_keys=True))
         return
-    print("AWS Lightsail inbound requirement")
+    print(f"Inbound requirement (attested boundary: {boundary or 'missing'})")
     print(f"  Custom / UDP / {config['listen_port']} / 0.0.0.0/0")
 
 
 def cmd_status(args: argparse.Namespace) -> int:
     config = load_config()
+    boundary = ingress_boundary_attestation()
     active, enabled = systemctl_state(config["interface"])
     link_result = run(["ip", "-brief", "link", "show", config["interface"]], check=False)
     link_up = link_result.returncode == 0 and "UP" in link_result.stdout.decode("utf-8", "replace")
@@ -1580,7 +1645,7 @@ def cmd_status(args: argparse.Namespace) -> int:
         {
             "name": client["name"],
             "address": str(ipaddress.ip_interface(client["address"]).ip),
-            "status": client.get("status", "active"),
+            "status": effective_client_status(client),
             "management": client.get("management", "managed"),
             "last_handshake": format_age(handshakes.get(client["public_key"], 0)),
         }
@@ -1596,9 +1661,11 @@ def cmd_status(args: argparse.Namespace) -> int:
         "forwarding": forwarding,
         "nat": nft_table_active("amneziawg_nat"),
         "isolation": nft_table_active("amneziawg_forward"),
+        "ingress_boundary": boundary,
         "peer_count": len(peers) if active else 0,
         "clients": client_rows,
-        "lightsail_rule": {
+        "ingress_rule": {
+            "boundary": boundary,
             "type": "Custom",
             "protocol": "UDP",
             "port": config["listen_port"],
@@ -1623,7 +1690,10 @@ def cmd_status(args: argparse.Namespace) -> int:
     if not clients:
         print("  none")
     for client in client_rows:
-        print(f"  {client['name']:<20} {client['address']:<15} {client['last_handshake']}")
+        print(
+            f"  {client['name']:<20} {client['address']:<15} "
+            f"{client['status']:<9} {client['last_handshake']}"
+        )
     cmd_aws_rule(config)
     return 0
 
@@ -1660,6 +1730,18 @@ def management_security_checks() -> list[tuple[str, str, str]]:
     except SettingsError as exc:
         add("FAIL", "manager privilege policy", str(exc))
         return checks
+    if settings.ingress_boundary is None:
+        add(
+            "FAIL",
+            "ingress boundary attestation",
+            "missing; run install.py configure --ingress-boundary VALUE --yes",
+        )
+    else:
+        add(
+            "PASS",
+            "ingress boundary attestation",
+            settings.ingress_boundary,
+        )
 
     try:
         user = pwd.getpwnam(settings.staging_user)
@@ -1831,6 +1913,7 @@ def cmd_health(args: argparse.Namespace) -> int:
         clients = load_clients(include_secrets=True)
         duplicates = find_duplicate_client_state(clients)
         add("FAIL" if duplicates else "PASS", "client uniqueness", "; ".join(duplicates) if duplicates else f"{len(clients)} unique active clients")
+        checks.append(client_expiry_health_check(clients))
         profile_drift: list[str] = []
         external_count = 0
         server_public = server_public_key()
@@ -1852,6 +1935,7 @@ def cmd_health(args: argparse.Namespace) -> int:
             client["name"]
             for client in clients
             if client.get("management", "managed") == "managed"
+            and client_is_server_eligible(client)
             and client.get("distribution_status") in {"pending", "unknown"}
         ]
         add(
@@ -1869,11 +1953,15 @@ def cmd_health(args: argparse.Namespace) -> int:
         add("PASS" if public_ip in addresses else "FAIL", "endpoint/public IPv4", f"endpoint={','.join(addresses)} public={public_ip}")
     else:
         add("WARN", "endpoint/public IPv4", "comparison unavailable")
-    add(
-        "WARN",
-        "Lightsail static IP",
-        "No stable Lightsail public IP was verified. A stop/start can change the instance public IPv4 and break the VPN endpoint DNS record.",
-    )
+    boundary = ingress_boundary_attestation()
+    if boundary == "lightsail":
+        add(
+            "WARN",
+            "Lightsail static IP",
+            "No stable Lightsail public IP was verified. A stop/start can change the instance public IPv4 and break the VPN endpoint DNS record.",
+        )
+    elif boundary == "equivalent-external-firewall":
+        add("PASS", "external ingress boundary", boundary)
     configured_dns_policy = dns_policy_name(config["dns"])
     add(
         "PASS" if configured_dns_policy != "custom" else "WARN",
@@ -1900,7 +1988,11 @@ def cmd_health(args: argparse.Namespace) -> int:
         add("WARN", "package upgrade/DKMS risk", "low disk space may prevent a future kernel/DKMS upgrade; no cleanup was performed")
 
     ss_output = run(["ss", "-H", "-lntup"]).stdout.decode("utf-8", "replace")
-    listeners = suspicious_wildcard_listeners(ss_output, vpn_port=config["listen_port"])
+    listeners = suspicious_wildcard_listeners(
+        ss_output,
+        vpn_port=config["listen_port"],
+        vpn_addresses=(config["server_address"],),
+    )
     if listeners:
         add("WARN", "host listeners reachable through awg0", "; ".join(listeners))
     else:
@@ -1908,7 +2000,13 @@ def cmd_health(args: argparse.Namespace) -> int:
     prometheus = [value for value in listeners if "prometheus" in value.lower() or "/9090" in value or "/9100" in value]
     add("WARN" if prometheus else "PASS", "Prometheus/node-exporter exposure", "; ".join(prometheus) if prometheus else "not detected")
     ufw = run(["ufw", "status"], check=False).stdout.decode("utf-8", "replace")
-    add("WARN" if "Status: active" in ufw else "PASS", "UFW", "active (unexpected)" if "Status: active" in ufw else "inactive; Lightsail remains public-ingress firewall")
+    add(
+        "WARN" if "Status: active" in ufw else "PASS",
+        "UFW",
+        "active (unexpected)"
+        if "Status: active" in ufw
+        else f"inactive; attested ingress boundary: {boundary or 'missing'}",
+    )
 
     failures = sum(1 for level, _, _ in checks if level == "FAIL")
     warnings = sum(1 for level, _, _ in checks if level == "WARN")
@@ -1930,6 +2028,143 @@ def verify_peer_state(interface: str, public_key: str, *, present: bool) -> None
         raise AwgctlError(f"peer did not {expectation} in the running interface")
 
 
+def clients_due_for_expiry(clients: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [
+        client
+        for client in clients
+        if client.get("status", "active") == "active"
+        and effective_client_status(client) == "expired"
+    ]
+
+
+def client_expiry_health_check(clients: Sequence[dict[str, Any]]) -> tuple[str, str, str]:
+    expired = [client["name"] for client in clients if effective_client_status(client) == "expired"]
+    return (
+        "PASS",
+        "client expiry",
+        "expired: " + ", ".join(expired) if expired else "no expired clients",
+    )
+
+
+def ensure_expiry_reconcilable(
+    generated_text: str,
+    config: dict[str, Any],
+    clients: Sequence[dict[str, Any]],
+    due: Sequence[dict[str, Any]],
+) -> None:
+    """Allow only the exact managed pre-expiry peer set before the fail-closed rewrite."""
+    expected = semantic_signature(render_current_server(clients))
+    actual = semantic_signature(generated_text)
+    due_peers: list[tuple[tuple[str, str], ...]] = []
+    for client in due:
+        peer = {
+            "PublicKey": client["public_key"],
+            "AllowedIPs": str(ipaddress.ip_interface(client["address"])),
+        }
+        if config.get("use_psk", True):
+            peer["PresharedKey"] = client["psk"]
+        due_peers.append(tuple(sorted(peer.items())))
+    allowed_peers = sorted([*expected["peers"], *due_peers])
+    if actual["interface"] != expected["interface"] or actual["peers"] != allowed_peers:
+        raise AwgctlError("managed-state drift detected before client expiry")
+
+
+def cmd_client_expire(args: argparse.Namespace) -> int:
+    argv = [str(INTERNAL_ENTRYPOINT), "_expire-clients"]
+    if getattr(args, "dry_run", False):
+        argv.append("--dry-run")
+    if getattr(args, "json", False):
+        argv.append("--json")
+    result = run(argv, timeout=90)
+    sys.stdout.write(result.stdout.decode("utf-8", "replace"))
+    return 0
+
+
+def cmd_expire_clients(args: argparse.Namespace) -> int:
+    with mutation_lock():
+        clients = load_clients()
+        due = clients_due_for_expiry(clients)
+        if getattr(args, "dry_run", False):
+            data = {
+                "dry_run": True,
+                "due_clients": [client["name"] for client in due],
+                "runtime_action": "reload" if due else "none",
+            }
+            if getattr(args, "json", False):
+                print(json.dumps(json_envelope("client expire", data=data), indent=2, sort_keys=True))
+            else:
+                print("Due clients: " + (", ".join(data["due_clients"]) or "none"))
+                print("No state was changed.")
+            return 0
+        try:
+            generated = GENERATED_CONFIG.read_bytes()
+            runtime = RUNTIME_CONFIG.read_bytes()
+        except OSError as exc:
+            raise AwgctlError("cannot read generated/runtime server configuration") from exc
+        if runtime != generated:
+            raise AwgctlError("manual runtime drift detected before client expiry")
+        config = load_config()
+        if not due:
+            data = {"expired_clients": [], "runtime_action": "none", "changed": False}
+            if getattr(args, "json", False):
+                print(json.dumps(json_envelope("client expire", data=data), indent=2, sort_keys=True))
+            else:
+                print("No clients are due for expiry.")
+            return 0
+        clients = load_clients(include_secrets=True)
+        due = clients_due_for_expiry(clients)
+        ensure_expiry_reconcilable(generated.decode("utf-8"), config, clients, due)
+        backup = create_backup()
+        metadata_snapshots = {
+            CLIENTS / client["name"] / "metadata.json":
+            (CLIENTS / client["name"] / "metadata.json").read_bytes()
+            for client in due
+        }
+        timestamp = iso_now()
+        committed = False
+        try:
+            for client in due:
+                metadata_path = CLIENTS / client["name"] / "metadata.json"
+                metadata = json.loads(metadata_snapshots[metadata_path])
+                metadata.update(status="expired", expired_at=timestamp, updated_at=timestamp)
+                atomic_json(metadata_path, metadata, 0o600)
+                client.update(status="expired", expired_at=timestamp, updated_at=timestamp)
+            new_server = render_current_server(clients)
+            active = commit_server_config(new_server, runtime_action="reload")
+            committed = True
+            if active:
+                live = live_peers(config["interface"])
+                remaining = [client["name"] for client in due if client["public_key"] in live]
+                if remaining:
+                    raise AwgctlError(
+                        "expired peers remain in the running interface: " + ", ".join(remaining)
+                    )
+        except Exception:
+            if not committed:
+                for path, content in metadata_snapshots.items():
+                    atomic_write(path, content, 0o600)
+            audit("client expiry failed")
+            raise
+        names = [client["name"] for client in due]
+        audit("clients expired: " + ",".join(names))
+        data = {
+            "expired_clients": names,
+            "runtime_action": "reload" if active else "none-service-stopped",
+            "changed": True,
+            "backup": str(backup),
+        }
+        if getattr(args, "json", False):
+            print(json.dumps(json_envelope("client expire", data=data), indent=2, sort_keys=True))
+        else:
+            print("Expired clients: " + ", ".join(names))
+            print(f"Pre-change backup: {backup}")
+            print(
+                "Expired peers removed from the running server."
+                if active else "Expired peers removed from managed configuration; service is stopped."
+            )
+        return 0
+
+
 def cmd_client_list(args: argparse.Namespace) -> int:
     config = load_config()
     clients = load_clients()
@@ -1943,7 +2178,7 @@ def cmd_client_list(args: argparse.Namespace) -> int:
             {
                 "name": client["name"],
                 "address": str(ipaddress.ip_interface(client["address"]).ip),
-                "status": client.get("status", "active"),
+                "status": effective_client_status(client),
                 "management": client.get("management", "managed"),
                 "owner": client.get("owner"),
                 "device": client.get("device"),
@@ -1956,10 +2191,10 @@ def cmd_client_list(args: argparse.Namespace) -> int:
     if getattr(args, "json", False):
         print(json.dumps(json_envelope("client list", data={"clients": rows}), indent=2, sort_keys=True))
         return 0
-    print(f"{'NAME':<22} {'ADDRESS':<15} {'LAST HANDSHAKE'}")
+    print(f"{'NAME':<22} {'ADDRESS':<15} {'STATUS':<9} {'LAST HANDSHAKE'}")
     for client in rows:
         print(
-            f"{client['name']:<22} {client['address']:<15} {client['last_handshake']}"
+            f"{client['name']:<22} {client['address']:<15} {client['status']:<9} {client['last_handshake']}"
         )
     if not clients:
         print("No active clients.")
@@ -1979,7 +2214,7 @@ def cmd_client_show(args: argparse.Namespace) -> int:
             handshake = handshake_map(config["interface"]).get(client["public_key"], 0)
     data = {
         "name": name,
-        "status": client["status"],
+        "status": effective_client_status(client),
         "management": client.get("management", "managed"),
         "address": client["address"],
         "public_key_fingerprint": client["public_key_fingerprint"],
@@ -2000,7 +2235,7 @@ def cmd_client_show(args: argparse.Namespace) -> int:
         print(json.dumps(json_envelope("client show", data=data), indent=2, sort_keys=True))
         return 0
     print(f"Client: {name}")
-    print(f"  status:                 {client['status']}")
+    print(f"  status:                 {data['status']}")
     print(f"  address:                {client['address']}")
     print(f"  public key fingerprint: {client['public_key_fingerprint']}")
     print(f"  created:                {client['created_at']}")
@@ -2793,16 +3028,20 @@ def cmd_config_set(args: argparse.Namespace) -> int:
                 "backup": "created at execution",
             }
             if args.key == "listen-port":
-                data["aws_firewall_update_required"] = True
-                data["old_aws_rule"] = f"Custom / UDP / {old_display} / 0.0.0.0/0"
-                data["new_aws_rule"] = f"Custom / UDP / {new_display} / 0.0.0.0/0"
+                data["ingress_firewall_update_required"] = True
+                data["ingress_boundary"] = ingress_boundary_attestation()
+                data["old_ingress_rule"] = f"Custom / UDP / {old_display} / 0.0.0.0/0"
+                data["new_ingress_rule"] = f"Custom / UDP / {new_display} / 0.0.0.0/0"
             if getattr(args, "json", False):
                 print(json.dumps(json_envelope("config set", data=data), indent=2, sort_keys=True))
             else:
                 print(f"Dry run: set {args.key}: {old_display} -> {new_display}")
                 print(f"  runtime action: {runtime_action or 'none'}")
                 if args.key == "listen-port":
-                    print("AWS LIGHTSAIL FIREWALL UPDATE REQUIRED")
+                    print(
+                        "INGRESS FIREWALL UPDATE REQUIRED "
+                        f"({data['ingress_boundary'] or 'boundary attestation missing'})"
+                    )
                 print("No state was changed.")
             return 0
         old_config_bytes = CONFIG_FILE.read_bytes()
@@ -2861,9 +3100,10 @@ def cmd_config_set(args: argparse.Namespace) -> int:
         }
         if args.key == "listen-port":
             data.update(
-                aws_firewall_update_required=True,
-                old_aws_rule=f"Custom / UDP / {old_display} / 0.0.0.0/0",
-                new_aws_rule=f"Custom / UDP / {new_display} / 0.0.0.0/0",
+                ingress_firewall_update_required=True,
+                ingress_boundary=ingress_boundary_attestation(),
+                old_ingress_rule=f"Custom / UDP / {old_display} / 0.0.0.0/0",
+                new_ingress_rule=f"Custom / UDP / {new_display} / 0.0.0.0/0",
             )
         if getattr(args, "json", False):
             print(json.dumps(json_envelope("config set", data=data), indent=2, sort_keys=True))
@@ -2877,9 +3117,12 @@ def cmd_config_set(args: argparse.Namespace) -> int:
             else:
                 print("Client profiles updated; no tunnel restart was required.")
             if args.key == "listen-port":
-                print("AWS LIGHTSAIL FIREWALL UPDATE REQUIRED")
-                print(f"  old: {data['old_aws_rule']}")
-                print(f"  new: {data['new_aws_rule']}")
+                print(
+                    "INGRESS FIREWALL UPDATE REQUIRED "
+                    f"({data['ingress_boundary'] or 'boundary attestation missing'})"
+                )
+                print(f"  old: {data['old_ingress_rule']}")
+                print(f"  new: {data['new_ingress_rule']}")
     return 0
 
 
@@ -3303,7 +3546,11 @@ def cmd_initialize_fresh(args: argparse.Namespace) -> int:
         print(f"Config: {CLIENTS / client_name / (client_name + '.conf')}")
         print(f"QR: {CLIENTS / client_name / (client_name + '.png')}")
         print(f"Initial verified backup: {backup}")
-        print(f"AWS LIGHTSAIL RULE REQUIRED: Custom / UDP / {config['listen_port']} / 0.0.0.0/0")
+        print(
+            "INGRESS RULE REQUIRED "
+            f"({ingress_boundary_attestation() or 'boundary attestation missing'}): "
+            f"Custom / UDP / {config['listen_port']} / 0.0.0.0/0"
+        )
     return 0
 
 
@@ -3440,6 +3687,9 @@ def build_parser(*, entrypoint: str = "public") -> argparse.ArgumentParser:
         fresh.add_argument("--first-client", default="admin-phone")
         fresh.add_argument("--owner")
         fresh.add_argument("--device")
+        expire = subcommands.add_parser("_expire-clients", help=argparse.SUPPRESS)
+        expire.add_argument("--dry-run", action="store_true")
+        expire.add_argument("--json", action="store_true")
         return parser
 
     def output_flag(command: argparse.ArgumentParser) -> None:
@@ -3489,6 +3739,9 @@ def build_parser(*, entrypoint: str = "public") -> argparse.ArgumentParser:
     client_parser = subcommands.add_parser("client")
     client_commands = client_parser.add_subparsers(dest="client_command", required=True)
     output_flag(client_commands.add_parser("list"))
+    client_expire = client_commands.add_parser("expire")
+    output_flag(client_expire)
+    dry_run_flag(client_expire)
     for name in ("add", "show", "qr", "revoke", "rotate"):
         command = client_commands.add_parser(name)
         if name == "add":
@@ -3570,6 +3823,7 @@ def dispatch(args: argparse.Namespace) -> int:
     if args.command == "client":
         handlers = {
             "list": cmd_client_list,
+            "expire": cmd_client_expire,
             "add": cmd_client_add,
             "show": cmd_client_show,
             "export": cmd_client_export,
@@ -3586,6 +3840,8 @@ def dispatch(args: argparse.Namespace) -> int:
         return cmd_migrate_existing(args)
     if args.command == "_initialize-fresh":
         return cmd_initialize_fresh(args)
+    if args.command == "_expire-clients":
+        return cmd_expire_clients(args)
     raise AwgctlError("unknown command")
 
 

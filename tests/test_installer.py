@@ -118,6 +118,18 @@ class UpgradeTests(unittest.TestCase):
                 parsed = parser.parse_args([command, "--dry-run"] if command != "check" else [command])
                 self.assertEqual(parsed.command, command)
 
+    def test_ingress_boundary_override_is_available_on_policy_flows(self):
+        parser = build_parser()
+        for command in ("check", "install", "configure", "upgrade"):
+            argv = [command, "--ingress-boundary", "lightsail"]
+            if command != "check":
+                argv.append("--dry-run")
+            if command == "install":
+                argv.extend(["--endpoint", "vpn.example.com"])
+            with self.subTest(command=command):
+                parsed = parser.parse_args(argv)
+                self.assertEqual(parsed.ingress_boundary, "lightsail")
+
     def test_installer_exposes_security_overrides_and_filtered_dns_default(self):
         parser = build_parser()
         defaults = parser.parse_args(["install", "--dry-run", "--endpoint", "vpn.example.com"])
@@ -157,9 +169,11 @@ class UpgradeTests(unittest.TestCase):
                 },
                 "systemd": {"hardening": "off"},
                 "dns": {"default": ["9.9.9.9", "149.112.112.112"], "policy": "custom"},
+                "network": {"ingress_boundary": "lightsail"},
             }))
             args = cli.build_parser().parse_args([
-                "upgrade", "--dry-run", "--default-dns", "cloudflare-malware"
+                "upgrade", "--dry-run", "--default-dns", "cloudflare-malware",
+                "--ingress-boundary", "equivalent-external-firewall",
             ])
             settings = cli._resolved_settings(args, root=root)
         self.assertEqual(settings.staging_user, "vpn-stage")
@@ -167,6 +181,42 @@ class UpgradeTests(unittest.TestCase):
         self.assertEqual(settings.operators, ("deploy",))
         self.assertEqual(settings.sudo_policy, "existing-sudo")
         self.assertEqual(settings.default_dns, ("1.1.1.2", "1.0.0.2"))
+        self.assertEqual(settings.ingress_boundary, "equivalent-external-firewall")
+
+    def test_upgrade_persists_legacy_missing_ingress_override_before_new_health(self):
+        from awginstall import cli
+        from awginstall.settings import resolve_installation_settings
+
+        events = []
+        legacy = resolve_installation_settings(sudo_user=None).to_dict()
+        legacy.pop("network")
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory) / "opt/amneziawg"
+            (root / "config").mkdir(parents=True)
+            (root / "config/installation.json").write_text(json.dumps(legacy))
+            preconfiguration = object()
+
+            def configure(_args, *, settings, **_kwargs):
+                events.append(("configure", settings.ingress_boundary))
+                return preconfiguration
+
+            def deploy(_root, _repo, *, settings, **_kwargs):
+                events.append(("deploy", settings.ingress_boundary))
+
+            with (
+                mock.patch.object(cli, "_configure_host_for_command", side_effect=configure),
+                mock.patch.object(cli, "_deploy_source_release", side_effect=deploy),
+                mock.patch.object(cli, "_apply_requested_runtime_settings"),
+            ):
+                result = installer_main(
+                    ["upgrade", "--yes", "--ingress-boundary", "lightsail"],
+                    root=root,
+                    repo_root=REPO_ROOT,
+                    output=io.StringIO(),
+                )
+
+        self.assertEqual(result, 0)
+        self.assertEqual(events, [("configure", "lightsail"), ("deploy", "lightsail")])
 
     def test_first_upgrade_applies_no_sudo_bootstrap_before_release_then_final_policy(self):
         from awginstall import cli
@@ -181,7 +231,10 @@ class UpgradeTests(unittest.TestCase):
                 mock.patch.object(cli, "_apply_requested_runtime_settings"),
             ):
                 result = installer_main(
-                    ["upgrade", "--yes"], root=root, repo_root=REPO_ROOT, output=io.StringIO()
+                    ["upgrade", "--yes", "--ingress-boundary", "lightsail"],
+                    root=root,
+                    repo_root=REPO_ROOT,
+                    output=io.StringIO(),
                 )
         self.assertEqual(result, 0)
         self.assertEqual([value.sudo_policy for value in configured], ["none", "scoped-nopasswd"])
@@ -203,7 +256,10 @@ class UpgradeTests(unittest.TestCase):
                 mock.patch("sys.stderr", errors),
             ):
                 result = installer_main(
-                    ["upgrade", "--yes"], root=root, repo_root=REPO_ROOT, output=io.StringIO()
+                    ["upgrade", "--yes", "--ingress-boundary", "lightsail"],
+                    root=root,
+                    repo_root=REPO_ROOT,
+                    output=io.StringIO(),
                 )
         self.assertEqual(result, 1)
         rollback.assert_called_once_with(bootstrap_report)
@@ -246,6 +302,27 @@ class UpgradeTests(unittest.TestCase):
         self.assertEqual(result, 0)
         self.assertIn("official Amnezia PPA", output.getvalue())
         self.assertIn("1.1.1.2,1.0.0.2", output.getvalue())
+
+    def test_fresh_mutating_install_fails_closed_without_ingress_attestation(self):
+        from awginstall import cli
+
+        errors = io.StringIO()
+        with (
+            mock.patch.object(cli, "validate_platform", return_value={"architecture": "amd64"}),
+            mock.patch.object(cli, "_install_amneziawg_packages") as install_packages,
+            mock.patch.object(cli.pathlib.Path, "exists", return_value=False),
+            mock.patch("sys.stderr", errors),
+        ):
+            result = installer_main(
+                ["install", "--yes", "--endpoint", "vpn.example.com"],
+                root=pathlib.Path("/test/amneziawg"),
+                repo_root=REPO_ROOT,
+                output=io.StringIO(),
+            )
+
+        self.assertEqual(result, 1)
+        install_packages.assert_not_called()
+        self.assertIn("--ingress-boundary", errors.getvalue())
 
     def test_configure_dry_run_reports_privilege_boundary_without_mutation(self):
         output = io.StringIO()
