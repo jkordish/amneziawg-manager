@@ -36,6 +36,26 @@ class JsonContractTests(unittest.TestCase):
 
         self.assertEqual(check, ("PASS", "client expiry", "expired: due"))
 
+    def test_client_expiry_health_fails_when_terminal_peer_remains_live(self):
+        with mock.patch.object(core, "live_peers", return_value={"expired-public"}):
+            check = core.client_expiry_health_check(
+                [
+                    {
+                        "name": "terminal",
+                        "status": "expired",
+                        "expires": "2025-01-01",
+                        "public_key": "expired-public",
+                    }
+                ],
+                interface="awg0",
+                interface_active=True,
+            )
+
+        self.assertEqual(
+            check,
+            ("FAIL", "client expiry", "expired peers still active: terminal"),
+        )
+
     def test_terminal_expired_status_cannot_be_resurrected_by_clock_rollback(self):
         status = core.effective_client_status(
             {"status": "expired", "expires": "2026-09-01"},

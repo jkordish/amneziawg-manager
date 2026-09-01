@@ -3,6 +3,7 @@ import io
 import os
 import pathlib
 import platform
+import stat
 import subprocess
 import sys
 import tempfile
@@ -38,6 +39,32 @@ class PlatformValidationTests(unittest.TestCase):
 
 
 class UpgradeTests(unittest.TestCase):
+    def test_atomic_entrypoint_replacements_fsync_the_parent_directory(self):
+        from awginstall import cli
+
+        with tempfile.TemporaryDirectory() as directory:
+            parent = pathlib.Path(directory)
+            file_path = parent / "README.md"
+            fsync_targets = []
+            real_fsync = os.fsync
+
+            def record_fsync(descriptor):
+                fsync_targets.append(
+                    "directory"
+                    if stat.S_ISDIR(os.fstat(descriptor).st_mode)
+                    else "file"
+                )
+                return real_fsync(descriptor)
+
+            with mock.patch.object(cli.os, "fsync", side_effect=record_fsync):
+                cli._atomic_owned_file(file_path, b"durable\n", 0o644)
+            self.assertEqual(fsync_targets, ["file", "directory"])
+
+            fsync_targets.clear()
+            with mock.patch.object(cli.os, "fsync", side_effect=record_fsync):
+                cli._atomic_owned_symlink(parent / "awgctl-internal", "../bin/awgctl")
+            self.assertEqual(fsync_targets, ["directory"])
+
     def test_release_selector_layout_is_installed_before_post_upgrade_health(self):
         from awginstall import cli
         from awginstall.settings import resolve_installation_settings
@@ -222,7 +249,8 @@ class UpgradeTests(unittest.TestCase):
             def command_runner(argv, **_kwargs):
                 command = tuple(argv)
                 health_commands.append(command)
-                if len(command) >= 2 and command[1] == "health":
+                if len(command) >= 2 and command[1:] == ("_health", "--json"):
+                    self.assertEqual(pathlib.Path(command[0]).name, "awgctl-internal")
                     self.assertFalse(
                         (directory / "etc/systemd/system/amneziawg-client-expiry.timer").exists()
                     )
@@ -258,7 +286,13 @@ class UpgradeTests(unittest.TestCase):
             self.assertEqual(active_release(root), "0.1.0-beta.4")
             self.assertEqual((root / "bin/awgctl").read_bytes(), b"beta4 executable\n")
             self.assertEqual(
-                len([command for command in health_commands if command[1:] == ("health", "--json")]),
+                len(
+                    [
+                        command
+                        for command in health_commands
+                        if command[1:] == ("_health", "--json")
+                    ]
+                ),
                 1,
             )
 

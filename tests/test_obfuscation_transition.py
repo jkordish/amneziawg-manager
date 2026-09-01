@@ -2554,11 +2554,12 @@ class ObfuscationPrepareTests(unittest.TestCase):
 
                 def write_header(path, **kwargs):
                     events.append("key write")
+                    self.assertEqual(kwargs["owner_uid"], root.stat().st_uid)
+                    self.assertEqual(kwargs["owner_gid"], root.stat().st_gid)
                     return original_header_writer(
                         path,
                         token_bytes=lambda count: b"\xb6" * count,
-                        owner_uid=1000,
-                        owner_gid=1000,
+                        **kwargs,
                     )
 
                 def write_qr(profile, path):

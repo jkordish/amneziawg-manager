@@ -89,6 +89,26 @@ class DiagnosticsTests(unittest.TestCase):
                         files={"system/status.txt": b"active\n"},
                     )
             self.assertEqual(list(sink.iterdir()), [])
+            self.assertEqual(list(original.iterdir()), [])
+
+    def test_incomplete_bundle_is_removed_after_write_failure(self):
+        with tempfile.TemporaryDirectory() as directory:
+            parent = pathlib.Path(directory)
+            with (
+                mock.patch(
+                    "awgctl.diagnostics.os.write",
+                    side_effect=OSError("injected disk full"),
+                ),
+                self.assertRaisesRegex(OSError, "disk full"),
+            ):
+                create_bundle(
+                    parent,
+                    product_version="0.1.0-beta.1",
+                    created_at="2026-09-01T02:00:00Z",
+                    files={"system/status.txt": b"active\n"},
+                )
+
+            self.assertEqual(list(parent.iterdir()), [])
 
     def test_preexisting_candidate_symlink_cannot_reach_its_sink(self):
         with tempfile.TemporaryDirectory() as directory:

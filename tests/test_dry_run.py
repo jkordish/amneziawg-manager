@@ -280,10 +280,11 @@ class DryRunTests(unittest.TestCase):
         )
         self.assertEqual(output.getvalue(), completed.stdout.decode())
 
-    def test_internal_expiry_dry_run_reports_due_clients_without_mutation(self):
+    def test_internal_expiry_dry_run_reports_due_and_reconciliation_without_mutation(self):
         today = dt.datetime.now(dt.timezone.utc).date().isoformat()
         clients = [
             {"name": "due", "status": "active", "expires": today},
+            {"name": "terminal", "status": "expired", "expires": "2025-01-01"},
             {"name": "future", "status": "active", "expires": "2099-01-01"},
         ]
         args = core.build_parser(entrypoint="internal").parse_args(
@@ -305,6 +306,8 @@ class DryRunTests(unittest.TestCase):
         self.assertEqual(result, 0)
         payload = json.loads(output.getvalue())
         self.assertEqual(payload["data"]["due_clients"], ["due"])
+        self.assertEqual(payload["data"]["reconciliation_clients"], ["terminal"])
+        self.assertEqual(payload["data"]["runtime_action"], "reload")
         self.assertTrue(payload["data"]["dry_run"])
 
     def test_internal_expiry_reconciles_terminal_expired_peer_on_later_run(self):
