@@ -8,7 +8,7 @@ import shutil
 import stat
 import tempfile
 from dataclasses import dataclass
-from typing import Mapping, Sequence
+from typing import Iterable, Mapping, Sequence
 
 from .settings import InstallationSettings
 
@@ -51,6 +51,17 @@ class IdentityPlan:
     created_users: tuple[str, ...]
     created_groups: tuple[str, ...]
     added_memberships: tuple[tuple[str, str], ...]
+
+
+def effective_group_members(
+    gid: int,
+    listed_members: Iterable[str],
+    primary_accounts: Iterable[tuple[str, int]],
+) -> tuple[str, ...]:
+    """Return all accounts authorized by a group, including primary-GID users."""
+    members = set(listed_members)
+    members.update(name for name, primary_gid in primary_accounts if primary_gid == gid)
+    return tuple(sorted(members))
 
 
 def _validate_existing_staging(

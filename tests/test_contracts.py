@@ -133,6 +133,57 @@ class JsonContractTests(unittest.TestCase):
                 checks = core.management_security_checks()
         self.assertEqual(checks, [("FAIL", "manager privilege policy", f"missing {missing}")])
 
+    def test_management_health_rejects_primary_gid_operator_member(self):
+        from types import SimpleNamespace
+
+        from awginstall.settings import resolve_installation_settings
+
+        settings = resolve_installation_settings(
+            sudo_user=None,
+            overrides={"operators": ["ubuntu"]},
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            test_root = pathlib.Path(directory)
+            installation = test_root / "installation.json"
+            installation.write_text(json.dumps(settings.to_dict()), encoding="utf-8")
+            installation.chmod(0o600)
+            staging_user = SimpleNamespace(
+                pw_name="awgctl", pw_uid=450, pw_gid=451,
+                pw_dir="/var/lib/amneziawg-manager", pw_shell="/usr/sbin/nologin",
+            )
+            accounts = [
+                staging_user,
+                SimpleNamespace(pw_name="ubuntu", pw_uid=1000, pw_gid=1000),
+                SimpleNamespace(pw_name="stale-primary", pw_uid=1001, pw_gid=452),
+            ]
+            groups = {
+                "awgctl": SimpleNamespace(gr_name="awgctl", gr_gid=451, gr_mem=[]),
+                "awgctl-admin": SimpleNamespace(
+                    gr_name="awgctl-admin", gr_gid=452, gr_mem=["ubuntu"]
+                ),
+            }
+            completed = mock.Mock(returncode=0, stdout=b"awgctl L\n", stderr=b"")
+            with (
+                mock.patch.object(core, "INSTALLATION_CONFIG", installation),
+                mock.patch.object(core, "SUDOERS_CONFIG", test_root / "sudoers"),
+                mock.patch.object(core, "SERVICE_HARDENING", test_root / "hardening.conf"),
+                mock.patch.object(core, "MODULE_LOAD_CONFIG", test_root / "modules.conf"),
+                mock.patch.object(core, "PUBLIC_ENTRYPOINT", test_root / "public-awgctl"),
+                mock.patch.object(core, "INTERNAL_ENTRYPOINT", test_root / "internal-awgctl"),
+                mock.patch.object(core, "permission_problem", return_value=None),
+                mock.patch.object(core.pwd, "getpwnam", return_value=staging_user),
+                mock.patch.object(core.pwd, "getpwall", return_value=accounts),
+                mock.patch.object(core.grp, "getgrnam", side_effect=groups.__getitem__),
+                mock.patch.object(core.grp, "getgrall", return_value=list(groups.values())),
+                mock.patch.object(core, "run", return_value=completed),
+            ):
+                checks = core.management_security_checks()
+
+        self.assertIn(
+            ("FAIL", "operator group", "undeclared members: stale-primary"),
+            checks,
+        )
+
     def test_version_command_does_not_require_root(self):
         output = io.StringIO()
         with mock.patch.object(core, "require_root", side_effect=AssertionError("must not be called")), redirect_stdout(output):

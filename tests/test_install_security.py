@@ -202,6 +202,50 @@ class IdentityPlanTests(unittest.TestCase):
         with self.assertRaisesRegex(IdentityError, "undeclared members: stale-admin"):
             build_identity_plan(settings, snapshot, allow_existing=True)
 
+    def test_identity_snapshot_includes_primary_gid_operator_members(self):
+        from types import SimpleNamespace
+
+        from awginstall import host
+        from awginstall.identity import IdentityError, build_identity_plan
+        from awginstall.settings import resolve_installation_settings
+
+        settings = resolve_installation_settings(
+            sudo_user=None,
+            overrides={"operators": ["ubuntu"]},
+        )
+        accounts = {
+            "awgctl": SimpleNamespace(
+                pw_name="awgctl", pw_uid=450, pw_gid=451,
+                pw_dir="/var/lib/amneziawg-manager", pw_shell="/usr/sbin/nologin",
+            ),
+            "ubuntu": SimpleNamespace(
+                pw_name="ubuntu", pw_uid=1000, pw_gid=1000,
+                pw_dir="/home/ubuntu", pw_shell="/bin/bash",
+            ),
+            "stale-primary": SimpleNamespace(
+                pw_name="stale-primary", pw_uid=1001, pw_gid=452,
+                pw_dir="/home/stale-primary", pw_shell="/bin/bash",
+            ),
+        }
+        groups = [
+            SimpleNamespace(gr_name="awgctl", gr_gid=451, gr_mem=[]),
+            SimpleNamespace(gr_name="awgctl-admin", gr_gid=452, gr_mem=["ubuntu"]),
+        ]
+        completed = subprocess.CompletedProcess([], 0, stdout=b"awgctl L\n", stderr=b"")
+        with (
+            mock.patch.object(host.pwd, "getpwnam", side_effect=accounts.__getitem__),
+            mock.patch.object(host.pwd, "getpwall", return_value=list(accounts.values())),
+            mock.patch.object(host.grp, "getgrall", return_value=groups),
+        ):
+            snapshot = host.snapshot_identities(settings, runner=lambda _command: completed)
+
+        self.assertEqual(
+            snapshot.groups["awgctl-admin"].members,
+            ("stale-primary", "ubuntu"),
+        )
+        with self.assertRaisesRegex(IdentityError, "undeclared members: stale-primary"):
+            build_identity_plan(settings, snapshot, allow_existing=True)
+
     def test_sudoers_grants_only_public_entrypoint(self):
         from awginstall.identity import render_sudoers
 

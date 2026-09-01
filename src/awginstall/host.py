@@ -20,6 +20,7 @@ from .identity import (
     IdentitySnapshot,
     UserRecord,
     build_identity_plan,
+    effective_group_members,
     render_sudoers,
 )
 from .sandbox import render_module_load, render_service_hardening
@@ -151,9 +152,14 @@ def snapshot_identities(
             locked.add(name)
 
     all_groups = grp.getgrall()
+    all_accounts = tuple((record.pw_name, record.pw_gid) for record in pwd.getpwall())
     wanted_groups = {settings.staging_group, settings.operator_group}
     groups = {
-        record.gr_name: GroupRecord(record.gr_name, record.gr_gid, tuple(record.gr_mem))
+        record.gr_name: GroupRecord(
+            record.gr_name,
+            record.gr_gid,
+            effective_group_members(record.gr_gid, record.gr_mem, all_accounts),
+        )
         for record in all_groups
         if record.gr_name in wanted_groups
     }

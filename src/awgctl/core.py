@@ -43,7 +43,7 @@ from .selftest import SelfTestError, run_namespace_selftest
 from .version import VERSION
 from awginstall.installer import InstallerError, upgrade_product
 from awginstall.platform import PlatformError, read_os_release, validate_platform
-from awginstall.identity import render_sudoers
+from awginstall.identity import effective_group_members, render_sudoers
 from awginstall.sandbox import render_module_load, render_service_hardening
 from awginstall.settings import (
     SettingsError,
@@ -1550,7 +1550,13 @@ def management_security_checks() -> list[tuple[str, str, str]]:
     except KeyError:
         add("FAIL", "operator group", f"missing {settings.operator_group}")
     else:
-        actual_operators = set(operator_group.gr_mem)
+        actual_operators = set(
+            effective_group_members(
+                operator_group.gr_gid,
+                operator_group.gr_mem,
+                ((record.pw_name, record.pw_gid) for record in pwd.getpwall()),
+            )
+        )
         missing_operators = sorted(set(settings.operators) - actual_operators)
         extra_operators = sorted(actual_operators - set(settings.operators))
         membership_problem = missing_operators or extra_operators
