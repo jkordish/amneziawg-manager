@@ -3,6 +3,14 @@
 All notable changes are documented here. The project follows semantic
 versioning while preserving explicit beta labels for unqualified host paths.
 
+## 0.1.0-beta.7 - 2026-09-01
+
+- Accept both strict epoch and Ubuntu 24.04 systemd 255 human-UTC forms when
+  proving an armed AWG 3.1 rollback timer, while continuing to require the
+  exact persisted deadline, active runtime state, and enabled unit state.
+- Add regression coverage for the production systemd output plus rejection of
+  mismatched weekdays and one-second deadline drift.
+
 ## 0.1.0-beta.6 - 2026-09-01
 
 - Qualify exactly AmneziaWG tools/module `3.1.20260812` on the target Ubuntu

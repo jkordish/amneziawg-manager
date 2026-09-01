@@ -3030,11 +3030,56 @@ class ObfuscationActivateTests(unittest.TestCase):
                 )
             runner.assert_called_once_with(expected_argv, check=False, timeout=15)
 
+            for epoch_output in (
+                b"ActiveState=active\nUnitFileState=enabled\nNextElapseUSecRealtime=@1788257460.0\n",
+                b"ActiveState=active\nUnitFileState=enabled\nNextElapseUSecRealtime=@1788257460.000000\n",
+            ):
+                with (
+                    self.subTest(epoch_output=epoch_output),
+                    mock.patch.object(core, "SYSTEMD_UNIT_DIR", unit_dir),
+                    mock.patch.object(core, "_systemd_unit_is_root_owned", return_value=True),
+                    mock.patch.object(
+                        core,
+                        "run",
+                        return_value=subprocess.CompletedProcess(
+                            expected_argv, 0, epoch_output, b""
+                        ),
+                    ),
+                ):
+                    core.verify_transition_timeout(
+                        TRANSACTION_ID,
+                        deadline_at=deadline,
+                    )
+
+            ubuntu_2404 = subprocess.CompletedProcess(
+                expected_argv,
+                0,
+                (
+                    b"ActiveState=active\nUnitFileState=enabled\n"
+                    b"NextElapseUSecRealtime=Tue 2026-09-01 10:11:00 UTC\n"
+                ),
+                b"",
+            )
+            with (
+                mock.patch.object(core, "SYSTEMD_UNIT_DIR", unit_dir),
+                mock.patch.object(core, "_systemd_unit_is_root_owned", return_value=True),
+                mock.patch.object(core, "run", return_value=ubuntu_2404),
+            ):
+                core.verify_transition_timeout(
+                    TRANSACTION_ID,
+                    deadline_at=deadline,
+                )
+
             invalid_outputs = (
                 b"ActiveState=inactive\nUnitFileState=enabled\nNextElapseUSecRealtime=@1788257460\n",
                 b"ActiveState=active\nUnitFileState=disabled\nNextElapseUSecRealtime=@1788257460\n",
                 b"ActiveState=active\nUnitFileState=enabled\nNextElapseUSecRealtime=@1788257461\n",
+                b"ActiveState=active\nUnitFileState=enabled\nNextElapseUSecRealtime=@1788257460.1\n",
                 b"ActiveState=active\nUnitFileState=enabled\nNextElapseUSecRealtime=n/a\n",
+                b"ActiveState=active\nUnitFileState=enabled\nNextElapseUSecRealtime=Wed 2026-09-01 10:11:00 UTC\n",
+                b"ActiveState=active\nUnitFileState=enabled\nNextElapseUSecRealtime=Tue 2026-09-01 10:11:01 UTC\n",
+                b"ActiveState=active\nUnitFileState=enabled\nNextElapseUSecRealtime=Tue 2026-09-01 10:11:00 PST\n",
+                b"ActiveState=active\nUnitFileState=enabled\nNextElapseUSecRealtime=Tue 2026-09-31 10:11:00 UTC\n",
                 b"ActiveState=active\nUnitFileState=enabled\nUnexpected=value\n",
             )
             for output in invalid_outputs:
