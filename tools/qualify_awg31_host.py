@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import dataclasses
 import datetime as dt
+import base64
 import json
 import math
 import os
@@ -14,8 +15,10 @@ import secrets
 import stat
 import subprocess
 import sys
+import tempfile
+import time
 from collections.abc import Mapping, Sequence
-from typing import NoReturn
+from typing import Any, Callable, NoReturn
 
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
@@ -23,6 +26,7 @@ sys.path.insert(0, str(REPO_ROOT / "src"))
 
 from awgctl.core import AWG31_QUALIFICATION_POLICY_VERSION
 from awgctl.diagnostics import redact_awg_config
+from awgctl.selftest import SelfTestError, render_peer_configs
 
 
 REQUIRED_CHECKS = (
@@ -412,3 +416,478 @@ def atomic_write_receipt(
             os.close(output_fd)
         os.close(parent_fd)
     return output_dir / filename
+
+
+CommandRunner = Callable[..., subprocess.CompletedProcess[bytes]]
+
+
+@dataclasses.dataclass
+class OwnedResources:
+    """Exact resources created by one qualifier process, in creation order."""
+
+    runner: CommandRunner
+    namespaces: list[str] = dataclasses.field(default_factory=list)
+    host_links: list[str] = dataclasses.field(default_factory=list)
+
+
+def _namespace_names(output: bytes) -> set[str]:
+    try:
+        text = output.decode("utf-8")
+    except UnicodeError as exc:
+        raise QualificationError("invalid namespace inventory output") from exc
+    return {
+        line.split(maxsplit=1)[0]
+        for line in text.splitlines()
+        if line.strip()
+    }
+
+
+def _root_link_names(output: bytes) -> set[str]:
+    try:
+        decoded = json.loads(output)
+    except (UnicodeError, json.JSONDecodeError) as exc:
+        raise QualificationError("invalid link inventory output") from exc
+    if not isinstance(decoded, list):
+        _fail("invalid link inventory output")
+    names: set[str] = set()
+    for entry in decoded:
+        if not isinstance(entry, dict) or type(entry.get("ifname")) is not str:
+            _fail("invalid link inventory output")
+        names.add(entry["ifname"])
+    return names
+
+
+def _runner_output(
+    runner: CommandRunner,
+    argv: Sequence[str],
+    *,
+    input_data: bytes | None = None,
+    timeout: float = 20,
+) -> bytes:
+    result = runner(argv, input_data=input_data, timeout=timeout)
+    if (
+        not isinstance(result, subprocess.CompletedProcess)
+        or result.returncode != 0
+        or type(result.stdout) is not bytes
+        or type(result.stderr) is not bytes
+    ):
+        _fail("qualification command runner returned an invalid result")
+    return result.stdout
+
+
+def cleanup_owned_resources(resources: OwnedResources) -> None:
+    """Best-effort delete, then prove absence of only the recorded resources."""
+    cleanup_errors: list[Exception] = []
+    for link in reversed(resources.host_links):
+        try:
+            _runner_output(resources.runner, ["ip", "link", "delete", link])
+        except Exception as exc:
+            cleanup_errors.append(exc)
+    for namespace in reversed(resources.namespaces):
+        try:
+            _runner_output(
+                resources.runner, ["ip", "netns", "delete", namespace]
+            )
+        except Exception as exc:
+            cleanup_errors.append(exc)
+
+    try:
+        remaining_namespaces = _namespace_names(
+            _runner_output(resources.runner, ["ip", "netns", "list"])
+        )
+        remaining_links = _root_link_names(
+            _runner_output(resources.runner, ["ip", "-j", "link", "show"])
+        )
+    except Exception as exc:
+        raise QualificationError(
+            "could not verify isolated qualification cleanup"
+        ) from exc
+    if set(resources.namespaces) & remaining_namespaces:
+        _fail("isolated qualification namespaces remain after cleanup")
+    if set(resources.host_links) & remaining_links:
+        _fail("isolated qualification links remain after cleanup")
+
+    resources.namespaces.clear()
+    resources.host_links.clear()
+    if cleanup_errors:
+        # A moved veth is expected to be absent from the root namespace. Only the
+        # post-cleanup inventories decide whether the cleanup succeeded.
+        return
+
+
+def parse_transfer_counters(output: bytes | str) -> tuple[int, int]:
+    """Parse one safe `awg show ... transfer` row without retaining its peer key."""
+    if type(output) is bytes:
+        try:
+            text = output.decode("ascii")
+        except UnicodeError as exc:
+            raise QualificationError("invalid AWG transfer counters") from exc
+    elif type(output) is str:
+        text = output
+    else:
+        _fail("invalid AWG transfer counters")
+    lines = [line for line in text.splitlines() if line.strip()]
+    if len(lines) != 1:
+        _fail("expected exactly one AWG peer transfer row")
+    fields = lines[0].split()
+    if len(fields) not in {2, 3}:
+        _fail("invalid AWG transfer counter row")
+    received_text, sent_text = fields[-2:]
+    if (
+        not received_text.isascii()
+        or not sent_text.isascii()
+        or not received_text.isdecimal()
+        or not sent_text.isdecimal()
+        or len(received_text) > 20
+        or len(sent_text) > 20
+    ):
+        _fail("invalid AWG transfer counter values")
+    return int(received_text), int(sent_text)
+
+
+def require_bidirectional_counters(
+    server_output: bytes | str,
+    client_output: bytes | str,
+) -> tuple[tuple[int, int], tuple[int, int]]:
+    """Require nonzero receive and transmit evidence from each isolated peer."""
+    server = parse_transfer_counters(server_output)
+    client = parse_transfer_counters(client_output)
+    if any(value <= 0 for value in (*server, *client)):
+        _fail("isolated AWG 3.1 transfer counters are not bidirectional")
+    return server, client
+
+
+def _validated_native_key(output: bytes, command: str) -> str:
+    try:
+        text = output.decode("ascii").strip()
+        decoded = base64.b64decode(text, validate=True)
+    except (UnicodeError, ValueError, base64.binascii.Error) as exc:
+        raise QualificationError(f"{command} returned invalid key material") from exc
+    if len(decoded) != 32:
+        _fail(f"{command} returned invalid key material")
+    return text
+
+
+def _write_private_config(root: pathlib.Path, name: str, content: str) -> pathlib.Path:
+    path = root / name
+    flags = (
+        os.O_WRONLY
+        | os.O_CREAT
+        | os.O_EXCL
+        | os.O_NOFOLLOW
+        | getattr(os, "O_CLOEXEC", 0)
+    )
+    fd = os.open(path, flags, 0o600)
+    try:
+        os.fchmod(fd, 0o600)
+        data = content.encode("utf-8")
+        view = memoryview(data)
+        while view:
+            written = os.write(fd, view)
+            if written <= 0:
+                _fail("isolated configuration write did not make progress")
+            view = view[written:]
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    return path
+
+
+class NamespaceQualifier:
+    """Exercise classic and AWG 3.1 only inside process-owned namespaces."""
+
+    def __init__(
+        self,
+        *,
+        runner: CommandRunner = run_command,
+        token: str | None = None,
+        clock: Callable[[], float] = time.monotonic,
+        sleeper: Callable[[float], Any] = time.sleep,
+    ) -> None:
+        selected = token if token is not None else secrets.token_hex(3)
+        if type(selected) is not str or re.fullmatch(r"[0-9a-f]{6}", selected) is None:
+            _fail("invalid qualification resource token")
+        self.runner = runner
+        self.token = selected
+        self.clock = clock
+        self.sleeper = sleeper
+        self.server_ns = f"awgq-s-{selected}"
+        self.client_ns = f"awgq-c-{selected}"
+        self.server_veth = f"awgq-vs-{selected}"
+        self.client_veth = f"awgq-vc-{selected}"
+        self.resources = OwnedResources(runner=runner)
+
+    def _run(
+        self,
+        argv: Sequence[str],
+        *,
+        input_data: bytes | None = None,
+        timeout: float = 20,
+    ) -> bytes:
+        return _runner_output(
+            self.runner, argv, input_data=input_data, timeout=timeout
+        )
+
+    def _require_candidate_names_absent(self) -> None:
+        namespaces = _namespace_names(self._run(["ip", "netns", "list"]))
+        links = _root_link_names(self._run(["ip", "-j", "link", "show"]))
+        if {self.server_ns, self.client_ns} & namespaces:
+            _fail("qualification namespace name already exists")
+        if {self.server_veth, self.client_veth} & links:
+            _fail("qualification link name already exists")
+
+    def _create_underlay(self) -> None:
+        for namespace in (self.server_ns, self.client_ns):
+            self._run(["ip", "netns", "add", namespace])
+            self.resources.namespaces.append(namespace)
+        self._run(
+            [
+                "ip",
+                "link",
+                "add",
+                self.server_veth,
+                "type",
+                "veth",
+                "peer",
+                "name",
+                self.client_veth,
+            ]
+        )
+        self.resources.host_links.extend((self.server_veth, self.client_veth))
+        self._run(
+            ["ip", "link", "set", self.server_veth, "netns", self.server_ns]
+        )
+        self._run(
+            ["ip", "link", "set", self.client_veth, "netns", self.client_ns]
+        )
+        for namespace, veth, address in (
+            (self.server_ns, self.server_veth, "192.0.2.1/30"),
+            (self.client_ns, self.client_veth, "192.0.2.2/30"),
+        ):
+            self._run(["ip", "-n", namespace, "link", "set", "lo", "up"])
+            self._run(
+                ["ip", "-n", namespace, "address", "add", address, "dev", veth]
+            )
+            self._run(["ip", "-n", namespace, "link", "set", veth, "up"])
+
+    def _generate_configs(
+        self,
+        root: pathlib.Path,
+        classic_obfuscation: Mapping[str, object],
+        awg31_obfuscation: Mapping[str, object],
+        header_protection_key: bytes,
+    ) -> dict[str, tuple[pathlib.Path, pathlib.Path]]:
+        server_private = _validated_native_key(
+            self._run(["awg", "genkey"]), "awg genkey"
+        )
+        client_private = _validated_native_key(
+            self._run(["awg", "genkey"]), "awg genkey"
+        )
+        psk = _validated_native_key(
+            self._run(["awg", "genpsk"]), "awg genpsk"
+        )
+        server_public = _validated_native_key(
+            self._run(
+                ["awg", "pubkey"],
+                input_data=(server_private + "\n").encode("ascii"),
+            ),
+            "awg pubkey",
+        )
+        client_public = _validated_native_key(
+            self._run(
+                ["awg", "pubkey"],
+                input_data=(client_private + "\n").encode("ascii"),
+            ),
+            "awg pubkey",
+        )
+        rendered: dict[str, tuple[pathlib.Path, pathlib.Path]] = {}
+        for mode, obfuscation, header in (
+            ("classic", classic_obfuscation, None),
+            ("awg31", awg31_obfuscation, header_protection_key),
+        ):
+            try:
+                server, client = render_peer_configs(
+                    server_private=server_private,
+                    server_public=server_public,
+                    client_private=client_private,
+                    client_public=client_public,
+                    psk=psk,
+                    obfuscation=obfuscation,
+                    header_protection_key=header,
+                    port=51871,
+                )
+            except SelfTestError as exc:
+                raise QualificationError(
+                    f"could not render isolated {mode} configuration"
+                ) from exc
+            rendered[mode] = (
+                _write_private_config(root, f"{mode}-server.conf", server),
+                _write_private_config(root, f"{mode}-client.conf", client),
+            )
+        return rendered
+
+    def _create_and_apply_tunnels(
+        self, server_config: pathlib.Path, client_config: pathlib.Path
+    ) -> None:
+        for namespace, address in (
+            (self.server_ns, "10.200.0.1/24"),
+            (self.client_ns, "10.200.0.2/24"),
+        ):
+            self._run(
+                ["ip", "-n", namespace, "link", "add", "awgt", "type", "amneziawg"]
+            )
+            self._run(
+                ["ip", "-n", namespace, "address", "add", address, "dev", "awgt"]
+            )
+        self._run(
+            [
+                "ip",
+                "netns",
+                "exec",
+                self.server_ns,
+                "awg",
+                "setconf",
+                "awgt",
+                str(server_config),
+            ]
+        )
+        self._run(
+            [
+                "ip",
+                "netns",
+                "exec",
+                self.client_ns,
+                "awg",
+                "setconf",
+                "awgt",
+                str(client_config),
+            ]
+        )
+        self._run(
+            ["ip", "-n", self.server_ns, "link", "set", "awgt", "up"]
+        )
+        self._run(
+            ["ip", "-n", self.client_ns, "link", "set", "awgt", "up"]
+        )
+
+    def _destroy_tunnels(self) -> None:
+        for namespace in (self.client_ns, self.server_ns):
+            self._run(["ip", "-n", namespace, "link", "delete", "awgt"])
+
+    def _require_ping(self, source_namespace: str, destination: str) -> None:
+        deadline = self.clock() + 15
+        last_error: QualificationError | None = None
+        for attempt in range(5):
+            if self.clock() > deadline:
+                break
+            try:
+                self._run(
+                    [
+                        "ip",
+                        "netns",
+                        "exec",
+                        source_namespace,
+                        "ping",
+                        "-n",
+                        "-c",
+                        "1",
+                        "-W",
+                        "2",
+                        destination,
+                    ],
+                    timeout=4,
+                )
+                return
+            except QualificationError as exc:
+                last_error = exc
+                if attempt < 4:
+                    self.sleeper(0.2)
+        raise QualificationError(
+            "isolated bidirectional traffic did not complete within its bound"
+        ) from last_error
+
+    def _require_bidirectional_ping(self) -> None:
+        self._require_ping(self.client_ns, "10.200.0.1")
+        self._require_ping(self.server_ns, "10.200.0.2")
+
+    def _require_awg31_counters(self) -> None:
+        server = self._run(
+            [
+                "ip",
+                "netns",
+                "exec",
+                self.server_ns,
+                "awg",
+                "show",
+                "awgt",
+                "transfer",
+            ]
+        )
+        client = self._run(
+            [
+                "ip",
+                "netns",
+                "exec",
+                self.client_ns,
+                "awg",
+                "show",
+                "awgt",
+                "transfer",
+            ]
+        )
+        require_bidirectional_counters(server, client)
+
+    def qualify(
+        self,
+        classic_obfuscation: Mapping[str, object],
+        awg31_obfuscation: Mapping[str, object],
+        header_protection_key: bytes,
+    ) -> dict[str, bool]:
+        """Run the complete isolated classic/AWG 3.1/recovery sequence."""
+        if type(header_protection_key) is not bytes or len(header_protection_key) != 32:
+            _fail("invalid isolated header-protection key material")
+        checks: dict[str, bool] = {}
+        try:
+            self._require_candidate_names_absent()
+            with tempfile.TemporaryDirectory(prefix="awgq-config-") as directory:
+                root = pathlib.Path(directory)
+                root.chmod(0o700)
+                configs = self._generate_configs(
+                    root,
+                    classic_obfuscation,
+                    awg31_obfuscation,
+                    header_protection_key,
+                )
+                self._create_underlay()
+
+                self._create_and_apply_tunnels(*configs["classic"])
+                checks["native_validation"] = True
+                self._require_bidirectional_ping()
+                checks["classic_traffic"] = True
+                self._destroy_tunnels()
+
+                self._create_and_apply_tunnels(*configs["classic"])
+                self._require_bidirectional_ping()
+                checks["classic_recreation"] = True
+                self._destroy_tunnels()
+
+                self._create_and_apply_tunnels(*configs["awg31"])
+                self._require_bidirectional_ping()
+                checks["awg31_traffic"] = True
+                self._require_awg31_counters()
+                checks["awg31_counters"] = True
+                self._destroy_tunnels()
+
+                self._create_and_apply_tunnels(*configs["awg31"])
+                self._require_bidirectional_ping()
+                self._require_awg31_counters()
+                checks["awg31_recreation"] = True
+                self._destroy_tunnels()
+
+                self._create_and_apply_tunnels(*configs["classic"])
+                self._require_bidirectional_ping()
+                checks["classic_rollback"] = True
+        finally:
+            cleanup_owned_resources(self.resources)
+        checks["cleanup"] = True
+        return checks

@@ -3,6 +3,7 @@ import json
 import os
 import pathlib
 import stat
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -259,6 +260,230 @@ class QualificationContractTests(unittest.TestCase):
                     "receipt.json",
                 )
             self.assertEqual(list(sink.iterdir()), [])
+
+
+def classic_obfuscation():
+    return {
+        "Jc": 6,
+        "Jmin": 8,
+        "Jmax": 80,
+        "S1": 25,
+        "S2": 75,
+        "H1": 101,
+        "H2": 102,
+        "H3": 103,
+        "H4": 104,
+    }
+
+
+def awg31_obfuscation():
+    return {
+        "mode": "awg31",
+        "profile": {
+            "schema_version": 1,
+            "name": "russia-ios-v1",
+            "parameters": {
+                "Jc": 9,
+                "Jmin": 8,
+                "Jmax": 80,
+                "S1": 30,
+                "S2": 100,
+                "S3": 40,
+                "S4": 20,
+                "H1": 1,
+                "H2": 2,
+                "H3": 3,
+                "H4": 4,
+                "I1": "<b 0x01020304>",
+                "I2": None,
+                "I3": None,
+                "I4": None,
+                "I5": None,
+                "ContentPaddingAddition": {"min": 0, "max": 64},
+                "RekeyAfterTime": {"min": 105, "max": 135},
+                "RekeyTimeout": {"min": 4, "max": 7},
+                "RejectAfterTime": {"min": 165, "max": 195},
+                "KeepaliveTimeout": {"min": 8, "max": 12},
+                "MaxHandshakeAttempts": {"min": 15, "max": 21},
+                "RandomTrailers": False,
+                "DisableCookies": True,
+            },
+            "header_protection_key_path": "/opt/amneziawg/keys/server/header-protection",
+        },
+    }
+
+
+class ScriptedRunner:
+    def __init__(self, *, fail_when=None, fail_ping_target=None, counters=b"peer\t10\t20\n"):
+        self.fail_when = fail_when
+        self.fail_ping_target = fail_ping_target
+        self.counters = counters
+        self.failed_once = False
+        self.argv = []
+        self.input_data = []
+        self.namespaces = {"customer-production"}
+        self.root_links = {"customer0"}
+        self.deleted_namespaces = []
+        self.config_paths = []
+
+    @property
+    def flattened_argv(self):
+        return [argument for command in self.argv for argument in command]
+
+    def __call__(self, argv, *, input_data=None, timeout=20):
+        command = tuple(argv)
+        self.argv.append(command)
+        self.input_data.append(input_data)
+        if (
+            self.fail_when is not None
+            and not self.failed_once
+            and self.fail_when(command)
+        ):
+            self.failed_once = True
+            raise qualification.QualificationError("injected command failure")
+
+        if command == ("ip", "netns", "list"):
+            output = "".join(f"{name}\n" for name in sorted(self.namespaces)).encode()
+            return subprocess.CompletedProcess(command, 0, output, b"")
+        if command == ("ip", "-j", "link", "show"):
+            output = json.dumps(
+                [{"ifname": name} for name in sorted(self.root_links)]
+            ).encode()
+            return subprocess.CompletedProcess(command, 0, output, b"")
+        if command[:3] == ("ip", "netns", "add"):
+            self.namespaces.add(command[3])
+        elif command[:3] == ("ip", "netns", "delete"):
+            self.namespaces.discard(command[3])
+            self.deleted_namespaces.append(command[3])
+        elif len(command) >= 4 and command[:3] == ("ip", "link", "add") and "peer" in command:
+            self.root_links.add(command[3])
+            self.root_links.add(command[-1])
+        elif command[:3] == ("ip", "link", "set") and "netns" in command:
+            self.root_links.discard(command[3])
+        elif command[:3] == ("ip", "link", "delete"):
+            self.root_links.discard(command[3])
+        elif len(command) >= 5 and command[:3] == ("ip", "netns", "exec"):
+            if len(command) >= 7 and command[4:7] == ("awg", "setconf", "awgt"):
+                self.config_paths.append(pathlib.Path(command[7]))
+            if command[4:7] == ("awg", "show", "awgt") and command[7:] == (
+                "transfer",
+            ):
+                return subprocess.CompletedProcess(command, 0, self.counters, b"")
+            if command[4] == "ping" and command[-1] == self.fail_ping_target:
+                raise qualification.QualificationError("injected ping failure")
+
+        if command == ("awg", "genkey"):
+            return subprocess.CompletedProcess(command, 0, b"A" * 43 + b"=\n", b"")
+        if command == ("awg", "genpsk"):
+            return subprocess.CompletedProcess(command, 0, b"C" * 43 + b"=\n", b"")
+        if command == ("awg", "pubkey"):
+            return subprocess.CompletedProcess(command, 0, b"B" * 43 + b"=\n", b"")
+        return subprocess.CompletedProcess(command, 0, b"", b"")
+
+
+class NamespaceQualificationTests(unittest.TestCase):
+    def test_failure_cleans_only_current_owned_resources_in_reverse_order(self):
+        runner = ScriptedRunner(
+            fail_when=lambda argv: argv[-3:] == ("set", "awgt", "up")
+        )
+        qualifier = qualification.NamespaceQualifier(
+            runner=runner, token="a1b2c3", sleeper=lambda _: None
+        )
+
+        with self.assertRaises(qualification.QualificationError):
+            qualifier.qualify(
+                classic_obfuscation(), awg31_obfuscation(), b"h" * 32
+            )
+
+        self.assertEqual(
+            runner.deleted_namespaces,
+            ["awgq-c-a1b2c3", "awgq-s-a1b2c3"],
+        )
+        self.assertIn("customer-production", runner.namespaces)
+        self.assertIn("customer0", runner.root_links)
+        self.assertNotIn("awg0", runner.flattened_argv)
+
+    def test_awg31_requires_nonzero_counters_in_both_directions_for_both_peers(self):
+        invalid = (
+            (b"peer\t0\t10\n", b"peer\t10\t10\n"),
+            (b"peer\t10\t0\n", b"peer\t10\t10\n"),
+            (b"peer\t10\t10\n", b"peer\t0\t10\n"),
+            (b"peer\t10\t10\n", b"peer\t10\t0\n"),
+        )
+        for server, client in invalid:
+            with self.subTest(server=server, client=client), self.assertRaises(
+                qualification.QualificationError
+            ):
+                qualification.require_bidirectional_counters(server, client)
+
+        self.assertEqual(
+            qualification.require_bidirectional_counters(
+                b"peer\t10\t20\n", b"peer\t30\t40\n"
+            ),
+            ((10, 20), (30, 40)),
+        )
+
+    def test_both_ping_directions_are_required_with_bounded_attempts(self):
+        runner = ScriptedRunner(fail_ping_target="10.200.0.2")
+        qualifier = qualification.NamespaceQualifier(
+            runner=runner, token="d4e5f6", sleeper=lambda _: None
+        )
+
+        with self.assertRaises(qualification.QualificationError):
+            qualifier.qualify(
+                classic_obfuscation(), awg31_obfuscation(), b"h" * 32
+            )
+
+        ping_commands = [command for command in runner.argv if "ping" in command]
+        self.assertTrue(any(command[-1] == "10.200.0.1" for command in ping_commands))
+        self.assertEqual(
+            sum(command[-1] == "10.200.0.2" for command in ping_commands), 5
+        )
+        self.assertEqual(
+            runner.deleted_namespaces,
+            ["awgq-c-d4e5f6", "awgq-s-d4e5f6"],
+        )
+
+    def test_success_recreates_each_mode_rolls_back_and_erases_configs(self):
+        runner = ScriptedRunner()
+        qualifier = qualification.NamespaceQualifier(
+            runner=runner, token="112233", sleeper=lambda _: None
+        )
+
+        checks = qualifier.qualify(
+            classic_obfuscation(), awg31_obfuscation(), b"h" * 32
+        )
+
+        self.assertEqual(
+            checks,
+            {
+                "native_validation": True,
+                "classic_traffic": True,
+                "classic_recreation": True,
+                "awg31_traffic": True,
+                "awg31_counters": True,
+                "awg31_recreation": True,
+                "classic_rollback": True,
+                "cleanup": True,
+            },
+        )
+        tunnel_creations = [
+            command
+            for command in runner.argv
+            if command[-5:] == ("link", "add", "awgt", "type", "amneziawg")
+        ]
+        self.assertEqual(len(tunnel_creations), 10)
+        self.assertFalse(any(path.exists() for path in runner.config_paths))
+        self.assertFalse(
+            any(
+                argument in {"I1", "I2", "I3", "I4", "I5"}
+                for argument in runner.flattened_argv
+            )
+        )
+        self.assertEqual(
+            runner.deleted_namespaces,
+            ["awgq-c-112233", "awgq-s-112233"],
+        )
 
 
 if __name__ == "__main__":
