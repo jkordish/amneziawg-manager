@@ -20,6 +20,7 @@ IDENTITY_RE = re.compile(r"^[a-z_][a-z0-9_-]{0,30}$")
 FORBIDDEN_IDENTITIES = {
     "root", "sudo", "wheel", "admin", "adm", "docker", "systemd-journal",
 }
+INGRESS_BOUNDARIES = {"lightsail", "equivalent-external-firewall"}
 
 
 class SettingsError(ValueError):
@@ -40,6 +41,7 @@ class InstallationSettings:
     sudo_policy: str
     systemd_hardening: str
     default_dns: tuple[str, ...]
+    ingress_boundary: str | None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -62,6 +64,7 @@ class InstallationSettings:
                 "default": list(self.default_dns),
                 "policy": dns_policy_name(self.default_dns),
             },
+            "network": {"ingress_boundary": self.ingress_boundary},
         }
 
 
@@ -150,7 +153,11 @@ def _load_document(path: pathlib.Path | None) -> dict[str, Any]:
     except (OSError, json.JSONDecodeError) as exc:
         raise SettingsError(f"could not read installation settings: {path}") from exc
     document = _object(value, "installation settings")
-    _reject_unknown(document, {"schema_version", "staging", "operators", "systemd", "dns"}, "installation settings")
+    _reject_unknown(
+        document,
+        {"schema_version", "staging", "operators", "systemd", "dns", "network"},
+        "installation settings",
+    )
     if document.get("schema_version", 1) != 1:
         raise SettingsError("unsupported installation settings schema")
     return document
@@ -167,10 +174,12 @@ def resolve_installation_settings(
     operator = _object(document.get("operators", {}), "operator settings")
     systemd = _object(document.get("systemd", {}), "systemd settings")
     dns = _object(document.get("dns", {}), "DNS settings")
+    network = _object(document.get("network", {}), "network settings")
     _reject_unknown(staging, {"user", "group", "uid", "gid", "root"}, "staging settings")
     _reject_unknown(operator, {"group", "users", "enroll_sudo_invoker", "sudo_policy"}, "operator settings")
     _reject_unknown(systemd, {"hardening"}, "systemd settings")
     _reject_unknown(dns, {"default", "policy"}, "DNS settings")
+    _reject_unknown(network, {"ingress_boundary"}, "network settings")
 
     values: dict[str, Any] = {
         "staging_user": staging.get("user", "awgctl"),
@@ -184,6 +193,7 @@ def resolve_installation_settings(
         "sudo_policy": operator.get("sudo_policy", "scoped-nopasswd"),
         "systemd_hardening": systemd.get("hardening", "conservative"),
         "default_dns": dns.get("default", "cloudflare-malware"),
+        "ingress_boundary": network.get("ingress_boundary"),
     }
     explicit = dict(overrides or {})
     extra_operators = explicit.pop("operators", None)
@@ -202,6 +212,13 @@ def resolve_installation_settings(
         raise SettingsError("unsupported sudo policy")
     if values["systemd_hardening"] not in {"conservative", "off"}:
         raise SettingsError("unsupported systemd hardening policy")
+    if (
+        values["ingress_boundary"] is not None
+        and values["ingress_boundary"] not in INGRESS_BOUNDARIES
+    ):
+        raise SettingsError(
+            "network.ingress_boundary must be lightsail or equivalent-external-firewall"
+        )
 
     operators: list[str] = []
     raw_operators = values["operators"]
@@ -229,4 +246,5 @@ def resolve_installation_settings(
         sudo_policy=values["sudo_policy"],
         systemd_hardening=values["systemd_hardening"],
         default_dns=validate_dns_setting(values["default_dns"]),
+        ingress_boundary=values["ingress_boundary"],
     )

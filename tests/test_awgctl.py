@@ -2,8 +2,10 @@
 import argparse
 import base64
 import contextlib
+import datetime as dt
 import io
 import ipaddress
+import json
 import os
 import pathlib
 import pwd
@@ -334,6 +336,34 @@ class RenderingTests(unittest.TestCase):
         self.assertEqual(rendered, expected)
         self.assertNotIn("SaveConfig", rendered)
 
+    def test_server_render_excludes_peer_at_utc_start_of_expiry_date(self):
+        today = dt.datetime.now(dt.timezone.utc).date().isoformat()
+        rendered = awgctl.render_server_config(
+            self.config,
+            key(1),
+            [
+                {
+                    "name": "due",
+                    "status": "active",
+                    "expires": today,
+                    "address": "10.77.42.2/32",
+                    "public_key": key(2),
+                    "psk": key(3),
+                },
+                {
+                    "name": "future",
+                    "status": "active",
+                    "expires": "2099-01-01",
+                    "address": "10.77.42.3/32",
+                    "public_key": key(4),
+                    "psk": key(5),
+                },
+            ],
+        )
+
+        self.assertNotIn("# due\n", rendered)
+        self.assertIn("# future\n", rendered)
+
     def test_client_render_inherits_stable_obfuscation(self):
         rendered = awgctl.render_client_config(self.config, key(2), key(3), key(1), "10.77.42.3/32")
         self.assertIn("Address = 10.77.42.3/32", rendered)
@@ -363,6 +393,28 @@ class AtomicWriteTests(unittest.TestCase):
 
 
 class OperationalContractTests(unittest.TestCase):
+    def test_client_list_surfaces_due_active_metadata_as_expired(self):
+        today = dt.datetime.now(dt.timezone.utc).date().isoformat()
+        client = {
+            "name": "due",
+            "status": "active",
+            "expires": today,
+            "address": "10.77.42.2/32",
+            "public_key": key(2),
+            "management": "managed",
+        }
+        output = io.StringIO()
+        with (
+            mock.patch.object(awgctl, "load_config", return_value={"interface": "awg0"}),
+            mock.patch.object(awgctl, "load_clients", return_value=[client]),
+            mock.patch.object(awgctl, "is_service_active", return_value=False),
+            mock.patch.object(awgctl.sys, "stdout", output),
+        ):
+            result = awgctl.cmd_client_list(argparse.Namespace(json=True))
+
+        self.assertEqual(result, 0)
+        self.assertEqual(json.loads(output.getvalue())["data"]["clients"][0]["status"], "expired")
+
     def test_cli_parser_supports_requested_simple_grammar(self):
         parser = awgctl.build_parser()
         self.assertEqual(parser.parse_args(["client", "add", "kat-iphone"]).client_name, "kat-iphone")
@@ -373,6 +425,16 @@ class OperationalContractTests(unittest.TestCase):
         self.assertEqual(qr.output, pathlib.Path("/secure/kat.png"))
         self.assertEqual(parser.parse_args(["config", "set", "listen-port", "55323"]).key, "listen-port")
         self.assertEqual(parser.parse_args(["aws-rule"]).command, "aws-rule")
+
+    def test_cli_parser_exposes_public_expiry_wrapper_and_internal_entrypoint(self):
+        public = awgctl.build_parser().parse_args(["client", "expire", "--dry-run", "--json"])
+        internal = awgctl.build_parser(entrypoint="internal").parse_args(
+            ["_expire-clients", "--dry-run", "--json"]
+        )
+
+        self.assertEqual(public.client_command, "expire")
+        self.assertTrue(public.dry_run)
+        self.assertEqual(internal.command, "_expire-clients")
 
     def test_operator_secret_copy_is_owned_by_invoker_and_rejects_writable_parent(self):
         invoker = pwd.getpwuid(os.getuid()).pw_name
@@ -408,6 +470,21 @@ class OperationalContractTests(unittest.TestCase):
         self.assertEqual(len(listeners), 1)
         self.assertIn("9100", listeners[0])
         self.assertIn("prometheus-node", listeners[0])
+
+    def test_listener_detection_accepts_normalized_managed_awg0_ipv4(self):
+        sample = (
+            'tcp LISTEN 0 4096 10.77.42.1:9090 0.0.0.0:* users:(("prometheus",pid=2,fd=3))\n'
+            'tcp LISTEN 0 4096 127.0.0.1:9121 0.0.0.0:* users:(("local",pid=3,fd=4))\n'
+        )
+        listeners = awgctl.suspicious_wildcard_listeners(
+            sample,
+            vpn_port=55323,
+            vpn_addresses=("10.77.42.1/24",),
+        )
+
+        self.assertEqual(len(listeners), 1)
+        self.assertIn("tcp/9090", listeners[0])
+        self.assertNotIn("9121", " ".join(listeners))
 
     def test_legacy_extraction_preserves_classic_parameters_and_psk(self):
         server = (

@@ -37,7 +37,7 @@ DEFAULT_ROOT = pathlib.Path("/opt/amneziawg")
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="install.py",
-        description="Install, adopt, or upgrade the AmneziaWG manager on Ubuntu 24.04 Lightsail",
+        description="Install, adopt, or upgrade the AmneziaWG manager on Ubuntu 24.04 amd64",
     )
     commands = parser.add_subparsers(dest="command", required=True)
     def security_options(command: argparse.ArgumentParser, *, mutating: bool = True) -> None:
@@ -55,6 +55,10 @@ def build_parser() -> argparse.ArgumentParser:
         command.add_argument("--sudo-policy", choices=("scoped-nopasswd", "existing-sudo", "none"))
         command.add_argument("--systemd-hardening", choices=("conservative", "off"))
         command.add_argument("--default-dns")
+        command.add_argument(
+            "--ingress-boundary",
+            choices=("lightsail", "equivalent-external-firewall"),
+        )
         if mutating:
             command.add_argument("--adopt-existing-identities", action="store_true")
             command.add_argument("--apply-default-dns", action="store_true")
@@ -102,6 +106,7 @@ def _resolved_settings(args: argparse.Namespace, *, root: pathlib.Path) -> Insta
     names = (
         "staging_user", "staging_group", "staging_uid", "staging_gid", "staging_root",
         "operator_group", "sudo_policy", "systemd_hardening",
+        "ingress_boundary",
     )
     overrides = {
         name: getattr(args, name)
@@ -115,7 +120,7 @@ def _resolved_settings(args: argparse.Namespace, *, root: pathlib.Path) -> Insta
     if getattr(args, "default_dns", None) is not None:
         overrides["default_dns"] = args.default_dns
     settings_path = getattr(args, "settings", None)
-    if settings_path is None and args.command in {"upgrade", "configure"}:
+    if settings_path is None and args.command in {"check", "upgrade", "configure"}:
         persisted = root / "config/installation.json"
         try:
             if persisted.is_file():
@@ -403,19 +408,34 @@ def main(
         settings = _resolved_settings(args, root=root)
         if args.command == "check":
             platform_info = validate_platform(read_os_release())
+            attested = settings.ingress_boundary is not None
             _emit(
                 output,
                 {
                     "schema_version": 1,
-                    "ok": True,
+                    "ok": attested,
                     "platform": platform_info,
                     "settings": settings.to_dict(),
-                    "message": "Host platform is supported: Ubuntu 24.04 amd64",
+                    "message": (
+                        "Host platform is supported: Ubuntu 24.04 amd64; "
+                        f"attested ingress boundary: {settings.ingress_boundary}"
+                        if attested
+                        else "Host platform is supported: Ubuntu 24.04 amd64; ingress boundary is not attested; run configure --ingress-boundary VALUE"
+                    ),
                 },
                 as_json=args.json,
             )
-            return 0
+            return 0 if attested else 1
         platform_info = validate_platform(read_os_release())
+        if (
+            args.command in {"install", "adopt", "upgrade", "configure"}
+            and not args.dry_run
+            and settings.ingress_boundary is None
+        ):
+            raise InstallerError(
+                "ingress boundary attestation is required; pass --ingress-boundary "
+                "lightsail or --ingress-boundary equivalent-external-firewall"
+            )
         if args.command == "configure":
             if root == DEFAULT_ROOT and not args.dry_run and os.geteuid() != 0:
                 raise InstallerError("run host configuration with sudo")
@@ -433,7 +453,8 @@ def main(
                     "systemd_hardening": "would install" if report.service_hardening else "disabled",
                     "message": (
                         "Dry run: would configure the staging identity, operator policy, "
-                        "confined workers, and native service hardening"
+                        "confined workers, and native service hardening; "
+                        f"attested ingress boundary: {settings.ingress_boundary or 'missing'}"
                     ),
                 }
                 _emit(output, payload, as_json=args.json)
@@ -447,7 +468,10 @@ def main(
                     "schema_version": 1,
                     "ok": True,
                     "settings": settings.to_dict(),
-                    "message": "Configured AmneziaWG Manager host identities and service policy",
+                    "message": (
+                        "Configured AmneziaWG Manager host identities and service policy; "
+                        f"attested ingress boundary: {settings.ingress_boundary}"
+                    ),
                 },
                 as_json=args.json,
             )
@@ -466,10 +490,12 @@ def main(
                         "ok": True,
                         "dry_run": True,
                         "platform": platform_info,
+                        "settings": settings.to_dict(),
                         "message": (
                             f"Dry run: would install kernel headers and AmneziaWG from the official Amnezia PPA, "
                             f"deploy awgctl {VERSION}, initialize awg0 on {args.endpoint}:{args.listen_port}, "
-                            f"and create {args.first_client}; external interface: {external}; DNS: {dns}"
+                            f"and create {args.first_client}; external interface: {external}; DNS: {dns}; "
+                            f"attested ingress boundary: {settings.ingress_boundary or 'missing (required for mutation)'}"
                         ),
                     },
                     as_json=args.json,
@@ -517,7 +543,11 @@ def main(
                     "schema_version": 1,
                     "ok": True,
                     "version": VERSION,
-                    "message": message or f"Installed AmneziaWG and awgctl {VERSION}",
+                    "ingress_boundary": settings.ingress_boundary,
+                    "message": (
+                        (message or f"Installed AmneziaWG and awgctl {VERSION}")
+                        + f"; attested ingress boundary: {settings.ingress_boundary}"
+                    ),
                 },
                 as_json=args.json,
             )
@@ -602,7 +632,11 @@ def main(
                         "ok": True,
                         "version": VERSION,
                         "root": str(root),
-                        "message": f"Dry run: would install awgctl {VERSION} into {root}",
+                        "ingress_boundary": settings.ingress_boundary,
+                        "message": (
+                            f"Dry run: would install awgctl {VERSION} into {root}; "
+                            f"attested ingress boundary: {settings.ingress_boundary or 'missing'}"
+                        ),
                     },
                     as_json=args.json,
                 )
@@ -612,9 +646,16 @@ def main(
             if not args.yes:
                 raise InstallerError("upgrade is mutating; rerun with --yes after reviewing --dry-run")
             existing_settings = _persisted_settings(root)
+            final_configuration_needed = True
             if existing_settings is None:
                 build_settings = _bootstrap_settings(settings)
                 bootstrap_report = _configure_host_for_command(args, root=root, settings=build_settings)
+            elif existing_settings.ingress_boundary is None:
+                # Persist the explicit legacy-upgrade attestation before the new
+                # executable's health gate, and compensate it if deployment fails.
+                build_settings = settings
+                bootstrap_report = _configure_host_for_command(args, root=root, settings=settings)
+                final_configuration_needed = False
             else:
                 build_settings = existing_settings
                 bootstrap_report = None
@@ -624,7 +665,8 @@ def main(
                 if bootstrap_report is not None:
                     rollback_host_configuration(bootstrap_report)
                 raise
-            _configure_host_for_command(args, root=root, settings=settings)
+            if final_configuration_needed:
+                _configure_host_for_command(args, root=root, settings=settings)
             _apply_requested_runtime_settings(args, root=root, settings=settings)
             _emit(
                 output,
@@ -632,7 +674,11 @@ def main(
                     "schema_version": 1,
                     "ok": True,
                     "version": VERSION,
-                    "message": f"Installed awgctl {VERSION} into {root}",
+                    "ingress_boundary": settings.ingress_boundary,
+                    "message": (
+                        f"Installed awgctl {VERSION} into {root}; "
+                        f"attested ingress boundary: {settings.ingress_boundary}"
+                    ),
                 },
                 as_json=args.json,
             )

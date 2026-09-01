@@ -13,6 +13,28 @@ sys.path.insert(0, str(REPO_ROOT / "src"))
 
 
 class InstallationSettingsTests(unittest.TestCase):
+    def test_ingress_boundary_is_explicit_validated_and_round_trips(self):
+        from awginstall.settings import SettingsError, resolve_installation_settings
+
+        settings = resolve_installation_settings(
+            sudo_user=None,
+            overrides={"ingress_boundary": "equivalent-external-firewall"},
+        )
+
+        self.assertEqual(
+            settings.ingress_boundary,
+            "equivalent-external-firewall",
+        )
+        self.assertEqual(
+            settings.to_dict()["network"],
+            {"ingress_boundary": "equivalent-external-firewall"},
+        )
+        with self.assertRaises(SettingsError):
+            resolve_installation_settings(
+                sudo_user=None,
+                overrides={"ingress_boundary": "inferred-aws"},
+            )
+
     def test_defaults_create_separate_staging_and_operator_identities(self):
         from awginstall.settings import resolve_installation_settings
 
@@ -395,13 +417,21 @@ class HostConfigurationTests(unittest.TestCase):
                     runner=runner,
                 )
             installed = json.loads((root / "opt/amneziawg/config/installation.json").read_text())
+            expiry_service = paths.expiry_service
+            expiry_timer = paths.expiry_timer
             self.assertEqual(installed["dns"]["policy"], "cloudflare-malware")
             self.assertEqual((paths.sudoers).stat().st_mode & 0o777, 0o440)
             self.assertIn("ProtectSystem=strict", paths.service_dropin.read_text())
             self.assertEqual(paths.module_load.read_text(), "# Managed by AmneziaWG Manager\namneziawg\n")
+            self.assertIn(
+                f"ExecStart={root / 'opt/amneziawg/libexec/awgctl-internal'} _expire-clients",
+                expiry_service.read_text(),
+            )
+            self.assertIn("OnCalendar=daily", expiry_timer.read_text())
         self.assertTrue(any(command[0] == "visudo" for command in commands))
         self.assertTrue(any(command[:2] == ("systemd-analyze", "verify") for command in commands))
         self.assertIn(("systemctl", "daemon-reload"), commands)
+        self.assertIn(("systemctl", "enable", "--now", "amneziawg-client-expiry.timer"), commands)
 
     def test_apply_failure_compensates_new_identity_commands(self):
         from awginstall.host import HostConfigurationError, HostPaths, configure_host

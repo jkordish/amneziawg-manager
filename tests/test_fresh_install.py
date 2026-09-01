@@ -12,6 +12,28 @@ from awgctl import core
 
 
 class FreshConfigurationTests(unittest.TestCase):
+    def test_classic_headers_keep_independent_csprng_assignment_order(self):
+        class ScriptedRandom:
+            def __init__(self):
+                self.values = iter((30, 40, 900, 100, 700, 300, 8))
+
+            def randint(self, lower, upper):
+                value = next(self.values)
+                self.assert_in_range(value, lower, upper)
+                return value
+
+            @staticmethod
+            def assert_in_range(value, lower, upper):
+                if not lower <= value <= upper:
+                    raise AssertionError(f"{value} is outside {lower}..{upper}")
+
+        generated = core.generate_classic_obfuscation(ScriptedRandom())
+
+        self.assertEqual(
+            [generated[name] for name in ("H1", "H2", "H3", "H4")],
+            [900, 100, 700, 300],
+        )
+
     def test_cloudflare_malware_alias_resolves_to_filtered_ipv4_service(self):
         self.assertEqual(core.parse_dns_value("cloudflare-malware"), ["1.1.1.2", "1.0.0.2"])
 

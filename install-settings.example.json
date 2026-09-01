@@ -16,6 +16,9 @@
   "systemd": {
     "hardening": "conservative"
   },
+  "network": {
+    "ingress_boundary": "lightsail"
+  },
   "dns": {
     "default": "cloudflare-malware"
   }

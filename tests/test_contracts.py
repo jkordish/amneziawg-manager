@@ -1,5 +1,6 @@
 import pathlib
 import argparse
+import datetime as dt
 import io
 import json
 import sys
@@ -24,6 +25,25 @@ from awgctl.contracts import (
 
 
 class JsonContractTests(unittest.TestCase):
+    def test_client_expiry_health_check_names_due_clients_as_expired(self):
+        today = dt.datetime.now(dt.timezone.utc).date().isoformat()
+        check = core.client_expiry_health_check(
+            [
+                {"name": "due", "status": "active", "expires": today},
+                {"name": "future", "status": "active", "expires": "2099-01-01"},
+            ]
+        )
+
+        self.assertEqual(check, ("PASS", "client expiry", "expired: due"))
+
+    def test_terminal_expired_status_cannot_be_resurrected_by_clock_rollback(self):
+        status = core.effective_client_status(
+            {"status": "expired", "expires": "2026-09-01"},
+            now=dt.datetime(2026, 8, 1, tzinfo=dt.timezone.utc),
+        )
+
+        self.assertEqual(status, "expired")
+
     def test_envelope_has_stable_shape_and_separates_warnings_from_errors(self):
         payload = json_envelope(
             "health",
@@ -89,6 +109,30 @@ class JsonContractTests(unittest.TestCase):
         self.assertEqual(payload["data"]["clients"][0]["name"], "kat")
         self.assertNotIn("RAW_PUBLIC_KEY", output.getvalue())
 
+    def test_ingress_rule_json_names_attested_external_boundary_without_lightsail_claim(self):
+        from awginstall.settings import resolve_installation_settings
+
+        settings = resolve_installation_settings(
+            sudo_user=None,
+            overrides={"ingress_boundary": "equivalent-external-firewall"},
+        )
+        output = io.StringIO()
+        with tempfile.TemporaryDirectory() as directory:
+            installation = pathlib.Path(directory) / "installation.json"
+            installation.write_text(json.dumps(settings.to_dict()), encoding="utf-8")
+            with (
+                mock.patch.object(core, "INSTALLATION_CONFIG", installation),
+                redirect_stdout(output),
+            ):
+                core.cmd_aws_rule({"listen_port": 55323}, as_json=True)
+
+        payload = json.loads(output.getvalue())
+        self.assertEqual(
+            payload["data"].get("ingress_boundary"),
+            "equivalent-external-firewall",
+        )
+        self.assertNotIn("lightsail", output.getvalue().lower())
+
     def test_health_envelope_marks_failures_but_not_warnings_as_broken(self):
         warning_only = health_envelope([("PASS", "service", "active"), ("WARN", "swap", "none")])
         broken = health_envelope([("FAIL", "service", "inactive")])
@@ -132,6 +176,36 @@ class JsonContractTests(unittest.TestCase):
             with mock.patch.object(core, "INSTALLATION_CONFIG", missing):
                 checks = core.management_security_checks()
         self.assertEqual(checks, [("FAIL", "manager privilege policy", f"missing {missing}")])
+
+    def test_management_health_fails_missing_ingress_attestation_with_configure_path(self):
+        from awginstall.settings import resolve_installation_settings
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            installation = root / "installation.json"
+            installation.write_text(
+                json.dumps(resolve_installation_settings(sudo_user=None).to_dict()),
+                encoding="utf-8",
+            )
+            with (
+                mock.patch.object(core, "INSTALLATION_CONFIG", installation),
+                mock.patch.object(core, "SUDOERS_CONFIG", root / "sudoers"),
+                mock.patch.object(core, "SERVICE_HARDENING", root / "hardening"),
+                mock.patch.object(core, "MODULE_LOAD_CONFIG", root / "modules"),
+                mock.patch.object(core, "PUBLIC_ENTRYPOINT", root / "public"),
+                mock.patch.object(core, "INTERNAL_ENTRYPOINT", root / "internal"),
+                mock.patch.object(core, "permission_problem", return_value=None),
+            ):
+                checks = core.management_security_checks()
+
+        self.assertIn(
+            (
+                "FAIL",
+                "ingress boundary attestation",
+                "missing; run install.py configure --ingress-boundary VALUE --yes",
+            ),
+            checks,
+        )
 
     def test_management_health_rejects_primary_gid_operator_member(self):
         from types import SimpleNamespace
