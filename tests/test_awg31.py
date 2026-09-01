@@ -19,6 +19,7 @@ sys.path.insert(0, str(REPO_ROOT / "src"))
 
 from awgctl import core
 from awgctl import diagnostics
+from awgctl import selftest as selftest_module
 from awgctl.selftest import render_peer_configs
 
 
@@ -631,6 +632,112 @@ class HeaderProtectionKeyTests(unittest.TestCase):
                 ):
                     core.validate_restore_stage(stage)
 
+    def test_restore_stage_binds_complete_generated_server_to_active_and_expired_metadata(self):
+        config, material = awg31_config()
+        active = restore_client(status="active")
+        expired = restore_client(
+            "expired-phone",
+            address="10.77.42.3/32",
+            private_byte=8,
+            public_byte=9,
+            psk_byte=10,
+        )
+        clients = [active, expired]
+
+        def server_record(client):
+            return {
+                "name": client["name"],
+                "address": client["address"],
+                "public_key": client["public_key"],
+                "psk": client["psk"],
+                "status": client["status"],
+            }
+
+        def missing_active(stage):
+            (stage / "generated/awg0.conf").write_text(
+                core.render_server_config(
+                    config,
+                    key(1),
+                    [server_record(expired)],
+                    header_protection_key=material,
+                ),
+                encoding="utf-8",
+            )
+
+        def extra_peer(stage):
+            path = stage / "generated/awg0.conf"
+            path.write_text(
+                path.read_text(encoding="utf-8")
+                + "\n[Peer]\n"
+                + f"PublicKey = {key(11)}\n"
+                + f"PresharedKey = {key(12)}\n"
+                + "AllowedIPs = 10.77.42.99/32\n",
+                encoding="utf-8",
+            )
+
+        def active_now_due(stage):
+            path = stage / "clients/kat-phone/metadata.json"
+            metadata = json.loads(path.read_text(encoding="utf-8"))
+            metadata["expires"] = "2000-01-01"
+            path.write_text(json.dumps(metadata), encoding="utf-8")
+
+        def replace_once(old, new):
+            def mutate(stage):
+                path = stage / "generated/awg0.conf"
+                text = path.read_text(encoding="utf-8")
+                self.assertIn(old, text)
+                path.write_text(text.replace(old, new, 1), encoding="utf-8")
+
+            return mutate
+
+        cases = (
+            ("missing-active", missing_active),
+            ("extra-peer", extra_peer),
+            ("active-now-due", active_now_due),
+            (
+                "public-key",
+                replace_once(
+                    f"PublicKey = {active['public_key']}",
+                    f"PublicKey = {key(11)}",
+                ),
+            ),
+            (
+                "preshared-key",
+                replace_once(
+                    f"PresharedKey = {active['psk']}",
+                    f"PresharedKey = {key(12)}",
+                ),
+            ),
+            (
+                "allowed-ips",
+                replace_once("AllowedIPs = 10.77.42.2/32", "AllowedIPs = 10.77.42.99/32"),
+            ),
+            (
+                "interface",
+                replace_once("Address = 10.77.42.1/24", "Address = 10.77.42.99/24"),
+            ),
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            stage = pathlib.Path(directory)
+            runner = populate_restore_stage(stage, config, material, clients)
+            with mock.patch.object(core, "run", side_effect=runner), mock.patch.object(
+                core, "validate_native_server"
+            ), mock.patch.object(core, "validate_nftables_text"):
+                self.assertEqual(core.validate_restore_stage(stage), config)
+
+        for label, mutate in cases:
+            with self.subTest(case=label), tempfile.TemporaryDirectory() as directory:
+                stage = pathlib.Path(directory)
+                runner = populate_restore_stage(stage, config, material, clients)
+                mutate(stage)
+                with mock.patch.object(core, "run", side_effect=runner), mock.patch.object(
+                    core, "validate_native_server"
+                ), mock.patch.object(core, "validate_nftables_text"), self.assertRaises(
+                    core.AwgctlError
+                ):
+                    core.validate_restore_stage(stage)
+
 
 class Awg31CapabilityTests(unittest.TestCase):
     @staticmethod
@@ -937,13 +1044,23 @@ class CpsDisclosureTests(unittest.TestCase):
             )
             generated.write_text(awg_text, encoding="utf-8")
             runtime.write_text(awg_text, encoding="utf-8")
+            prefixed_error = (
+                "Sep 01 awgctl[42]: Line unrecognized: "
+                f"'I1 = <b 0x{self.MARKER}>'"
+            )
+            diagnostic_result = subprocess.CompletedProcess(
+                ["journalctl"],
+                1,
+                b"",
+                prefixed_error.encode("utf-8"),
+            )
             output = io.StringIO()
             with (
                 mock.patch.object(core, "load_config", return_value=config),
                 mock.patch.object(core, "load_clients", return_value=[]),
                 mock.patch.object(core, "mutation_lock", return_value=contextlib.nullcontext()),
                 mock.patch.object(core, "ensure_layout"),
-                mock.patch.object(core, "diagnostic_command", return_value=b"safe\n"),
+                mock.patch.object(core, "run", return_value=diagnostic_result),
                 mock.patch.object(core, "GENERATED_CONFIG", generated),
                 mock.patch.object(core, "RUNTIME_CONFIG", runtime),
                 mock.patch.object(core, "audit"),
@@ -971,6 +1088,57 @@ class CpsDisclosureTests(unittest.TestCase):
                 "manager/runtime-awg0.conf",
             ):
                 self.assertIn(b"[redacted]", (bundles[0] / relative).read_bytes())
+
+    def test_native_selftest_cps_error_is_safe_in_public_text_and_json(self):
+        native_error = (
+            "Line unrecognized: "
+            f"'I1 = <b 0x{self.MARKER}>'"
+        )
+        failed = subprocess.CompletedProcess(
+            ["ip", "netns", "exec", "test", "awg", "setconf"],
+            1,
+            b"",
+            native_error.encode("utf-8"),
+        )
+        with mock.patch.object(selftest_module.subprocess, "run", return_value=failed):
+            with self.assertRaises(selftest_module.SelfTestError) as raised:
+                selftest_module._run(
+                    ["ip", "netns", "exec", "test", "awg", "setconf", "awgt", "config"]
+                )
+        self.assertNotIn(self.MARKER, str(raised.exception))
+        self.assertIn("Line unrecognized", str(raised.exception))
+        self.assertIn("[redacted]", str(raised.exception))
+
+        for argv, as_json in (
+            (["self-test", "--experimental"], False),
+            (["--json", "self-test", "--experimental"], True),
+        ):
+            output = io.StringIO()
+            errors = io.StringIO()
+            with (
+                self.subTest(json=as_json),
+                mock.patch.object(core, "dispatch", side_effect=raised.exception),
+                mock.patch.object(core, "audit"),
+                contextlib.redirect_stdout(output),
+                contextlib.redirect_stderr(errors),
+            ):
+                self.assertEqual(core.main(argv), 1)
+            public = output.getvalue() + errors.getvalue()
+            self.assertNotIn(self.MARKER, public)
+            self.assertIn("Line unrecognized", public)
+            self.assertIn("[redacted]", public)
+
+        quoted_value = (
+            "native detail I2 = "
+            f"\"<b 0x{self.MARKER}>\" trailing context"
+        )
+        sanitized = diagnostics.sanitize_cps_text(quoted_value)
+        self.assertNotIn(self.MARKER, sanitized)
+        self.assertIn("native detail I2 = [redacted] trailing context", sanitized)
+        unquoted_value = f"parser rejected I3=<b 0x{self.MARKER}> at input line 7"
+        sanitized = diagnostics.sanitize_cps_text(unquoted_value)
+        self.assertNotIn(self.MARKER, sanitized)
+        self.assertIn("I3=[redacted] at input line 7", sanitized)
 
 
 if __name__ == "__main__":
