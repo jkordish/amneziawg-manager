@@ -450,3 +450,90 @@ OK
 ### Fix Round 3 commit
 
 - Subject: `fix: honor YAML workflow comment boundaries`
+
+## Fix Round 4
+
+### Finding addressed
+
+YAML comment separation now uses exactly ASCII space (`U+0020`) or horizontal tab (`U+0009`). The predicate no longer uses Python `str.isspace()`, which recognizes NBSP and other Unicode characters that YAML can retain inside a plain scalar.
+
+The change is intentionally limited to one workflow-policy predicate plus its boundary fixtures. SemVer, workflows, and all other Task 1 code remain unchanged.
+
+### Required RED evidence
+
+The exact bypass fixture included a valid pinned action plus:
+
+```text
+- { name: foo\u00a0#bar, uses: actions/checkout@v7 }
+```
+
+The boundary controls cover ordinary embedded `foo#bar`, NBSP-embedded `foo\u00a0#bar`, ASCII-space `foo # comment`, and tab-separated `foo\t# comment`.
+
+Command against the Round 3 predicate:
+
+```text
+python3 -m unittest -v \
+  tests.test_workflows.WorkflowSecurityTests.test_nbsp_plain_scalar_cannot_hide_flow_uses \
+  tests.test_workflows.WorkflowSecurityTests.test_yaml_comment_requires_separation_whitespace
+```
+
+Output:
+
+```text
+Ran 2 tests in 0.002s
+FAILED (failures=2)
+```
+
+The executable NBSP flow map returned no violations, and `_split_yaml_comment` incorrectly normalized `foo\u00a0#bar` into content `foo` plus comment `bar`.
+
+### GREEN evidence
+
+The same focused command after replacing `isspace()` with `{ " ", "\t" }` produced:
+
+```text
+Ran 2 tests in 0.001s
+OK
+```
+
+Workflow-policy set:
+
+```text
+python3 -m unittest -v tests.test_workflows
+Ran 12 tests in 0.009s
+OK
+```
+
+Serial Task 1 validator set:
+
+```text
+python3 -m unittest -v tests.test_workflows tests.test_releases tests.test_release_build tests.test_packaging
+Ran 23 tests in 0.725s
+OK
+```
+
+Additional focused gates:
+
+```text
+python3 -m py_compile tests/test_workflows.py
+git diff --check
+```
+
+Both commands exited 0 with no output.
+
+### Fix Round 4 self-review
+
+- `_is_yaml_comment_start` is the single comment-boundary owner used by both full-line comment splitting and flow-map scanning.
+- At index zero, `#` remains a comment. At later indices, only a preceding ASCII space or tab starts a comment.
+- Ordinary embedded `foo#bar` and NBSP-embedded `foo\u00a0#bar` remain plain-scalar content; ASCII-space and tab controls still split into content and comment.
+- The exact pinned-plus-NBSP flow fixture proves the global mapping count cannot mask the executable mutable action.
+- A focused `rg` review found no `isspace()` use in the comment predicate or either comment-boundary consumer. Remaining `isspace()` calls govern flow formatting and invalid action-reference whitespace, not `#` semantics.
+- Round 3 flow-map, inline-comment/block-scalar, and explicit/property key tests remained green, as did the prior SemVer boundary tests.
+
+### Fix Round 4 concerns
+
+- No blocker. This fixes the standards mismatch without broadening the dependency-free workflow lexer.
+- No production code, workflow behavior, SemVer logic, or unrelated task was changed.
+
+### Fix Round 4 commit
+
+- Subject: `fix: restrict YAML comment separation`
