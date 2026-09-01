@@ -49,7 +49,10 @@ def active_release(root: pathlib.Path) -> str | None:
     return parts[2]
 
 
-def _activate(root: pathlib.Path, version: str) -> None:
+def activate_release(root: pathlib.Path, version: str) -> None:
+    artifact = root / "releases" / version / "awgctl"
+    if not artifact.is_file():
+        raise DeploymentError(f"release is incomplete: {version}")
     selector = root / "bin/awgctl"
     selector.parent.mkdir(parents=True, exist_ok=True)
     os.chmod(selector.parent, 0o755)
@@ -81,7 +84,7 @@ def install_release(
         installed = final / "awgctl"
         if not installed.is_file() or installed.read_bytes() != artifact.read_bytes():
             raise DeploymentError(f"release already exists with different content: {version}")
-        _activate(root, version)
+        activate_release(root, version)
         return final
 
     staging = pathlib.Path(tempfile.mkdtemp(prefix=f".{version}.", dir=releases))
@@ -111,5 +114,39 @@ def install_release(
     except Exception:
         shutil.rmtree(staging, ignore_errors=True)
         raise
-    _activate(root, version)
+    activate_release(root, version)
     return final
+
+
+def preserve_legacy_release(root: pathlib.Path) -> str | None:
+    """Import a pre-versioned executable exactly once for safe rollback."""
+    selector = root / "bin/awgctl"
+    if selector.is_symlink() or not selector.is_file():
+        return active_release(root)
+    version = "legacy-import"
+    final = root / "releases" / version
+    if final.exists():
+        if (final / "awgctl").read_bytes() != selector.read_bytes():
+            raise DeploymentError("legacy-import already exists with different content")
+        return version
+    final.parent.mkdir(parents=True, exist_ok=True)
+    staging = pathlib.Path(tempfile.mkdtemp(prefix=".legacy-import.", dir=final.parent))
+    try:
+        data = selector.read_bytes()
+        _atomic_write(staging / "awgctl", data, 0o755)
+        manifest = {
+            "schema_version": 1,
+            "version": version,
+            "files": ["awgctl"],
+            "sha256": {"awgctl": hashlib.sha256(data).hexdigest()},
+        }
+        _atomic_write(
+            staging / "install-manifest.json",
+            (json.dumps(manifest, indent=2, sort_keys=True) + "\n").encode(),
+            0o644,
+        )
+        os.replace(staging, final)
+    except Exception:
+        shutil.rmtree(staging, ignore_errors=True)
+        raise
+    return version
