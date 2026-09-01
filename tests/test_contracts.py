@@ -266,7 +266,8 @@ class JsonContractTests(unittest.TestCase):
 
             def runner(argv, **kwargs):
                 commands.append((tuple(argv), kwargs))
-                return mock.Mock(returncode=0, stdout=b"", stderr=b"")
+                stdout = b"enabled\n" if argv[1] == "is-enabled" else b"active\n"
+                return mock.Mock(returncode=0, stdout=stdout, stderr=b"")
 
             checks = core.expiry_host_asset_checks(
                 product_root=product_root,
@@ -288,8 +289,8 @@ class JsonContractTests(unittest.TestCase):
         self.assertEqual(
             commands,
             [
-                (("systemctl", "is-enabled", "--quiet", "amneziawg-client-expiry.timer"), {"check": False}),
-                (("systemctl", "is-active", "--quiet", "amneziawg-client-expiry.timer"), {"check": False}),
+                (("systemctl", "is-enabled", "amneziawg-client-expiry.timer"), {"check": False}),
+                (("systemctl", "is-active", "amneziawg-client-expiry.timer"), {"check": False}),
             ],
         )
 
@@ -350,9 +351,15 @@ class JsonContractTests(unittest.TestCase):
             timer.write_text("stale but permissions are independently controlled\n")
             def states(enabled_code, active_code):
                 def runner(argv, **_kwargs):
+                    stdout = (
+                        b"enabled\n" if argv[1] == "is-enabled" and enabled_code == 0
+                        else b"disabled\n" if argv[1] == "is-enabled"
+                        else b"active\n" if active_code == 0
+                        else b"inactive\n"
+                    )
                     return mock.Mock(
                         returncode=enabled_code if argv[1] == "is-enabled" else active_code,
-                        stdout=b"",
+                        stdout=stdout,
                         stderr=b"",
                     )
 
@@ -367,8 +374,54 @@ class JsonContractTests(unittest.TestCase):
             disabled = states(1, 0)
             inactive = states(0, 3)
 
-        self.assertEqual(disabled[2], ("FAIL", "client expiry timer enablement", "disabled or unavailable (exit 1)"))
-        self.assertEqual(inactive[3], ("FAIL", "client expiry timer activity", "inactive or unavailable (exit 3)"))
+        self.assertEqual(
+            disabled[2],
+            (
+                "FAIL",
+                "client expiry timer enablement",
+                "expected persistent enabled state; textual state did not match (exit 1)",
+            ),
+        )
+        self.assertEqual(
+            inactive[3],
+            (
+                "FAIL",
+                "client expiry timer activity",
+                "expected active state; textual state did not match (exit 3)",
+            ),
+        )
+
+    def test_expiry_host_health_rejects_runtime_enablement_and_malformed_states(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            service = root / "expiry.service"
+            timer = root / "expiry.timer"
+            service.write_text("stale but state checks remain observable\n")
+            timer.write_text("stale but state checks remain observable\n")
+
+            def checks(enabled_stdout, active_stdout=b"active\n"):
+                def runner(argv, **_kwargs):
+                    stdout = enabled_stdout if argv[1] == "is-enabled" else active_stdout
+                    return mock.Mock(returncode=0, stdout=stdout, stderr=b"")
+
+                return core.expiry_host_asset_checks(
+                    product_root=root / "opt/amneziawg",
+                    service_path=service,
+                    timer_path=timer,
+                    permission_checker=lambda _path, _mode: None,
+                    command_runner=runner,
+                )
+
+            runtime = checks(b"enabled-runtime\n")
+            alias = checks(b"alias\n")
+            malformed = checks(b"enabled\nextra\n")
+            malformed_active = checks(b"enabled\n", b"activating\n")
+
+        for result in (runtime, alias, malformed):
+            self.assertEqual(result[2][0], "FAIL")
+            self.assertEqual(result[2][1], "client expiry timer enablement")
+        self.assertEqual(malformed_active[3][0], "FAIL")
+        self.assertEqual(malformed_active[3][1], "client expiry timer activity")
 
     def test_management_health_rejects_primary_gid_operator_member(self):
         from types import SimpleNamespace

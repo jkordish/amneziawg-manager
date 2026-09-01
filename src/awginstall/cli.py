@@ -9,11 +9,12 @@ import os
 import pathlib
 import pwd
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
 from collections.abc import Sequence
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from typing import TextIO
 
 from awgctl.version import VERSION
@@ -33,6 +34,23 @@ from .worker import WorkerError, build_in_confined_worker
 
 
 DEFAULT_ROOT = pathlib.Path("/opt/amneziawg")
+PUBLIC_ENTRYPOINT_PATH = pathlib.Path("/usr/local/sbin/awgctl")
+COMPLETION_PATH = pathlib.Path("/etc/bash_completion.d/awgctl")
+
+
+@dataclass(frozen=True)
+class _OwnedPathSnapshot:
+    kind: str
+    mode: int = 0
+    uid: int = 0
+    gid: int = 0
+    data: bytes = b""
+    target: str = ""
+
+
+@dataclass(frozen=True)
+class EntrypointInstallationReport:
+    snapshots: tuple[tuple[pathlib.Path, _OwnedPathSnapshot], ...]
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -212,43 +230,152 @@ def _install_amneziawg_packages() -> None:
         raise InstallerError("AmneziaWG DKMS is not installed for the running kernel")
 
 
-def _install_entrypoints(root: pathlib.Path, repo_root: pathlib.Path) -> None:
-    def atomic_public_file(path: pathlib.Path, data: bytes, mode: int) -> None:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        descriptor, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
-        temporary_path = pathlib.Path(temporary_name)
-        try:
-            os.fchmod(descriptor, mode)
-            with os.fdopen(descriptor, "wb") as handle:
-                handle.write(data)
-                handle.flush()
-                os.fsync(handle.fileno())
-            os.replace(temporary_path, path)
-        except Exception:
-            temporary_path.unlink(missing_ok=True)
-            raise
+def _snapshot_owned_path(path: pathlib.Path) -> _OwnedPathSnapshot:
+    try:
+        metadata = path.lstat()
+    except FileNotFoundError:
+        return _OwnedPathSnapshot("absent")
+    mode = stat.S_IMODE(metadata.st_mode)
+    common = {"mode": mode, "uid": metadata.st_uid, "gid": metadata.st_gid}
+    if stat.S_ISLNK(metadata.st_mode):
+        return _OwnedPathSnapshot("symlink", target=os.readlink(path), **common)
+    if stat.S_ISREG(metadata.st_mode):
+        return _OwnedPathSnapshot("file", data=path.read_bytes(), **common)
+    if stat.S_ISDIR(metadata.st_mode):
+        return _OwnedPathSnapshot("directory", **common)
+    raise InstallerError(f"owned entrypoint path has unsupported type: {path}")
 
-    readme = repo_root / "README.md"
-    if readme.is_file():
-        atomic_public_file(root / "README.md", readme.read_bytes(), 0o644)
-    libexec = root / "libexec"
-    libexec.mkdir(parents=True, exist_ok=True)
-    os.chmod(libexec, 0o755)
-    internal = libexec / "awgctl-internal"
-    temporary_internal = libexec / f".awgctl-internal.{os.getpid()}"
-    temporary_internal.unlink(missing_ok=True)
-    os.symlink("../bin/awgctl", temporary_internal)
-    os.replace(temporary_internal, internal)
-    if root == DEFAULT_ROOT:
-        public = pathlib.Path("/usr/local/sbin/awgctl")
-        public.parent.mkdir(parents=True, exist_ok=True)
-        temporary = public.parent / f".awgctl.{os.getpid()}"
+
+def _atomic_owned_file(path: pathlib.Path, data: bytes, mode: int) -> None:
+    if not path.parent.is_dir() or path.parent.is_symlink():
+        raise InstallerError(f"entrypoint parent directory is unavailable: {path.parent}")
+    descriptor, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    temporary_path = pathlib.Path(temporary_name)
+    try:
+        os.fchmod(descriptor, mode)
+        with os.fdopen(descriptor, "wb") as handle:
+            handle.write(data)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary_path, path)
+    except Exception:
+        temporary_path.unlink(missing_ok=True)
+        raise
+
+
+def _atomic_owned_symlink(path: pathlib.Path, target: str) -> None:
+    if not path.parent.is_dir() or path.parent.is_symlink():
+        raise InstallerError(f"entrypoint parent directory is unavailable: {path.parent}")
+    temporary = path.parent / f".{path.name}.{os.getpid()}"
+    temporary.unlink(missing_ok=True)
+    try:
+        os.symlink(target, temporary)
+        os.replace(temporary, path)
+    except Exception:
         temporary.unlink(missing_ok=True)
-        os.symlink(str(root / "bin/awgctl"), temporary)
-        os.replace(temporary, public)
-        completion_source = repo_root / "awgctl-completion.bash"
-        if completion_source.is_file():
-            atomic_public_file(pathlib.Path("/etc/bash_completion.d/awgctl"), completion_source.read_bytes(), 0o644)
+        raise
+
+
+def _remove_owned_path(path: pathlib.Path) -> None:
+    try:
+        metadata = path.lstat()
+    except FileNotFoundError:
+        return
+    if stat.S_ISDIR(metadata.st_mode):
+        path.rmdir()
+    else:
+        path.unlink()
+
+
+def _restore_owned_path(path: pathlib.Path, snapshot: _OwnedPathSnapshot) -> None:
+    if snapshot.kind == "absent":
+        _remove_owned_path(path)
+        return
+    if snapshot.kind == "directory":
+        try:
+            metadata = path.lstat()
+        except FileNotFoundError:
+            path.mkdir()
+        else:
+            if not stat.S_ISDIR(metadata.st_mode):
+                _remove_owned_path(path)
+                path.mkdir()
+        os.chmod(path, snapshot.mode)
+    elif snapshot.kind == "file":
+        _atomic_owned_file(path, snapshot.data, snapshot.mode)
+    elif snapshot.kind == "symlink":
+        _atomic_owned_symlink(path, snapshot.target)
+    else:
+        raise InstallerError(f"unsupported entrypoint rollback state: {snapshot.kind}")
+
+    metadata = path.lstat()
+    if metadata.st_uid != snapshot.uid or metadata.st_gid != snapshot.gid:
+        os.chown(
+            path,
+            snapshot.uid,
+            snapshot.gid,
+            follow_symlinks=False,
+        )
+
+
+def rollback_entrypoint_installation(report: EntrypointInstallationReport) -> None:
+    errors: list[str] = []
+    for path, snapshot in reversed(report.snapshots):
+        try:
+            _restore_owned_path(path, snapshot)
+        except Exception as exc:
+            errors.append(f"restore {path}: {exc}")
+    if errors:
+        raise InstallerError("entrypoint rollback was incomplete: " + "; ".join(errors))
+
+
+def _install_entrypoints(
+    root: pathlib.Path,
+    repo_root: pathlib.Path,
+) -> EntrypointInstallationReport:
+    readme_target = root / "README.md"
+    libexec = root / "libexec"
+    internal = libexec / "awgctl-internal"
+    owned_paths = [readme_target, libexec, internal]
+    if root == DEFAULT_ROOT:
+        owned_paths.extend((PUBLIC_ENTRYPOINT_PATH, COMPLETION_PATH))
+    report = EntrypointInstallationReport(
+        tuple((path, _snapshot_owned_path(path)) for path in owned_paths)
+    )
+    snapshot_by_path = dict(report.snapshots)
+    if snapshot_by_path[libexec].kind not in {"absent", "directory"}:
+        raise InstallerError(f"managed libexec path is not a directory: {libexec}")
+    for path in (readme_target, internal, *owned_paths[3:]):
+        if snapshot_by_path[path].kind == "directory":
+            raise InstallerError(f"managed entrypoint path is a directory: {path}")
+
+    try:
+        readme = repo_root / "README.md"
+        if readme.is_file():
+            _atomic_owned_file(readme_target, readme.read_bytes(), 0o644)
+        libexec.mkdir(exist_ok=True)
+        os.chmod(libexec, 0o755)
+        _atomic_owned_symlink(internal, "../bin/awgctl")
+        if root == DEFAULT_ROOT:
+            _atomic_owned_symlink(PUBLIC_ENTRYPOINT_PATH, str(root / "bin/awgctl"))
+            completion_source = repo_root / "awgctl-completion.bash"
+            if completion_source.is_file():
+                _atomic_owned_file(
+                    COMPLETION_PATH,
+                    completion_source.read_bytes(),
+                    0o644,
+                )
+        return report
+    except Exception as exc:
+        try:
+            rollback_entrypoint_installation(report)
+        except InstallerError as rollback_exc:
+            raise InstallerError(
+                f"entrypoint installation failed and rollback failed: {rollback_exc}"
+            ) from exc
+        if isinstance(exc, InstallerError):
+            raise
+        raise InstallerError(f"entrypoint installation failed: {exc}") from exc
 
 
 def _deploy_source_release(
@@ -258,19 +385,26 @@ def _deploy_source_release(
     health: bool,
     settings: InstallationSettings,
 ) -> None:
-    # Health validates both selectors, so establish the stable selector layout
-    # before activating and checking a new immutable release.
-    _install_entrypoints(root, repo_root)
     with tempfile.TemporaryDirectory(prefix="awgctl-release-") as directory:
         artifact = pathlib.Path(directory) / "awgctl"
         _build_artifact(repo_root, artifact, settings=settings, confined=root == DEFAULT_ROOT)
-        upgrade_product(
-            root=root,
-            artifact=artifact,
-            version=VERSION,
-            share_files=_share_files(repo_root),
-            health_check=_health_check if health else None,
-        )
+        entrypoint_report = _install_entrypoints(root, repo_root)
+        try:
+            upgrade_product(
+                root=root,
+                artifact=artifact,
+                version=VERSION,
+                share_files=_share_files(repo_root),
+                health_check=_health_check if health else None,
+            )
+        except Exception as exc:
+            try:
+                rollback_entrypoint_installation(entrypoint_report)
+            except InstallerError as rollback_exc:
+                raise InstallerError(
+                    f"release deployment failed and entrypoint rollback failed: {rollback_exc}"
+                ) from exc
+            raise
 
 
 def _rollback_host_reports(reports: Sequence[HostConfigurationReport]) -> None:
@@ -443,6 +577,15 @@ def main(
             )
             return 0 if attested else 1
         platform_info = validate_platform(read_os_release())
+        if args.command == "upgrade" and (
+            getattr(args, "apply_default_dns", False)
+            or getattr(args, "apply_live", False)
+        ):
+            raise InstallerError(
+                "upgrade does not accept --apply-default-dns or --apply-live; "
+                "complete the upgrade first, then use awgctl config set dns and/or "
+                "awgctl restart as a separate operator-reviewed transaction"
+            )
         if (
             args.command in {"install", "adopt", "upgrade", "configure"}
             and not args.dry_run
@@ -684,7 +827,6 @@ def main(
             except Exception:
                 _rollback_host_reports(host_reports)
                 raise
-            _apply_requested_runtime_settings(args, root=root, settings=settings)
             _emit(
                 output,
                 {

@@ -48,6 +48,13 @@ host units before it deploys and health-checks the new executable. A deploy or
 health failure restores the prior release selector, exact prior managed files,
 and the prior timer enabled/active state.
 
+The health proof reads textual systemd state and accepts only persistent
+`enabled` plus exact `active`; runtime-only enablement and every ambiguous state
+fail closed. Artifact build precedes entrypoint mutation, and README,
+internal/public entrypoints, and completion are exact rollback participants.
+Do not combine upgrade with `--apply-default-dns` or `--apply-live`; beta.5
+rejects both before mutation. Apply DNS or restart separately after health.
+
 `awgctl update apply` remains compatible and fail closed across this boundary:
 when beta.4 attempts a beta.5 code-only update without exact active expiry
 assets, beta.5 health fails and the selector returns to beta.4. Do not describe

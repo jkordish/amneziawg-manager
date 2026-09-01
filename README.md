@@ -111,11 +111,13 @@ On first installation the script creates locked `awgctl:awgctl` staging
 identity, `/var/lib/amneziawg-manager`, and the `awgctl-admin` operator group.
 The invoking sudo user is enrolled by default. Builds run as `awgctl` in a
 transient no-network systemd worker; root validates and installs the artifact.
-To migrate existing managed profiles to the configured DNS and activate the
-native service sandbox immediately:
+Upgrade does not combine release activation with later runtime/profile
+mutations. After the upgrade and health check complete, apply any intended DNS
+or service changes as separate operator-reviewed transactions:
 
 ```bash
-sudo python3 install.py upgrade --yes --apply-default-dns --apply-live
+sudo awgctl config set dns cloudflare-malware
+sudo awgctl restart
 ```
 
 ## Everyday use

@@ -28,6 +28,14 @@ versioning while preserving explicit beta labels for unqualified host paths.
   with exact file and timer-state compensation on configuration, deployment,
   or health failure. Beta.4 hosts migrate through `install.py upgrade --yes`
   after reviewing its dry run.
+- Require exact textual systemd state: persistent `enabled` and `active` for
+  health, while installer rollback preserves supported persistent, runtime, or
+  disabled prior enablement and exact active/inactive state.
+- Build before entrypoint mutation and transactionally restore README,
+  internal/public symlinks, completion, and their exact metadata on any later
+  entrypoint, deploy, selector, or health failure.
+- Reject upgrade `--apply-default-dns` and `--apply-live` before mutation;
+  profile DNS changes and service restart are separate post-upgrade commands.
 - Harden release workflow references, SemVer precedence, diagnostic directory
   creation, profile import, transition recovery, service/firewall coordination,
   and AWG 3.1 CPS redaction.

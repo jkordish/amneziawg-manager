@@ -112,11 +112,19 @@ previous selector if health fails. It does not reinstall AmneziaWG or restart
 the tunnel. Existing persisted ingress settings are reused; a legacy install
 without the field must provide an explicit value before the new health gate.
 
-Use `--apply-live` to restart and verify the native service with configured
-systemd hardening. Use `--apply-default-dns` to intentionally regenerate every
-managed client profile with the installation DNS default. These flags are
-explicit because an already distributed profile otherwise remains usable with
-its old resolver.
+Upgrade rejects `--apply-live` and `--apply-default-dns` before changing host or
+release state. After the upgrade and health check complete, make either change
+as its own operator-reviewed transaction:
+
+```bash
+sudo awgctl config set dns cloudflare-malware
+sudo awgctl restart
+```
+
+Choose the intended named/custom DNS value; changing it regenerates managed
+profiles and requires secure redistribution. The same flags remain available
+to the separate `install.py configure` workflow when that explicit host-policy
+transaction is intended.
 
 ## Host identities and customization
 
