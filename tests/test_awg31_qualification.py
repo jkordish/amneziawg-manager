@@ -786,6 +786,17 @@ class QualificationCliTests(unittest.TestCase):
 
         runner.assert_not_called()
 
+    def test_git_preflight_disables_optional_index_refresh(self):
+        self.assertEqual(
+            qualification.read_only_git_prefix(),
+            (
+                "git",
+                "--no-optional-locks",
+                "-C",
+                str(REPO_ROOT),
+            ),
+        )
+
     def test_live_preflight_rejects_recovery_artifacts_before_manager_commands(self):
         runner = mock.Mock(side_effect=AssertionError("must not run"))
         adapters = qualification.LiveAdapters(

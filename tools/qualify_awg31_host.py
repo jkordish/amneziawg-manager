@@ -1242,6 +1242,11 @@ def present_recovery_artifacts(
     return tuple(present)
 
 
+def read_only_git_prefix() -> tuple[str, ...]:
+    """Build Git commands that cannot opportunistically rewrite the index."""
+    return ("git", "--no-optional-locks", "-C", str(REPO_ROOT))
+
+
 class LiveProtectedReader:
     """Descriptor-safe reader that returns only aggregate protected-state hashes."""
 
@@ -1566,7 +1571,7 @@ class LiveAdapters:
             _fail("non-root qualification is forbidden")
         if self.recovery_artifact_probe():
             _fail("manager recovery artifact blocks qualification preflight")
-        git_prefix = ["git", "-C", str(REPO_ROOT)]
+        git_prefix = read_only_git_prefix()
         git_status = _runner_output(
             self.command_runner, [*git_prefix, "status", "--porcelain=v1"]
         )
@@ -1656,7 +1661,7 @@ class LiveAdapters:
         """Revalidate non-locking state after the manager flock is held."""
         if self.effective_uid() != 0:
             _fail("non-root qualification is forbidden")
-        git_prefix = ["git", "-C", str(REPO_ROOT)]
+        git_prefix = read_only_git_prefix()
         git_status = _runner_output(
             self.command_runner, [*git_prefix, "status", "--porcelain=v1"]
         )
