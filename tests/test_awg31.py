@@ -1,5 +1,8 @@
 import base64
+import argparse
 import copy
+import contextlib
+import io
 import json
 import os
 import pathlib
@@ -74,6 +77,116 @@ def awg31_config() -> tuple[dict, bytes]:
     return config, material
 
 
+def restore_client(
+    name: str = "kat-phone",
+    *,
+    address: str = "10.77.42.2/32",
+    private_byte: int = 4,
+    public_byte: int = 5,
+    psk_byte: int = 6,
+    status: str = "expired",
+) -> dict:
+    return {
+        "name": name,
+        "address": address,
+        "private_key": key(private_byte),
+        "public_key": key(public_byte),
+        "psk": key(psk_byte),
+        "status": status,
+    }
+
+
+def populate_restore_stage(
+    stage: pathlib.Path,
+    config: dict,
+    header_material: bytes,
+    clients: list[dict],
+):
+    for relative in ("config", "keys/server", "keys/clients", "clients", "generated"):
+        (stage / relative).mkdir(parents=True, exist_ok=True)
+    (stage / "config/server.json").write_text(json.dumps(config), encoding="utf-8")
+    (stage / "keys/server/private").write_text(key(1) + "\n", encoding="ascii")
+    (stage / "keys/server/public").write_text(key(2) + "\n", encoding="ascii")
+    (stage / "keys/server/header-protection").write_bytes(header_material)
+    server_clients = []
+    private_to_public = {key(1): key(2)}
+    for client in clients:
+        name = client["name"]
+        client_dir = stage / "clients" / name
+        key_dir = stage / "keys/clients" / name
+        client_dir.mkdir()
+        key_dir.mkdir()
+        timestamp = "2026-09-01T00:00:00Z"
+        metadata = {
+            "schema_version": 3,
+            "name": name,
+            "status": client["status"],
+            "management": "managed",
+            "address": client["address"],
+            "public_key": client["public_key"],
+            "public_key_fingerprint": core.fingerprint(client["public_key"]),
+            "use_psk": True,
+            "created_at": timestamp,
+            "updated_at": timestamp,
+            "owner": "Kat",
+            "device": "iPhone",
+            "expires": "2026-08-31" if client["status"] == "expired" else None,
+            "profile_revision": 1,
+            "profile_generated_at": timestamp,
+            "profile_change_reason": "created",
+            "distribution_status": "pending",
+            "distributed_at": None,
+        }
+        if client["status"] == "expired":
+            metadata["expired_at"] = timestamp
+        (client_dir / "metadata.json").write_text(json.dumps(metadata), encoding="utf-8")
+        profile = core.render_client_config(
+            config,
+            client["private_key"],
+            client["psk"],
+            key(2),
+            client["address"],
+            header_protection_key=header_material,
+        )
+        (client_dir / f"{name}.conf").write_text(profile, encoding="utf-8")
+        (client_dir / f"{name}.png").write_bytes(b"png fixture")
+        (key_dir / "private").write_text(client["private_key"] + "\n", encoding="ascii")
+        (key_dir / "public").write_text(client["public_key"] + "\n", encoding="ascii")
+        (key_dir / "psk").write_text(client["psk"] + "\n", encoding="ascii")
+        private_to_public[client["private_key"]] = client["public_key"]
+        server_clients.append(
+            {
+                "name": name,
+                "address": client["address"],
+                "public_key": client["public_key"],
+                "psk": client["psk"],
+                "status": client["status"],
+            }
+        )
+    (stage / "generated/awg0.conf").write_text(
+        core.render_server_config(
+            config,
+            key(1),
+            server_clients,
+            header_protection_key=header_material,
+        ),
+        encoding="utf-8",
+    )
+    (stage / "generated/nftables.nft").write_text("managed nft fixture\n", encoding="utf-8")
+    for path in stage.rglob("*"):
+        path.chmod(0o700 if path.is_dir() else 0o600)
+
+    def runner(argv, **kwargs):
+        supplied = kwargs.get("input_data", b"").decode("ascii").strip()
+        derived = private_to_public.get(supplied)
+        if derived is None:
+            decoded = base64.b64decode(supplied, validate=True)
+            derived = key((decoded[0] + 1) % 256)
+        return subprocess.CompletedProcess(argv, 0, derived.encode(), b"")
+
+    return runner
+
+
 class ServerSchemaTwoTests(unittest.TestCase):
     def test_schema_one_normalizes_to_classic_schema_two_without_changing_nine_values(self):
         legacy = schema_one_config()
@@ -88,6 +201,33 @@ class ServerSchemaTwoTests(unittest.TestCase):
         self.assertEqual(normalized["obfuscation"]["profile"]["parameters"], expected_values)
         self.assertEqual(legacy["schema_version"], 1)
         self.assertEqual(legacy["obfuscation"], expected_values)
+
+    def test_schema_one_retains_legacy_32_bit_non_header_values(self):
+        legacy = schema_one_config()
+        legacy["obfuscation"]["Jc"] = 65_536
+
+        normalized = core.normalize_server_config(legacy)
+
+        self.assertEqual(
+            normalized["obfuscation"]["profile"]["parameters"]["Jc"],
+            65_536,
+        )
+        self.assertEqual(
+            core.obfuscation_status(normalized),
+            {"mode": "classic", "profile": "classic-v1"},
+        )
+        rendered = core.render_server_config(normalized, key(1), [])
+        self.assertIn("Jc = 65536\n", rendered)
+
+    def test_nested_profile_schema_versions_reject_bool_for_both_modes(self):
+        classic = core.normalize_server_config(schema_one_config())
+        classic["obfuscation"]["profile"]["schema_version"] = True
+        awg31, _ = awg31_config()
+        awg31["obfuscation"]["profile"]["schema_version"] = True
+
+        for mode, value in (("classic", classic), ("awg31", awg31)):
+            with self.subTest(mode=mode), self.assertRaises(core.AwgctlError):
+                core.normalize_server_config(value)
 
     def test_unknown_fields_are_rejected_at_each_server_model_layer(self):
         normalized = core.normalize_server_config(schema_one_config())
@@ -415,36 +555,80 @@ class HeaderProtectionKeyTests(unittest.TestCase):
                 )
             self.assertFalse(path.exists())
 
-    def test_restore_stage_accepts_matching_header_key_and_rejects_drift(self):
-        config, rendered_material = awg31_config()
+    def test_restore_stage_accepts_complete_expired_client_and_rejects_profile_header_key_drift(self):
+        config, material = awg31_config()
         with tempfile.TemporaryDirectory() as directory:
             stage = pathlib.Path(directory)
-            for relative in ("config", "keys/server", "generated"):
-                (stage / relative).mkdir(parents=True, exist_ok=True)
-            (stage / "config/server.json").write_text(json.dumps(config), encoding="utf-8")
-            (stage / "keys/server/private").write_text(key(1) + "\n", encoding="ascii")
-            (stage / "keys/server/public").write_text(key(2) + "\n", encoding="ascii")
-            protected = stage / "keys/server/header-protection"
-            protected.write_bytes(rendered_material)
-            protected.chmod(0o600)
-            (stage / "generated/awg0.conf").write_text(
-                core.render_server_config(
-                    config,
-                    key(1),
-                    [],
-                    header_protection_key=rendered_material,
-                ),
-                encoding="utf-8",
+            client = restore_client()
+            runner = populate_restore_stage(stage, config, material, [client])
+            profile = stage / "clients/kat-phone/kat-phone.conf"
+            wrong_material = b"w" * 32
+            divergent = core.render_client_config(
+                config,
+                client["private_key"],
+                client["psk"],
+                key(2),
+                client["address"],
+                header_protection_key=wrong_material,
             )
-            (stage / "generated/nftables.nft").write_text("managed nft fixture\n", encoding="utf-8")
-            derived = subprocess.CompletedProcess(["awg", "pubkey"], 0, key(2).encode(), b"")
 
-            with mock.patch.object(core, "run", return_value=derived), mock.patch.object(
+            with mock.patch.object(core, "run", side_effect=runner), mock.patch.object(
                 core, "validate_native_server"
             ), mock.patch.object(core, "validate_nftables_text"):
                 self.assertEqual(core.validate_restore_stage(stage), config)
-                protected.write_bytes(b"different-protected-material!!"[:32].ljust(32, b"!"))
-                with self.assertRaisesRegex(core.AwgctlError, "header-protection"):
+                profile.write_text(divergent, encoding="utf-8")
+                profile.chmod(0o600)
+                with self.assertRaisesRegex(core.AwgctlError, "client"):
+                    core.validate_restore_stage(stage)
+
+    def test_restore_stage_rejects_missing_extra_malformed_duplicate_or_divergent_client_artifacts(self):
+        config, material = awg31_config()
+
+        def missing_profile(stage):
+            (stage / "clients/kat-phone/kat-phone.conf").unlink()
+
+        def extra_artifact(stage):
+            extra = stage / "clients/kat-phone/unexpected.txt"
+            extra.write_text("extra", encoding="utf-8")
+            extra.chmod(0o600)
+
+        def malformed_metadata(stage):
+            path = stage / "clients/kat-phone/metadata.json"
+            path.write_text("{", encoding="utf-8")
+
+        def divergent_private(stage):
+            path = stage / "keys/clients/kat-phone/private"
+            path.write_text(key(8) + "\n", encoding="ascii")
+
+        cases = (
+            ("missing", [restore_client()], missing_profile),
+            ("extra", [restore_client()], extra_artifact),
+            ("malformed", [restore_client()], malformed_metadata),
+            ("divergent", [restore_client()], divergent_private),
+            (
+                "duplicate",
+                [
+                    restore_client(),
+                    restore_client(
+                        "duplicate-phone",
+                        private_byte=8,
+                        public_byte=9,
+                        psk_byte=10,
+                    ),
+                ],
+                lambda stage: None,
+            ),
+        )
+        for label, clients, mutate in cases:
+            with self.subTest(case=label), tempfile.TemporaryDirectory() as directory:
+                stage = pathlib.Path(directory)
+                runner = populate_restore_stage(stage, config, material, clients)
+                mutate(stage)
+                with mock.patch.object(core, "run", side_effect=runner), mock.patch.object(
+                    core, "validate_native_server"
+                ), mock.patch.object(core, "validate_nftables_text"), self.assertRaises(
+                    core.AwgctlError
+                ):
                     core.validate_restore_stage(stage)
 
 
@@ -707,6 +891,86 @@ class Awg31RenderingTests(unittest.TestCase):
                 core.obfuscation_status(config),
                 {"mode": "classic", "profile": "classic-v1"},
             )
+
+
+class CpsDisclosureTests(unittest.TestCase):
+    MARKER = "deadbeefc001d00d"
+
+    def config_with_marker(self) -> dict:
+        config, _ = awg31_config()
+        config["obfuscation"]["profile"]["parameters"]["I1"] = (
+            f"<b 0x{self.MARKER}>"
+        )
+        return core.normalize_server_config(config)
+
+    def test_config_show_text_and_json_use_one_secret_safe_representation(self):
+        config = self.config_with_marker()
+        for as_json in (False, True):
+            output = io.StringIO()
+            with (
+                self.subTest(json=as_json),
+                mock.patch.object(core, "load_config", return_value=config),
+                contextlib.redirect_stdout(output),
+            ):
+                self.assertEqual(core.cmd_config_show(argparse.Namespace(json=as_json)), 0)
+            rendered = output.getvalue()
+            self.assertNotIn(self.MARKER, rendered)
+            self.assertIn("[redacted]", rendered)
+        self.assertIn(
+            self.MARKER,
+            config["obfuscation"]["profile"]["parameters"]["I1"],
+        )
+
+    def test_actual_diagnostic_bundle_removes_cps_from_state_and_awg_configs(self):
+        config = self.config_with_marker()
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            output_parent = root / "diagnostics"
+            output_parent.mkdir(mode=0o700)
+            generated = root / "generated.conf"
+            runtime = root / "runtime.conf"
+            config["paths"]["generated_config"] = str(generated)
+            config["paths"]["runtime_config"] = str(runtime)
+            awg_text = "[Interface]\n" + "".join(
+                f"I{index} = <b 0x{self.MARKER}{index:02x}>\n"
+                for index in range(1, 6)
+            )
+            generated.write_text(awg_text, encoding="utf-8")
+            runtime.write_text(awg_text, encoding="utf-8")
+            output = io.StringIO()
+            with (
+                mock.patch.object(core, "load_config", return_value=config),
+                mock.patch.object(core, "load_clients", return_value=[]),
+                mock.patch.object(core, "mutation_lock", return_value=contextlib.nullcontext()),
+                mock.patch.object(core, "ensure_layout"),
+                mock.patch.object(core, "diagnostic_command", return_value=b"safe\n"),
+                mock.patch.object(core, "GENERATED_CONFIG", generated),
+                mock.patch.object(core, "RUNTIME_CONFIG", runtime),
+                mock.patch.object(core, "audit"),
+                contextlib.redirect_stdout(output),
+            ):
+                self.assertEqual(
+                    core.cmd_diagnose(
+                        argparse.Namespace(
+                            output=output_parent,
+                            dry_run=False,
+                            json=False,
+                        )
+                    ),
+                    0,
+                )
+            bundles = [path for path in output_parent.iterdir() if path.is_dir()]
+            self.assertEqual(len(bundles), 1)
+            for path in bundles[0].rglob("*"):
+                if path.is_file():
+                    content = path.read_bytes()
+                    self.assertNotIn(self.MARKER.encode(), content, path)
+            for relative in (
+                "manager/server.json",
+                "manager/generated-awg0.conf",
+                "manager/runtime-awg0.conf",
+            ):
+                self.assertIn(b"[redacted]", (bundles[0] / relative).read_bytes())
 
 
 if __name__ == "__main__":

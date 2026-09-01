@@ -18,6 +18,7 @@ _KEY_LINE = re.compile(
     r"(?P<value>\S+)(\s*)$",
     re.MULTILINE,
 )
+_CPS_LINE = re.compile(r"^(\s*I[1-5]\s*=\s*)[^\r\n]*$", re.MULTILINE)
 
 
 class DiagnosticsError(RuntimeError):
@@ -41,7 +42,7 @@ def redact_awg_config(text: str) -> str:
         digest = hashlib.sha256(value).hexdigest()[:length]
         return f"{match.group(1)}[redacted sha256:{digest}]{match.group(4)}"
 
-    return _KEY_LINE.sub(replace, text)
+    return _CPS_LINE.sub(r"\1[redacted]", _KEY_LINE.sub(replace, text))
 
 
 def _safe_relative(name: str) -> pathlib.PurePosixPath:
