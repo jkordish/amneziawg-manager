@@ -15,6 +15,16 @@ class DeploymentError(RuntimeError):
     """A safe deployment error suitable for operator output."""
 
 
+def _normalize_release_permissions(release: pathlib.Path) -> None:
+    for directory, directories, files in os.walk(release):
+        directory_path = pathlib.Path(directory)
+        os.chmod(directory_path, 0o755)
+        for name in directories:
+            os.chmod(directory_path / name, 0o755)
+        for name in files:
+            os.chmod(directory_path / name, 0o755 if directory_path == release and name == "awgctl" else 0o644)
+
+
 def _atomic_write(path: pathlib.Path, data: bytes, mode: int) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
@@ -84,6 +94,7 @@ def install_release(
         installed = final / "awgctl"
         if not installed.is_file() or installed.read_bytes() != artifact.read_bytes():
             raise DeploymentError(f"release already exists with different content: {version}")
+        _normalize_release_permissions(final)
         activate_release(root, version)
         return final
 
@@ -110,6 +121,7 @@ def install_release(
             (json.dumps(manifest, indent=2, sort_keys=True) + "\n").encode(),
             0o644,
         )
+        _normalize_release_permissions(staging)
         os.replace(staging, final)
     except Exception:
         shutil.rmtree(staging, ignore_errors=True)
@@ -128,6 +140,7 @@ def preserve_legacy_release(root: pathlib.Path) -> str | None:
     if final.exists():
         if (final / "awgctl").read_bytes() != selector.read_bytes():
             raise DeploymentError("legacy-import already exists with different content")
+        _normalize_release_permissions(final)
         return version
     final.parent.mkdir(parents=True, exist_ok=True)
     staging = pathlib.Path(tempfile.mkdtemp(prefix=".legacy-import.", dir=final.parent))
@@ -145,6 +158,7 @@ def preserve_legacy_release(root: pathlib.Path) -> str | None:
             (json.dumps(manifest, indent=2, sort_keys=True) + "\n").encode(),
             0o644,
         )
+        _normalize_release_permissions(staging)
         os.replace(staging, final)
     except Exception:
         shutil.rmtree(staging, ignore_errors=True)

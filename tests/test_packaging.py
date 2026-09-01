@@ -37,6 +37,9 @@ class VersionedDeploymentTests(unittest.TestCase):
                 f"../releases/{VERSION}/awgctl",
             )
             self.assertEqual((installed / "awgctl").stat().st_mode & 0o777, 0o755)
+            self.assertEqual(installed.stat().st_mode & 0o777, 0o755)
+            self.assertEqual((installed / "share").stat().st_mode & 0o777, 0o755)
+            self.assertEqual((installed / "share/README.md").stat().st_mode & 0o777, 0o644)
             manifest = json.loads((installed / "install-manifest.json").read_text())
             self.assertEqual(manifest["version"], VERSION)
             self.assertEqual(manifest["files"], ["awgctl", "share/README.md"])
