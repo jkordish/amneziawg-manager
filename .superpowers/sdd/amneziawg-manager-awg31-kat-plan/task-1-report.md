@@ -350,3 +350,103 @@ OK
 ### Fix Round 2 commit
 
 - Subject: `fix: reject flow-mapped workflow actions`
+
+## Fix Round 3
+
+### Findings addressed
+
+1. YAML comment recognition is now context-sensitive: an unquoted `#` begins a comment only at the start of a scalar or after separation whitespace. Embedded plain-scalar text such as `foo#bar` remains executable content, so a later flow-map `uses` key cannot be hidden.
+2. Every line is lexed into YAML content and comment text before block-scalar-header matching. `jobs: # fake: |` is evaluated as `jobs:` and cannot suppress its indented job mappings, while `run: | # real comment` remains a real protected block scalar.
+3. The unsupported block-key grammar now accepts the combination of an explicit-key marker with one or more YAML properties before `uses`, so `? &action-key uses` and `? !!str uses` fail closed.
+
+The correction remains confined to `tests/test_workflows.py`; the SemVer implementation and unrelated Task 1 boundaries were not changed.
+
+### Required RED evidence
+
+Command run against the Round 2 implementation:
+
+```text
+python3 -m unittest -v \
+  tests.test_workflows.WorkflowSecurityTests.test_embedded_hash_in_plain_flow_scalar_does_not_hide_uses \
+  tests.test_workflows.WorkflowSecurityTests.test_inline_comment_cannot_fabricate_a_block_scalar_header \
+  tests.test_workflows.WorkflowSecurityTests.test_explicit_property_uses_keys_fail_closed
+```
+
+Output:
+
+```text
+Ran 3 tests in 0.004s
+FAILED (failures=4)
+```
+
+- `- { name: foo#bar, uses: actions/checkout@v7 }` produced no violation because scanning stopped at the embedded hash.
+- `jobs: # fake: |` suppressed all indented job mappings and returned only `no uses mappings found`.
+- Both combined explicit/property variants returned no violations beside the valid pinned control action.
+
+### Focused GREEN evidence
+
+The same three-test command after the correction produced:
+
+```text
+Ran 3 tests in 0.003s
+OK
+```
+
+All workflow-policy tests:
+
+```text
+python3 -m unittest -v tests.test_workflows
+Ran 11 tests in 0.009s
+OK
+```
+
+Serial Task 1 validator set:
+
+```text
+python3 -m unittest -v tests.test_workflows tests.test_releases tests.test_release_build tests.test_packaging
+Ran 22 tests in 0.724s
+OK
+```
+
+Additional focused gates:
+
+```text
+python3 -m py_compile tests/test_workflows.py
+git diff --check
+```
+
+Both commands exited 0 with no output.
+
+### Comment-boundary mutation evidence
+
+The `_is_yaml_comment_start` boundary was deliberately mutated back to treating every `#` as a comment.
+
+```text
+python3 -m unittest -v tests.test_workflows.WorkflowSecurityTests.test_yaml_comment_requires_separation_whitespace
+Ran 1 test in 0.001s
+FAILED (failures=1)
+```
+
+The mutation incorrectly split `name: foo#bar` into content `name: foo` and comment `bar`. Restoring the separation-whitespace rule produced:
+
+```text
+Ran 1 test in 0.000s
+OK
+```
+
+### Fix Round 3 self-review
+
+- Comment lexing skips single- and double-quoted scalars and recognizes `#` only at index zero or after whitespace. Both `_split_yaml_comment` and the flow-map scanner consume the same predicate, preventing boundary drift.
+- The mutation test pairs embedded `foo#bar` with separated `foo # comment`, and pairs an executable embedded-hash flow map with a real comment containing a fake flow map.
+- Block-scalar recognition sees only comment-stripped YAML content. The test set covers a fake `|` inside an inline comment, a real `|` with an inline comment, literal body content containing `{ uses: ... }`, and a commented-out scalar header.
+- Explicit keys with no property, a property with no explicit marker, and combined `? &anchor uses` / `? !!str uses` forms all fail closed. Flow-map explicit/property variants remain covered from Round 2.
+- Ordinary pinned block actions, reusable-workflow paths, local action handling, version comments, `.yml`/`.yaml` enumeration, and the prior SemVer rejection cases stayed green.
+
+### Fix Round 3 concerns
+
+- No blocker. This remains a narrow dependency-free workflow-policy lexer, not a general YAML parser; the verified comment and key-property semantics are now explicit and regression-tested.
+- No workflow file, production module, release behavior, or unrelated task was changed.
+
+### Fix Round 3 commit
+
+- Subject: `fix: honor YAML workflow comment boundaries`

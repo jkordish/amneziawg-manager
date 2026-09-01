@@ -12,10 +12,10 @@ VERSION_COMMENT_RE = re.compile(
     r"^v[0-9]+(?:\.[0-9]+)*(?:[-+][0-9A-Za-z.-]+)?(?:\s+\S(?:.*\S)?)?$"
 )
 BLOCK_SCALAR_HEADER_RE = re.compile(
-    r":\s*[|>](?:[1-9][+-]?|[+-][1-9]?)?\s*(?:#.*)?$"
+    r":\s*[|>](?:[1-9][+-]?|[+-][1-9]?)?\s*$"
 )
 UNSUPPORTED_BLOCK_USES_RE = re.compile(
-    r"^\s*(?:-\s*)?(?:(?:[&!][^\s]+\s+)+|\?\s+)"
+    r"^\s*(?:-\s*)?(?:(?:\?\s+)?(?:[&!][^\s]+\s+)+|\?\s+)"
     r"(?:uses|['\"]uses['\"])\s*(?::.*|#.*)?$"
 )
 
@@ -41,6 +41,22 @@ def _quoted_scalar(line: str, start: int) -> tuple[str, int]:
     return "".join(value), index
 
 
+def _is_yaml_comment_start(text: str, index: int) -> bool:
+    return text[index] == "#" and (index == 0 or text[index - 1].isspace())
+
+
+def _split_yaml_comment(text: str) -> tuple[str, str]:
+    index = 0
+    while index < len(text):
+        if text[index] in {"'", '"'}:
+            _, index = _quoted_scalar(text, index)
+            continue
+        if _is_yaml_comment_start(text, index):
+            return text[:index].rstrip(), text[index + 1:].strip()
+        index += 1
+    return text.rstrip(), ""
+
+
 def _is_uses_key(key: str) -> bool:
     candidate = key.strip()
     if candidate.startswith("?"):
@@ -64,7 +80,7 @@ def _has_unsupported_flow_uses_mapping(line: str) -> bool:
     index = 0
     while index < len(line):
         character = line[index]
-        if character == "#":
+        if _is_yaml_comment_start(line, index):
             break
         if character in {"'", '"'}:
             scalar, next_index = _quoted_scalar(line, index)
@@ -103,7 +119,9 @@ def _has_unsupported_flow_uses_mapping(line: str) -> bool:
                 index += 1
                 continue
             key_start = index
-            while index < len(line) and line[index] not in ":,{}[]#":
+            while index < len(line):
+                if line[index] in ":,{}[]" or _is_yaml_comment_start(line, index):
+                    break
                 index += 1
             key = line[key_start:index].strip()
             if index < len(line) and line[index] == ":":
@@ -133,9 +151,10 @@ def action_policy_violations(workflow_root: pathlib.Path) -> list[str]:
                 if not line.strip() or indentation > block_scalar_indent:
                     continue
                 block_scalar_indent = None
-            if line.lstrip().startswith("#"):
+            yaml_content, _ = _split_yaml_comment(line)
+            if not yaml_content.strip():
                 continue
-            if BLOCK_SCALAR_HEADER_RE.search(line):
+            if BLOCK_SCALAR_HEADER_RE.search(yaml_content):
                 block_scalar_indent = indentation
             match = USES_MAPPING_RE.fullmatch(line)
             if not match:
@@ -145,9 +164,9 @@ def action_policy_violations(workflow_root: pathlib.Path) -> list[str]:
                 continue
             mapping_count += 1
             raw_value = match.group(1).strip()
-            raw_reference, marker, raw_comment = raw_value.partition("#")
+            raw_reference, raw_comment = _split_yaml_comment(raw_value)
             reference = raw_reference.strip()
-            version_comment = raw_comment.strip() if marker else ""
+            version_comment = raw_comment.strip()
             if (
                 not reference
                 or any(character.isspace() for character in reference)
@@ -213,7 +232,7 @@ class WorkflowSecurityTests(unittest.TestCase):
                 "  - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7\n"
                 "  # - { uses: actions/checkout@v7 }\n"
                 "  - run: 'echo \"{ uses: actions/checkout@v7 }\"'\n"
-                "  - run: |\n"
+                "  - run: | # real block scalar\n"
                 "      { uses: actions/checkout@v7 }\n"
                 "  # run: |\n"
                 "    - { uses: actions/checkout@v7 }\n"
@@ -257,6 +276,59 @@ class WorkflowSecurityTests(unittest.TestCase):
                 )
                 violations = action_policy_violations(root)
                 self.assertTrue(any("unsupported uses mapping" in item for item in violations), violations)
+
+    def test_embedded_hash_in_plain_flow_scalar_does_not_hide_uses(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            (root / "ci.yml").write_text(
+                "steps:\n"
+                "  - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7\n"
+                "  - { name: foo#bar, uses: actions/checkout@v7 }\n",
+                encoding="utf-8",
+            )
+            violations = action_policy_violations(root)
+            self.assertTrue(any("unsupported uses mapping" in item for item in violations), violations)
+
+    def test_inline_comment_cannot_fabricate_a_block_scalar_header(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            (root / "ci.yaml").write_text(
+                "jobs: # fake: |\n"
+                "  pinned:\n"
+                "    uses: owner/repository/.github/workflows/ci.yml@"
+                "3d3c42e5aac5ba805825da76410c181273ba90b1 # v7\n"
+                "  mutable:\n"
+                "    uses: actions/checkout@v7 # v7\n",
+                encoding="utf-8",
+            )
+            violations = action_policy_violations(root)
+            self.assertTrue(any("mutable external action" in item for item in violations), violations)
+
+    def test_explicit_property_uses_keys_fail_closed(self):
+        variants = (
+            "? &action-key uses\n: actions/checkout@v7",
+            "? !!str uses\n: actions/checkout@v7",
+        )
+        for variant in variants:
+            with self.subTest(variant=variant), tempfile.TemporaryDirectory() as directory:
+                root = pathlib.Path(directory)
+                indented = variant.replace("\n", "\n  ")
+                (root / "ci.yml").write_text(
+                    "steps:\n"
+                    "  - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7\n"
+                    f"  {indented}\n",
+                    encoding="utf-8",
+                )
+                violations = action_policy_violations(root)
+                self.assertTrue(any("unsupported uses mapping" in item for item in violations), violations)
+
+    def test_yaml_comment_requires_separation_whitespace(self):
+        embedded = "- { name: foo#bar, uses: actions/checkout@v7 }"
+        separated = "- { name: foo } # { uses: actions/checkout@v7 }"
+        self.assertEqual(_split_yaml_comment("name: foo#bar"), ("name: foo#bar", ""))
+        self.assertEqual(_split_yaml_comment("name: foo # comment"), ("name: foo", "comment"))
+        self.assertTrue(_has_unsupported_flow_uses_mapping(embedded))
+        self.assertFalse(_has_unsupported_flow_uses_mapping(separated))
 
 
 if __name__ == "__main__":
