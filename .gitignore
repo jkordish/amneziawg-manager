@@ -1,0 +1,33 @@
+# Python runtime and test artifacts
+__pycache__/
+*.py[cod]
+*.pyo
+.coverage
+.pytest_cache/
+
+# Local builds and isolated worktrees
+build/
+dist/
+.worktrees/
+*.tar.gz
+*.tar.gz.sig
+
+# Editor and operating-system artifacts
+.*.swp
+.DS_Store
+
+# Defense in depth: VPN runtime material never belongs in this repository.
+keys/
+clients/
+revoked/
+backups/
+generated/
+server.json
+*.conf
+*.png
+*.qr
+
+# Dedicated release private keys must never be committed.
+release-signing-key
+release-signing-key.*
+!release-signing-key.pub
