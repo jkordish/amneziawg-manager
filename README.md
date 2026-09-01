@@ -15,10 +15,11 @@ port, AWS credential, or generic host firewall.
 > **Beta support boundary:** v0.1 supports Ubuntu 24.04 LTS, amd64, IPv4, one
 > `awg0`, and an explicitly attested public-ingress boundary: AWS Lightsail or
 > an equivalent external firewall. Classic mode remains compatible. The AWG
-> 3.1 model and direct-cutover controls are repository-tested, but the
-> production qualification allowlist is intentionally empty. Therefore no
-> package pair can activate AWG 3.1 in this release, and no in-Russia iOS result
-> is claimed.
+> 3.1 model and direct-cutover controls are repository-tested, and exactly the
+> tools/module pair `3.1.20260812` is qualified on the target Ubuntu 24.04 amd64
+> host through isolated native traffic. This is not disposable-host,
+> package-upgrade, future-kernel, Russian-network, or physical-device evidence;
+> no in-Russia iOS result is claimed.
 
 ## Why this exists
 

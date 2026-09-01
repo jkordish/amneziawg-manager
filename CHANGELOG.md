@@ -3,6 +3,20 @@
 All notable changes are documented here. The project follows semantic
 versioning while preserving explicit beta labels for unqualified host paths.
 
+## 0.1.0-beta.6 - 2026-09-01
+
+- Qualify exactly AmneziaWG tools/module `3.1.20260812` on the target Ubuntu
+  24.04 amd64 host through isolated native classic and AWG 3.1 traffic,
+  counters, interface recreation, and AWG 3.1-to-classic rollback.
+- Require complete production before/after invariants, exact source and native
+  version binding, verified cleanup, root-only redacted evidence, and a
+  non-reconciling recovery-artifact preflight before issuing the receipt.
+- Prevent root qualification from opportunistically refreshing or changing
+  ownership of the source checkout's Git index.
+- Keep every other tools/module pair denied. This evidence does not cover a
+  disposable host, package upgrades, future kernels, Russian-network traffic,
+  or a physical iPhone; activation and Kat acceptance remain separate gates.
+
 ## 0.1.0-beta.5 - 2026-09-01
 
 - Add a versioned AWG 3.1 server/profile model with `russia-ios-v1`, strict CPS

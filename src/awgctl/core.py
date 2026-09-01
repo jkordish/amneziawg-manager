@@ -123,9 +123,11 @@ AWG31_PARAMETER_FIELDS = (
     *AWG31_BOOLEAN_FIELDS,
 )
 AWG31_QUALIFICATION_POLICY_VERSION = 1
-# Qualification is intentionally empty until a server pair completes the external
-# compatibility process. Tests inject this impossible future fixture explicitly.
-AWG31_QUALIFIED_PAIRS_V1: frozenset[tuple[str, str]] = frozenset()
+# Exact-host native qualification evidence is reviewed and versioned in source.
+# Any other tools/module pair remains denied until it completes the same policy.
+AWG31_QUALIFIED_PAIRS_V1: frozenset[tuple[str, str]] = frozenset(
+    {("3.1.20260812", "3.1.20260812")}
+)
 AWG31_TEST_FIXTURE_PAIR = ("3.1.20990101", "3.1.20990102")
 BLOCKED_FORWARD_IPV4 = (
     "0.0.0.0/8",

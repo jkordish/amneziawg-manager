@@ -168,9 +168,10 @@ guaranteed censorship bypass: AWG remains IP over UDP, so destination IP
 blocking, blanket UDP blocking, or a restrictive UDP whitelist can stop it.
 There is no XRay or other fallback transport.
 
-The production qualification allowlist is currently empty. The commands below
-are the operator contract for a future release with an exactly qualified
-tools/module pair; today `prepare` must fail closed at the capability gate.
+The production qualification allowlist contains exactly tools/module
+`3.1.20260812`/`3.1.20260812`. The commands below are the operator contract for
+that pair; every other pair fails closed at the capability gate. Qualification
+does not replace the external-ingress or physical-device acceptance gates.
 
 1. Inspect the non-secret state and perform a no-write preview:
 

@@ -141,7 +141,7 @@ class RepositoryDryRunAcceptanceTests(unittest.TestCase):
         )
         self.assertEqual(legacy["schema_version"], 1)
 
-    def test_awg31_prepare_dry_run_is_nonmutating_secret_free_and_unqualified(self):
+    def test_awg31_prepare_dry_run_is_nonmutating_secret_free_and_qualified(self):
         config = core.normalize_server_config(schema_one_classic())
         args = core.build_parser().parse_args(
             [
@@ -205,7 +205,10 @@ class RepositoryDryRunAcceptanceTests(unittest.TestCase):
         self.assertEqual(payload["data"]["required_ingress"]["port"], "selected-at-execution")
         self.assertNotIn("private", output.getvalue().lower())
         self.assertNotIn(key(3), output.getvalue())
-        self.assertEqual(core.AWG31_QUALIFIED_PAIRS_V1, frozenset())
+        self.assertEqual(
+            core.AWG31_QUALIFIED_PAIRS_V1,
+            frozenset({("3.1.20260812", "3.1.20260812")}),
+        )
 
     def test_activation_failure_invokes_synchronous_classic_rollback(self):
         document = {

@@ -770,6 +770,38 @@ class Awg31CapabilityTests(unittest.TestCase):
             },
         )
 
+    def test_production_policy_contains_only_the_live_qualified_pair(self):
+        qualified_pair = ("3.1.20260812", "3.1.20260812")
+        self.assertEqual(
+            core.AWG31_QUALIFIED_PAIRS_V1,
+            frozenset({qualified_pair}),
+        )
+
+        evidence = core.require_awg31_capability(
+            command_runner=self.runner_for(*qualified_pair),
+            loaded_version_reader=lambda: qualified_pair[1] + "\n",
+        )
+
+        self.assertEqual(evidence["tools_version"], qualified_pair[0])
+        self.assertEqual(evidence["module_version"], qualified_pair[1])
+        self.assertTrue(evidence["qualified"])
+
+    def test_neighboring_or_mismatched_production_pairs_remain_unqualified(self):
+        for tools_version, module_version in (
+            ("3.1.20260811", "3.1.20260812"),
+            ("3.1.20260812", "3.1.20260813"),
+        ):
+            with self.subTest(
+                tools=tools_version, module=module_version
+            ), self.assertRaises(core.AwgctlError):
+                core.require_awg31_capability(
+                    command_runner=self.runner_for(
+                        tools_version, module_version
+                    ),
+                    loaded_version_reader=lambda value=module_version: value
+                    + "\n",
+                )
+
     def test_capability_gate_fails_closed_for_absent_unparsable_mismatch_or_unqualified(self):
         tools_version, module_version = core.AWG31_TEST_FIXTURE_PAIR
 

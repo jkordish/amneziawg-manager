@@ -171,11 +171,13 @@ the module versions to match, and then requires that pair in the versioned
 source allowlist. Missing, malformed, mismatched, or unlisted evidence fails
 closed before pending artifacts are written.
 
-The production allowlist is intentionally empty in this release. The locally
-installed or newest PPA package must not be added merely because it exists.
-Qualification requires disposable-host compatibility evidence for that exact
-tools/module pair and remains distinct from Kat's later in-Russia iOS
-acceptance. `sudo awgctl status --json` and
+Policy version 1 allows exactly tools/module
+`3.1.20260812`/`3.1.20260812`, qualified through isolated native traffic on the
+target Ubuntu 24.04 amd64 host. The locally installed or newest PPA package must
+not be added merely because it exists. The reviewed evidence does not cover a
+disposable host, package upgrade, future kernel, Russian network, or physical
+device and remains distinct from Kat's later in-Russia iOS acceptance.
+`sudo awgctl status --json` and
 `sudo awgctl obfuscation show --json` report only non-secret version evidence.
 
 ## Installed paths
