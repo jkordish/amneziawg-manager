@@ -3,28 +3,37 @@
 
 from __future__ import annotations
 
+import argparse
+import base64
 import dataclasses
 import datetime as dt
-import base64
+import hashlib
 import json
 import math
 import os
 import pathlib
 import re
 import secrets
+import signal
 import stat
 import subprocess
 import sys
 import tempfile
 import time
 from collections.abc import Mapping, Sequence
-from typing import Any, Callable, NoReturn
+from typing import Any, Callable, NoReturn, Protocol, TextIO
 
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT / "src"))
 
-from awgctl.core import AWG31_QUALIFICATION_POLICY_VERSION
+from awgctl.core import (
+    AWG31_QUALIFICATION_POLICY_VERSION,
+    AwgctlError,
+    build_russia_ios_obfuscation,
+    inspect_awg_versions,
+    sha256_bytes,
+)
 from awgctl.diagnostics import redact_awg_config
 from awgctl.selftest import SelfTestError, render_peer_configs
 
@@ -891,3 +900,700 @@ class NamespaceQualifier:
             cleanup_owned_resources(self.resources)
         checks["cleanup"] = True
         return checks
+
+
+PROTECTED_PATHS = (
+    pathlib.Path("/opt/amneziawg/config"),
+    pathlib.Path("/opt/amneziawg/keys"),
+    pathlib.Path("/opt/amneziawg/clients"),
+    pathlib.Path("/opt/amneziawg/revoked"),
+    pathlib.Path("/opt/amneziawg/generated"),
+    pathlib.Path("/opt/amneziawg/transitions"),
+    pathlib.Path("/opt/amneziawg/pending"),
+    pathlib.Path("/etc/amnezia/amneziawg/awg0.conf"),
+)
+_VOLATILE_SNAPSHOT_FIELDS = frozenset(
+    {
+        "bytes",
+        "packets",
+        "valid_life_time",
+        "preferred_life_time",
+        "stats",
+        "stats64",
+        "event",
+        "carrier_changes",
+    }
+)
+_CLASSIC_CANDIDATE = {
+    "Jc": 6,
+    "Jmin": 8,
+    "Jmax": 80,
+    "S1": 25,
+    "S2": 75,
+    "H1": 101,
+    "H2": 102,
+    "H3": 103,
+    "H4": 104,
+}
+
+
+class ProtectedReader(Protocol):
+    def digest_paths(self, paths: Sequence[pathlib.Path]) -> str: ...
+
+    def read_text(self, path: pathlib.Path) -> str: ...
+
+
+class ReceiptWriter(Protocol):
+    def __call__(self, receipt: Mapping[str, object]) -> pathlib.Path: ...
+
+
+@dataclasses.dataclass(frozen=True)
+class PreflightEvidence:
+    source_commit: str
+    dirty_worktree: bool
+    os_version: str
+    architecture: str
+    kernel: str
+    versions: VersionEvidence
+
+
+def _decode_json_value(name: str, output: bytes) -> Any:
+    try:
+        return json.loads(output)
+    except (UnicodeError, json.JSONDecodeError) as exc:
+        raise QualificationError(f"invalid {name} JSON") from exc
+
+
+def _decode_json_object(name: str, output: bytes) -> dict[str, Any]:
+    value = _decode_json_value(name, output)
+    if not isinstance(value, dict):
+        _fail(f"invalid {name} JSON")
+    return value
+
+
+def _parse_os_release(text: str) -> dict[str, str]:
+    values: dict[str, str] = {}
+    for line in text.splitlines():
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        name, value = line.split("=", 1)
+        if re.fullmatch(r"[A-Z0-9_]+", name) is None:
+            _fail("invalid platform OS release metadata")
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in {'"', "'"}:
+            value = value[1:-1]
+        values[name] = value
+    return values
+
+
+def _managed_listener_lines(output: bytes, port: int) -> tuple[str, ...]:
+    try:
+        lines = output.decode("utf-8").splitlines()
+    except UnicodeError as exc:
+        raise QualificationError("invalid production listener inventory") from exc
+    pattern = re.compile(rf":{port}(?:\s|$)")
+    return tuple(sorted(" ".join(line.split()) for line in lines if pattern.search(line)))
+
+
+def validate_host_preflight(
+    *,
+    effective_uid: int,
+    git_status: bytes,
+    head: bytes,
+    origin_main: bytes,
+    health: bytes,
+    status: bytes,
+    service_state: bytes,
+    boot_state: bytes,
+    os_release: str,
+    architecture: bytes,
+    namespace_inventory: bytes,
+    link_inventory: bytes,
+    listeners: bytes,
+    orphaned_temporary_roots: Sequence[str],
+) -> None:
+    """Validate all mutation-free host gates before generating any entropy."""
+    if effective_uid != 0:
+        _fail("non-root qualification is forbidden")
+    if git_status:
+        _fail("dirty source worktree cannot be qualified")
+    try:
+        head_text = head.decode("ascii").strip()
+        origin_text = origin_main.decode("ascii").strip()
+    except UnicodeError as exc:
+        raise QualificationError("invalid source revision output") from exc
+    if _COMMIT.fullmatch(head_text) is None or _COMMIT.fullmatch(origin_text) is None:
+        _fail("invalid source revision output")
+    if head_text != origin_text:
+        _fail("source HEAD does not match origin/main")
+
+    health_document = _decode_json_object("health", health)
+    health_data = health_document.get("data")
+    if (
+        health_document.get("ok") is not True
+        or health_document.get("errors") != []
+        or not isinstance(health_data, dict)
+        or not isinstance(health_data.get("summary"), dict)
+        or type(health_data["summary"].get("failures")) is not int
+        or health_data["summary"]["failures"] != 0
+        or health_data.get("mode") != "classic"
+        or not isinstance(health_data.get("transition"), dict)
+        or health_data["transition"].get("state") != "none"
+    ):
+        _fail("health preflight requires zero failures in classic mode")
+
+    status_document = _decode_json_object("status", status)
+    status_data = status_document.get("data")
+    if status_document.get("ok") is not True or status_document.get("errors") != []:
+        _fail("production status preflight failed")
+    if not isinstance(status_data, dict):
+        _fail("invalid production status preflight")
+    obfuscation = status_data.get("obfuscation")
+    if (
+        status_data.get("mode") != "classic"
+        or not isinstance(obfuscation, dict)
+        or obfuscation.get("mode") != "classic"
+    ):
+        _fail("production is not in classic mode")
+    transition = status_data.get("transition")
+    if not isinstance(transition, dict) or transition.get("state") != "none":
+        _fail("production transition is active")
+    interface = status_data.get("interface")
+    if (
+        not isinstance(interface, dict)
+        or interface.get("name") != "awg0"
+        or interface.get("up") is not True
+    ):
+        _fail("production interface is not up")
+    if status_data.get("service") != "active" or service_state != b"active\n":
+        _fail("production service is not exactly active")
+    if status_data.get("boot") != "enabled" or boot_state != b"enabled\n":
+        _fail("production boot state is not exactly enabled")
+
+    os_values = _parse_os_release(os_release)
+    if os_values.get("ID") != "ubuntu" or os_values.get("VERSION_ID") != "24.04":
+        _fail("unsupported platform OS; expected Ubuntu 24.04")
+    if architecture != b"amd64\n":
+        _fail("unsupported platform architecture; expected amd64")
+
+    namespaces = _namespace_names(namespace_inventory)
+    links = _root_link_names(link_inventory)
+    if any(name.startswith("awgq-") for name in (*namespaces, *links)):
+        _fail("pre-existing qualification resource blocks the run")
+    if orphaned_temporary_roots:
+        _fail("orphaned qualification resource blocks the run")
+
+    endpoint = status_data.get("endpoint")
+    port = endpoint.get("port") if isinstance(endpoint, dict) else None
+    if type(port) is not int or not 1 <= port <= 65535:
+        _fail("invalid production listener port")
+    if not _managed_listener_lines(listeners, port):
+        _fail("production listener is unavailable")
+
+
+def verify_preflight(
+    *,
+    expected_tools: str,
+    expected_module: str,
+    command_runner: CommandRunner,
+    loaded_version_reader: Callable[[], str] | None = None,
+) -> VersionEvidence:
+    """Bind qualification to one exact parsed native pair and current DKMS row."""
+    if _VERSION.fullmatch(expected_tools) is None or _VERSION.fullmatch(expected_module) is None:
+        _fail("invalid expected AWG version")
+    loaded_reader = loaded_version_reader or (
+        lambda: pathlib.Path("/sys/module/amneziawg/version").read_text(
+            encoding="ascii"
+        )
+    )
+    try:
+        inspected = inspect_awg_versions(
+            command_runner=command_runner,
+            loaded_version_reader=loaded_reader,
+        )
+    except AwgctlError as exc:
+        raise QualificationError(safe_error(exc)) from exc
+    tools = inspected.get("tools_version")
+    module = inspected.get("module_version")
+    if tools != expected_tools or module != expected_module:
+        _fail("installed native pair does not match the expected qualification pair")
+
+    kernel = _runner_output(command_runner, ["uname", "-r"]).decode(
+        "ascii", "strict"
+    ).strip()
+    dkms_output = _runner_output(command_runner, ["dkms", "status"])
+    try:
+        dkms_text = dkms_output.decode("utf-8")
+    except UnicodeError as exc:
+        raise QualificationError("invalid DKMS status output") from exc
+    pattern = re.compile(
+        rf"^amneziawg/(?P<version>[0-9]+\.[0-9]+\.[0-9]+), "
+        rf"{re.escape(kernel)}, [^:]+: installed$"
+    )
+    matches = [match for line in dkms_text.splitlines() if (match := pattern.fullmatch(line))]
+    if len(matches) != 1:
+        _fail("current-kernel DKMS module is not exactly installed")
+    dkms_version = matches[0].group("version")
+    return VersionEvidence(
+        tools=tools,
+        loaded_module=module,
+        packaged_module=module,
+        dkms=dkms_version,
+    )
+
+
+class LiveProtectedReader:
+    """Descriptor-safe reader that returns only aggregate protected-state hashes."""
+
+    def __init__(self) -> None:
+        self._allowed = frozenset(PROTECTED_PATHS)
+
+    def read_text(self, path: pathlib.Path) -> str:
+        if path not in {
+            pathlib.Path("/etc/os-release"),
+            pathlib.Path("/sys/module/amneziawg/version"),
+        }:
+            _fail("protected reader received an unsupported public path")
+        flags = os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
+        fd = os.open(path, flags)
+        try:
+            metadata = os.fstat(fd)
+            if not stat.S_ISREG(metadata.st_mode) or metadata.st_size > 65536:
+                _fail("public preflight file is not a bounded regular file")
+            chunks: list[bytes] = []
+            while True:
+                chunk = os.read(fd, 65536)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+            return b"".join(chunks).decode("utf-8")
+        finally:
+            os.close(fd)
+
+    def _digest_entry(
+        self,
+        digest: Any,
+        path: pathlib.Path,
+        label: str,
+    ) -> None:
+        try:
+            metadata = os.stat(path, follow_symlinks=False)
+        except FileNotFoundError:
+            digest.update(f"missing\0{label}\0".encode())
+            return
+        if stat.S_ISLNK(metadata.st_mode):
+            _fail("protected production path contains a symlink")
+        kind = "directory" if stat.S_ISDIR(metadata.st_mode) else "file"
+        digest.update(
+            f"{kind}\0{label}\0{stat.S_IMODE(metadata.st_mode):04o}\0"
+            f"{metadata.st_uid}\0{metadata.st_gid}\0".encode()
+        )
+        if stat.S_ISDIR(metadata.st_mode):
+            fd = os.open(path, _OPEN_DIRECTORY_FLAGS)
+            try:
+                opened = os.fstat(fd)
+                if (opened.st_dev, opened.st_ino) != (metadata.st_dev, metadata.st_ino):
+                    _fail("protected production directory changed during snapshot")
+                for name in sorted(os.listdir(fd)):
+                    child = pathlib.Path(f"/proc/self/fd/{fd}") / name
+                    self._digest_entry(digest, child, f"{label}/{name}")
+            finally:
+                os.close(fd)
+            return
+        if not stat.S_ISREG(metadata.st_mode):
+            _fail("protected production path contains an unsupported file type")
+        flags = os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
+        fd = os.open(path, flags)
+        try:
+            opened = os.fstat(fd)
+            if (opened.st_dev, opened.st_ino) != (metadata.st_dev, metadata.st_ino):
+                _fail("protected production file changed during snapshot")
+            while True:
+                chunk = os.read(fd, 65536)
+                if not chunk:
+                    break
+                digest.update(chunk)
+        finally:
+            os.close(fd)
+
+    def digest_paths(self, paths: Sequence[pathlib.Path]) -> str:
+        selected = tuple(paths)
+        if set(selected) != set(PROTECTED_PATHS) or len(selected) != len(PROTECTED_PATHS):
+            _fail("protected snapshot path set does not match policy")
+        digest = hashlib.sha256()
+        for path in sorted(selected, key=str):
+            if path not in self._allowed:
+                _fail("protected snapshot path is outside policy")
+            self._digest_entry(digest, path, str(path))
+        return digest.hexdigest()
+
+
+def _without_volatile_fields(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {
+            key: _without_volatile_fields(item)
+            for key, item in sorted(value.items())
+            if key not in _VOLATILE_SNAPSHOT_FIELDS
+        }
+    if isinstance(value, list):
+        return [_without_volatile_fields(item) for item in value]
+    return value
+
+
+def _canonical_json(value: Any) -> bytes:
+    return json.dumps(
+        value, allow_nan=False, ensure_ascii=True, separators=(",", ":"), sort_keys=True
+    ).encode("ascii")
+
+
+def _normalized_peer_lines(output: bytes, *, handshakes: bool = False) -> list[str]:
+    try:
+        lines = output.decode("ascii").splitlines()
+    except UnicodeError as exc:
+        raise QualificationError("invalid production peer output") from exc
+    normalized: list[str] = []
+    for line in lines:
+        fields = line.split()
+        if not fields:
+            continue
+        peer = fields[0]
+        if KEY_SHAPED_BASE64.fullmatch(peer) is None:
+            _fail("invalid production peer output")
+        if handshakes and len(fields) != 2:
+            _fail("invalid production handshake output")
+        normalized.append(peer)
+    return sorted(normalized)
+
+
+def capture_production_snapshot(
+    command_runner: CommandRunner,
+    protected_reader: ProtectedReader,
+) -> ProductionSnapshot:
+    """Hash stable production semantics while discarding volatile counters/times."""
+    protected_digest = protected_reader.digest_paths(PROTECTED_PATHS)
+    interface_document = _decode_json_value(
+        "production interface",
+        _runner_output(
+            command_runner, ["ip", "-j", "address", "show", "dev", "awg0"]
+        ),
+    )
+    peers = _normalized_peer_lines(
+        _runner_output(command_runner, ["awg", "show", "awg0", "peers"])
+    )
+    handshake_peers = _normalized_peer_lines(
+        _runner_output(
+            command_runner, ["awg", "show", "awg0", "latest-handshakes"]
+        ),
+        handshakes=True,
+    )
+    interface_bytes = _canonical_json(
+        {
+            "address": _without_volatile_fields(interface_document),
+            "peers": peers,
+            "handshake_peers": handshake_peers,
+        }
+    )
+
+    try:
+        port = int(
+            _runner_output(
+                command_runner, ["awg", "show", "awg0", "listen-port"]
+            ).decode("ascii")
+        )
+    except (UnicodeError, ValueError) as exc:
+        raise QualificationError("invalid production listener port") from exc
+    if not 1 <= port <= 65535:
+        _fail("invalid production listener port")
+    listener_lines = _managed_listener_lines(
+        _runner_output(command_runner, ["ss", "-H", "-lunp"]), port
+    )
+    if not listener_lines:
+        _fail("production listener disappeared during snapshot")
+
+    nft_document = _decode_json_value(
+        "production nftables",
+        _runner_output(command_runner, ["nft", "-j", "list", "ruleset"]),
+    )
+    service = _runner_output(
+        command_runner, ["systemctl", "is-active", "awg-quick@awg0.service"]
+    ).decode("ascii").strip()
+    boot = _runner_output(
+        command_runner, ["systemctl", "is-enabled", "awg-quick@awg0.service"]
+    ).decode("ascii").strip()
+    if service != "active" or boot != "enabled":
+        _fail("production service state changed during snapshot")
+
+    packages = _runner_output(
+        command_runner,
+        [
+            "dpkg-query",
+            "-W",
+            "-f=${Package}\\t${Version}\\n",
+            "amneziawg",
+            "amneziawg-tools",
+            "amneziawg-dkms",
+        ],
+    )
+    dkms = _runner_output(command_runner, ["dkms", "status"])
+    return ProductionSnapshot(
+        protected_tree_sha256=protected_digest,
+        interface_sha256=sha256_bytes(interface_bytes),
+        listener_sha256=sha256_bytes("\n".join(listener_lines).encode()),
+        nftables_sha256=sha256_bytes(
+            _canonical_json(_without_volatile_fields(nft_document))
+        ),
+        service_state=(service, boot),
+        package_sha256=sha256_bytes(packages + b"\0" + dkms),
+    )
+
+
+@dataclasses.dataclass
+class LiveAdapters:
+    command_runner: CommandRunner = run_command
+    protected_reader: ProtectedReader = dataclasses.field(
+        default_factory=LiveProtectedReader
+    )
+    namespace_factory: Callable[[CommandRunner], NamespaceQualifier] = (
+        lambda runner: NamespaceQualifier(runner=runner)
+    )
+    clock: Callable[[], str] = lambda: dt.datetime.now(
+        dt.timezone.utc
+    ).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+    effective_uid: Callable[[], int] = os.geteuid
+
+    def verify_preflight(
+        self, *, expected_tools: str, expected_module: str
+    ) -> PreflightEvidence:
+        if self.effective_uid() != 0:
+            _fail("non-root qualification is forbidden")
+        git_prefix = ["git", "-C", str(REPO_ROOT)]
+        git_status = _runner_output(
+            self.command_runner, [*git_prefix, "status", "--porcelain=v1"]
+        )
+        head = _runner_output(
+            self.command_runner, [*git_prefix, "rev-parse", "HEAD"]
+        )
+        origin_main = _runner_output(
+            self.command_runner, [*git_prefix, "rev-parse", "origin/main"]
+        )
+        health = _runner_output(
+            self.command_runner,
+            ["/usr/local/sbin/awgctl", "health", "--json"],
+            timeout=60,
+        )
+        status = _runner_output(
+            self.command_runner,
+            ["/usr/local/sbin/awgctl", "status", "--json"],
+            timeout=30,
+        )
+        service = _runner_output(
+            self.command_runner,
+            ["systemctl", "is-active", "awg-quick@awg0.service"],
+        )
+        boot = _runner_output(
+            self.command_runner,
+            ["systemctl", "is-enabled", "awg-quick@awg0.service"],
+        )
+        os_release = self.protected_reader.read_text(pathlib.Path("/etc/os-release"))
+        architecture = _runner_output(
+            self.command_runner, ["dpkg", "--print-architecture"]
+        )
+        namespaces = _runner_output(
+            self.command_runner, ["ip", "netns", "list"]
+        )
+        links = _runner_output(self.command_runner, ["ip", "-j", "link", "show"])
+        listeners = _runner_output(self.command_runner, ["ss", "-H", "-lunp"])
+        orphans = tuple(
+            path.name
+            for path in pathlib.Path(tempfile.gettempdir()).glob("awgq-config-*")
+        )
+        validate_host_preflight(
+            effective_uid=self.effective_uid(),
+            git_status=git_status,
+            head=head,
+            origin_main=origin_main,
+            health=health,
+            status=status,
+            service_state=service,
+            boot_state=boot,
+            os_release=os_release,
+            architecture=architecture,
+            namespace_inventory=namespaces,
+            link_inventory=links,
+            listeners=listeners,
+            orphaned_temporary_roots=orphans,
+        )
+        versions = verify_preflight(
+            expected_tools=expected_tools,
+            expected_module=expected_module,
+            command_runner=self.command_runner,
+            loaded_version_reader=lambda: self.protected_reader.read_text(
+                pathlib.Path("/sys/module/amneziawg/version")
+            ),
+        )
+        kernel = _runner_output(self.command_runner, ["uname", "-r"]).decode(
+            "ascii"
+        ).strip()
+        os_values = _parse_os_release(os_release)
+        return PreflightEvidence(
+            source_commit=head.decode("ascii").strip(),
+            dirty_worktree=False,
+            os_version=os_values["VERSION_ID"],
+            architecture=architecture.decode("ascii").strip(),
+            kernel=kernel,
+            versions=versions,
+        )
+
+    def capture_snapshot(self) -> ProductionSnapshot:
+        return capture_production_snapshot(
+            self.command_runner, self.protected_reader
+        )
+
+    def qualify_namespaces(self) -> dict[str, bool]:
+        header_material = secrets.token_bytes(32)
+        if len(header_material) != 32:
+            _fail("CSPRNG returned invalid isolated header material")
+        awg31 = build_russia_ios_obfuscation(
+            pathlib.Path("/opt/amneziawg/keys/server/header-protection"),
+            mtu=1280,
+        )
+        qualifier = self.namespace_factory(self.command_runner)
+        return qualifier.qualify(_CLASSIC_CANDIDATE, awg31, header_material)
+
+    def now(self) -> str:
+        return self.clock()
+
+
+def execute_qualification(
+    *,
+    expected_tools: str,
+    expected_module: str,
+    adapters: LiveAdapters,
+    receipt_writer: ReceiptWriter,
+) -> pathlib.Path:
+    """Execute preflight, isolated traffic, invariant comparison, then receipt."""
+    started_at = adapters.now()
+    evidence = adapters.verify_preflight(
+        expected_tools=expected_tools,
+        expected_module=expected_module,
+    )
+    before = adapters.capture_snapshot()
+    qualification_error: BaseException | None = None
+    namespace_checks: Mapping[str, bool] | None = None
+    try:
+        namespace_checks = adapters.qualify_namespaces()
+    except BaseException as exc:
+        qualification_error = exc
+    after = adapters.capture_snapshot()
+    if before != after:
+        raise QualificationError(
+            "production invariants changed; no receipt was written and no repair was attempted"
+        ) from qualification_error
+    if qualification_error is not None:
+        raise qualification_error
+    if not isinstance(namespace_checks, Mapping):
+        _fail("isolated qualifier returned invalid checks")
+    checks = {
+        "version_parsing": True,
+        **dict(namespace_checks),
+        "production_invariants": True,
+    }
+    completed_at = adapters.now()
+    receipt = build_receipt(
+        source_commit=evidence.source_commit,
+        dirty_worktree=evidence.dirty_worktree,
+        os_version=evidence.os_version,
+        architecture=evidence.architecture,
+        kernel=evidence.kernel,
+        versions=evidence.versions,
+        checks=checks,
+        started_at=started_at,
+        completed_at=completed_at,
+    )
+    return receipt_writer(receipt)
+
+
+def _default_receipt_writer(receipt: Mapping[str, object]) -> pathlib.Path:
+    started = receipt.get("started_at")
+    versions = receipt.get("versions")
+    if type(started) is not str or not isinstance(versions, Mapping):
+        _fail("cannot derive qualification receipt filename")
+    tools = versions.get("tools")
+    if type(tools) is not str or _VERSION.fullmatch(tools) is None:
+        _fail("cannot derive qualification receipt filename")
+    stamp = started.replace("-", "").replace(":", "")
+    return atomic_write_receipt(
+        receipt,
+        pathlib.Path("/opt/amneziawg/qualification"),
+        f"{stamp}-{tools}.json",
+    )
+
+
+def _version_argument(value: str) -> str:
+    if _VERSION.fullmatch(value) is None:
+        raise argparse.ArgumentTypeError("expected N.N.N native version")
+    return value
+
+
+def main(
+    argv: Sequence[str] | None = None,
+    *,
+    stdout: TextIO | None = None,
+) -> int:
+    """Run the source-only qualifier and print one secret-free JSON envelope."""
+    parser = argparse.ArgumentParser(
+        description="Qualify one exact AWG 3.1 pair on this classic production host",
+        exit_on_error=False,
+    )
+    parser.add_argument("--expected-tools", required=True, type=_version_argument)
+    parser.add_argument("--expected-module", required=True, type=_version_argument)
+    output = stdout if stdout is not None else sys.stdout
+    try:
+        arguments = parser.parse_args(argv)
+    except (argparse.ArgumentError, argparse.ArgumentTypeError) as exc:
+        output.write(json.dumps({"ok": False, "error": safe_error(exc)}) + "\n")
+        return 2
+
+    def interrupted(signum: int, _frame: Any) -> NoReturn:
+        raise QualificationError(f"qualification interrupted by signal {signum}")
+
+    previous_umask = os.umask(0o077)
+    previous_handlers: dict[signal.Signals, Any] = {}
+    try:
+        for selected in (signal.SIGINT, signal.SIGTERM):
+            previous_handlers[selected] = signal.signal(selected, interrupted)
+        receipt = execute_qualification(
+            expected_tools=arguments.expected_tools,
+            expected_module=arguments.expected_module,
+            adapters=LiveAdapters(),
+            receipt_writer=_default_receipt_writer,
+        )
+        output.write(
+            json.dumps(
+                {
+                    "ok": True,
+                    "receipt": str(receipt),
+                    "summary": {
+                        "scope": "isolated exact-host native qualification",
+                        "tools": arguments.expected_tools,
+                        "module": arguments.expected_module,
+                    },
+                },
+                sort_keys=True,
+            )
+            + "\n"
+        )
+        return 0
+    except QualificationError as exc:
+        output.write(
+            json.dumps({"ok": False, "error": safe_error(exc)}, sort_keys=True)
+            + "\n"
+        )
+        return 1
+    finally:
+        for selected, previous in previous_handlers.items():
+            signal.signal(selected, previous)
+        os.umask(previous_umask)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

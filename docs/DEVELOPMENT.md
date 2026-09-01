@@ -33,6 +33,24 @@ Tests run without root and must not read live credentials. The network namespace
 self-test's renderer is unit-tested; the actual namespace test is explicitly
 root-only and operator-triggered.
 
+The source-only AWG 3.1 host qualifier is intentionally excluded from the
+installed zipapp. After the source and tests have merged, an operator may run it
+from an exact clean `main` checkout whose `HEAD` equals `origin/main`:
+
+```bash
+sudo python3 tools/qualify_awg31_host.py \
+  --expected-tools 3.1.20260812 \
+  --expected-module 3.1.20260812
+```
+
+The qualifier requires healthy classic production with no active transition,
+captures production state before and after, and owns only token-scoped
+`awgq-*` namespaces and links. It never reloads or reconfigures `awg0`, changes
+packages/DKMS, restarts a service, or changes host nftables. A passing root-only
+receipt under `/opt/amneziawg/qualification/` is exact-host isolated evidence;
+it is not disposable-host, package-upgrade, future-kernel, Russian-network, or
+physical-device evidence.
+
 The production build path is deliberately stricter than `make build`: the
 installer creates the staging identity, copies only `src/` and `tools/` into a
 protected job, and invokes `tools/build_release.py` through `systemd-run` with
@@ -75,16 +93,18 @@ and integrity fields already describe.
   firewall; never infer that boundary from platform metadata.
 - Never query `I1`–`I5` with the affected AmneziaWG 3.1 tooling.
 - Keep `AWG31_QUALIFIED_PAIRS_V1` empty until an exact tools/module candidate
-  has disposable-host compatibility evidence. Adding a pair is a reviewed
-  release decision, not an automatic package-discovery side effect.
+  has completed the reviewed qualification policy. Adding a pair is a reviewed
+  release decision based on a passing redacted receipt, not an automatic
+  package-discovery side effect.
 - Preserve unknown/unrelated host firewall, Docker, service, and application
   state.
 
 Repository tests, source review, generated profiles, mocked dry runs, and a
 local namespace self-test are separate non-deployment evidence lanes. Fresh
 installation stays beta until the release candidate passes the disposable-host
-checklist. AWG 3.1 remains separately unqualified until the exact package pair
-passes compatibility work and Kat completes the in-Russia native-iOS checklist.
+checklist. AWG 3.1 remains separately unqualified until an exact native pair has
+a reviewed live qualification receipt; Kat's in-Russia native-iOS checklist is
+still a separate final acceptance lane.
 
 `make verify` supplies `equivalent-external-firewall` only as an explicit
 non-live parser/platform fixture for the read-only installer check. It does not

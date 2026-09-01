@@ -1,4 +1,6 @@
+import dataclasses
 import importlib.util
+import io
 import json
 import os
 import pathlib
@@ -7,6 +9,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 
 REPO_ROOT = pathlib.Path(__file__).parents[1]
@@ -484,6 +487,323 @@ class NamespaceQualificationTests(unittest.TestCase):
             runner.deleted_namespaces,
             ["awgq-c-112233", "awgq-s-112233"],
         )
+
+
+class StaticProtectedReader:
+    def __init__(self, digest="f" * 64):
+        self.value = digest
+
+    def digest_paths(self, paths):
+        return self.value
+
+    def read_text(self, path):
+        values = {
+            pathlib.Path("/etc/os-release"): 'ID=ubuntu\nVERSION_ID="24.04"\n',
+            pathlib.Path("/sys/module/amneziawg/version"): "3.1.20260812\n",
+        }
+        return values[path]
+
+
+class MappingRunner:
+    def __init__(self, outputs):
+        self.outputs = dict(outputs)
+        self.argv = []
+
+    def __call__(self, argv, *, input_data=None, timeout=20):
+        command = tuple(argv)
+        self.argv.append(command)
+        if command not in self.outputs:
+            raise AssertionError(f"unexpected command: {command!r}")
+        output = self.outputs[command]
+        if isinstance(output, Exception):
+            raise output
+        return subprocess.CompletedProcess(command, 0, output, b"")
+
+
+def healthy_document():
+    return {
+        "schema_version": 1,
+        "ok": True,
+        "errors": [],
+        "warnings": [],
+        "data": {
+            "mode": "classic",
+            "summary": {"failures": 0, "warnings": 0},
+            "transition": {"state": "none"},
+        },
+    }
+
+
+def status_document():
+    return {
+        "schema_version": 1,
+        "ok": True,
+        "errors": [],
+        "warnings": [],
+        "data": {
+            "boot": "enabled",
+            "endpoint": {"host": "vpn.example.com", "port": 55323},
+            "interface": {"name": "awg0", "up": True},
+            "mode": "classic",
+            "obfuscation": {"mode": "classic", "profile": "classic-v1"},
+            "service": "active",
+            "transition": {"state": "none"},
+        },
+    }
+
+
+class QualificationCliTests(unittest.TestCase):
+    def valid_host_documents(self):
+        return {
+            "effective_uid": 0,
+            "git_status": b"",
+            "head": b"a" * 40 + b"\n",
+            "origin_main": b"a" * 40 + b"\n",
+            "health": json.dumps(healthy_document()).encode(),
+            "status": json.dumps(status_document()).encode(),
+            "service_state": b"active\n",
+            "boot_state": b"enabled\n",
+            "os_release": 'ID=ubuntu\nVERSION_ID="24.04"\n',
+            "architecture": b"amd64\n",
+            "namespace_inventory": b"customer-production\n",
+            "link_inventory": b'[{"ifname":"customer0"}]\n',
+            "listeners": b"UNCONN 0 0 0.0.0.0:55323 0.0.0.0:*\n",
+            "orphaned_temporary_roots": (),
+        }
+
+    def test_host_preflight_rejects_every_production_safety_violation(self):
+        cases = (
+            ("non-root", {"effective_uid": 1000}),
+            ("dirty", {"git_status": b" M src/awgctl/core.py\n"}),
+            ("source", {"origin_main": b"b" * 40 + b"\n"}),
+            (
+                "health",
+                {
+                    "health": json.dumps(
+                        {
+                            **healthy_document(),
+                            "data": {
+                                **healthy_document()["data"],
+                                "summary": {"failures": 1, "warnings": 0},
+                            },
+                        }
+                    ).encode()
+                },
+            ),
+            (
+                "classic",
+                {
+                    "status": json.dumps(
+                        {
+                            **status_document(),
+                            "data": {**status_document()["data"], "mode": "awg31"},
+                        }
+                    ).encode()
+                },
+            ),
+            (
+                "transition",
+                {
+                    "status": json.dumps(
+                        {
+                            **status_document(),
+                            "data": {
+                                **status_document()["data"],
+                                "transition": {"state": "prepared"},
+                            },
+                        }
+                    ).encode()
+                },
+            ),
+            ("service", {"service_state": b"inactive\n"}),
+            ("boot", {"boot_state": b"disabled\n"}),
+            ("platform", {"architecture": b"arm64\n"}),
+            ("platform", {"os_release": 'ID=ubuntu\nVERSION_ID="22.04"\n'}),
+            ("resource", {"namespace_inventory": b"awgq-s-a1b2c3\n"}),
+            ("resource", {"link_inventory": b'[{"ifname":"awgq-vs-a1b2c3"}]'}),
+            ("resource", {"orphaned_temporary_roots": ("awgq-config-stale",)}),
+            ("listener", {"listeners": b"UNCONN 0 0 0.0.0.0:9999 0.0.0.0:*\n"}),
+        )
+
+        for expected, changed in cases:
+            with self.subTest(changed=changed), self.assertRaisesRegex(
+                qualification.QualificationError, expected
+            ):
+                qualification.validate_host_preflight(
+                    **{**self.valid_host_documents(), **changed}
+                )
+
+    def test_version_preflight_binds_exact_native_pair_and_current_dkms(self):
+        runner = MappingRunner(
+            {
+                ("awg", "--version"): b"amneziawg-tools v3.1.20260812 - https://amnezia.org\n",
+                ("modinfo", "-F", "version", "amneziawg"): b"3.1.20260812\n",
+                ("uname", "-r"): b"7.0.0-1011-aws\n",
+                ("dkms", "status"): b"amneziawg/1.0.0, 7.0.0-1011-aws, x86_64: installed\n",
+            }
+        )
+
+        versions = qualification.verify_preflight(
+            expected_tools="3.1.20260812",
+            expected_module="3.1.20260812",
+            command_runner=runner,
+            loaded_version_reader=lambda: "3.1.20260812\n",
+        )
+
+        self.assertEqual(
+            versions,
+            qualification.VersionEvidence(
+                tools="3.1.20260812",
+                loaded_module="3.1.20260812",
+                packaged_module="3.1.20260812",
+                dkms="1.0.0",
+            ),
+        )
+
+    def test_version_preflight_rejects_expected_pair_mismatch(self):
+        runner = MappingRunner(
+            {
+                ("awg", "--version"): b"amneziawg-tools v3.1.20260811 - https://amnezia.org\n",
+                ("modinfo", "-F", "version", "amneziawg"): b"3.1.20260812\n",
+            }
+        )
+        with self.assertRaisesRegex(
+            qualification.QualificationError, "expected"
+        ):
+            qualification.verify_preflight(
+                expected_tools="3.1.20260812",
+                expected_module="3.1.20260812",
+                command_runner=runner,
+                loaded_version_reader=lambda: "3.1.20260812\n",
+            )
+
+    def test_live_preflight_rejects_non_root_before_running_commands(self):
+        runner = mock.Mock(side_effect=AssertionError("must not run"))
+        adapters = qualification.LiveAdapters(
+            command_runner=runner,
+            protected_reader=StaticProtectedReader(),
+            effective_uid=lambda: 1000,
+        )
+
+        with self.assertRaisesRegex(
+            qualification.QualificationError, "non-root"
+        ):
+            adapters.verify_preflight(
+                expected_tools="3.1.20260812",
+                expected_module="3.1.20260812",
+            )
+
+        runner.assert_not_called()
+
+    def test_snapshot_normalizes_only_volatile_handshakes_and_nft_counters(self):
+        peer = b"A" * 43 + b"="
+        common = {
+            ("ip", "-j", "address", "show", "dev", "awg0"): b'[{"ifname":"awg0","ifindex":9,"addr_info":[{"local":"10.77.42.1","valid_life_time":100}]}]',
+            ("awg", "show", "awg0", "peers"): peer + b"\n",
+            ("awg", "show", "awg0", "listen-port"): b"55323\n",
+            ("ss", "-H", "-lunp"): b"UNCONN 0 0 0.0.0.0:55323 0.0.0.0:*\n",
+            ("systemctl", "is-active", "awg-quick@awg0.service"): b"active\n",
+            ("systemctl", "is-enabled", "awg-quick@awg0.service"): b"enabled\n",
+            (
+                "dpkg-query",
+                "-W",
+                "-f=${Package}\\t${Version}\\n",
+                "amneziawg",
+                "amneziawg-tools",
+                "amneziawg-dkms",
+            ): b"amneziawg\t1\namneziawg-tools\t1\namneziawg-dkms\t1\n",
+            ("dkms", "status"): b"amneziawg/1.0.0, kernel, x86_64: installed\n",
+        }
+        first = MappingRunner(
+            {
+                **common,
+                ("awg", "show", "awg0", "latest-handshakes"): peer + b"\t0\n",
+                ("nft", "-j", "list", "ruleset"): b'{"nftables":[{"counter":{"packets":1,"bytes":2}}]}',
+            }
+        )
+        second = MappingRunner(
+            {
+                **common,
+                ("awg", "show", "awg0", "latest-handshakes"): peer + b"\t1788292800\n",
+                ("nft", "-j", "list", "ruleset"): b'{"nftables":[{"counter":{"packets":99,"bytes":999}}]}',
+            }
+        )
+
+        before = qualification.capture_production_snapshot(
+            first, StaticProtectedReader()
+        )
+        after = qualification.capture_production_snapshot(
+            second, StaticProtectedReader()
+        )
+
+        self.assertEqual(before, after)
+
+    def test_snapshot_turns_malformed_native_json_into_a_bounded_error(self):
+        runner = MappingRunner(
+            {
+                ("ip", "-j", "address", "show", "dev", "awg0"): b"not-json",
+            }
+        )
+
+        with self.assertRaises(qualification.QualificationError):
+            qualification.capture_production_snapshot(
+                runner, StaticProtectedReader()
+            )
+
+    def test_snapshot_mismatch_blocks_receipt_without_repair(self):
+        before = qualification.ProductionSnapshot(
+            protected_tree_sha256="a" * 64,
+            interface_sha256="b" * 64,
+            listener_sha256="c" * 64,
+            nftables_sha256="d" * 64,
+            service_state=("active", "enabled"),
+            package_sha256="e" * 64,
+        )
+        after = dataclasses.replace(before, nftables_sha256="b" * 64)
+        writer = mock.Mock()
+        adapters = mock.Mock(spec=qualification.LiveAdapters)
+        adapters.capture_snapshot.side_effect = (before, after)
+
+        with self.assertRaisesRegex(
+            qualification.QualificationError, "production invariants"
+        ):
+            qualification.execute_qualification(
+                expected_tools="3.1.20260812",
+                expected_module="3.1.20260812",
+                adapters=adapters,
+                receipt_writer=writer,
+            )
+
+        writer.assert_not_called()
+
+    def test_success_stdout_contains_only_receipt_path_and_nonsecret_summary(self):
+        output = io.StringIO()
+        with mock.patch.object(
+            qualification,
+            "execute_qualification",
+            return_value=pathlib.Path(
+                "/opt/amneziawg/qualification/receipt.json"
+            ),
+        ):
+            result = qualification.main(
+                [
+                    "--expected-tools",
+                    "3.1.20260812",
+                    "--expected-module",
+                    "3.1.20260812",
+                ],
+                stdout=output,
+            )
+
+        self.assertEqual(result, 0)
+        envelope = json.loads(output.getvalue())
+        self.assertTrue(envelope["ok"])
+        self.assertEqual(
+            envelope["receipt"],
+            "/opt/amneziawg/qualification/receipt.json",
+        )
+        self.assertNotRegex(output.getvalue(), qualification.KEY_SHAPED_BASE64)
+        self.assertNotIn("I1", output.getvalue())
 
 
 if __name__ == "__main__":
