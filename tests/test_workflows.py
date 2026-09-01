@@ -42,7 +42,7 @@ def _quoted_scalar(line: str, start: int) -> tuple[str, int]:
 
 
 def _is_yaml_comment_start(text: str, index: int) -> bool:
-    return text[index] == "#" and (index == 0 or text[index - 1].isspace())
+    return text[index] == "#" and (index == 0 or text[index - 1] in {" ", "\t"})
 
 
 def _split_yaml_comment(text: str) -> tuple[str, str]:
@@ -326,9 +326,23 @@ class WorkflowSecurityTests(unittest.TestCase):
         embedded = "- { name: foo#bar, uses: actions/checkout@v7 }"
         separated = "- { name: foo } # { uses: actions/checkout@v7 }"
         self.assertEqual(_split_yaml_comment("name: foo#bar"), ("name: foo#bar", ""))
+        self.assertEqual(_split_yaml_comment("name: foo\u00a0#bar"), ("name: foo\u00a0#bar", ""))
         self.assertEqual(_split_yaml_comment("name: foo # comment"), ("name: foo", "comment"))
+        self.assertEqual(_split_yaml_comment("name: foo\t# comment"), ("name: foo", "comment"))
         self.assertTrue(_has_unsupported_flow_uses_mapping(embedded))
         self.assertFalse(_has_unsupported_flow_uses_mapping(separated))
+
+    def test_nbsp_plain_scalar_cannot_hide_flow_uses(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            (root / "ci.yml").write_text(
+                "steps:\n"
+                "  - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7\n"
+                "  - { name: foo\u00a0#bar, uses: actions/checkout@v7 }\n",
+                encoding="utf-8",
+            )
+            violations = action_policy_violations(root)
+            self.assertTrue(any("unsupported uses mapping" in item for item in violations), violations)
 
 
 if __name__ == "__main__":
