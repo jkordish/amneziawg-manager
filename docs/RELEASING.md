@@ -108,8 +108,9 @@ sudo python3 tools/qualify_awg31_host.py \
 It requires healthy classic production with no active transition, creates only
 owned `awgq-*` network-namespace resources, exercises bidirectional classic and
 AWG 3.1 traffic/recreation plus rollback to classic, proves cleanup, and
-requires the production before/after snapshot to match before writing a
-root-only receipt. It does not modify or restart `awg0`, systemd, host nftables,
+holds the existing manager mutation lock while requiring the complete live and
+protected production before/after snapshots to match before writing a root-only
+receipt. It does not modify or restart `awg0`, systemd, host nftables,
 packages, DKMS, manager state, clients, or transitions.
 
 An allowlist change must name the exact native tools and matching loaded and

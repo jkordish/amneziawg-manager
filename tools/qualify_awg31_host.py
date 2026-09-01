@@ -5,8 +5,10 @@ from __future__ import annotations
 
 import argparse
 import base64
+import contextlib
 import dataclasses
 import datetime as dt
+import fcntl
 import hashlib
 import json
 import math
@@ -30,6 +32,7 @@ sys.path.insert(0, str(REPO_ROOT / "src"))
 from awgctl.core import (
     AWG31_QUALIFICATION_POLICY_VERSION,
     AwgctlError,
+    LOCK_FILE,
     build_russia_ios_obfuscation,
     inspect_awg_versions,
     sha256_bytes,
@@ -602,6 +605,18 @@ def _write_private_config(root: pathlib.Path, name: str, content: str) -> pathli
     return path
 
 
+@contextlib.contextmanager
+def _block_cleanup_signals() -> Any:
+    """Defer handled termination until a successful create is journaled."""
+    previous = signal.pthread_sigmask(
+        signal.SIG_BLOCK, {signal.SIGINT, signal.SIGTERM}
+    )
+    try:
+        yield
+    finally:
+        signal.pthread_sigmask(signal.SIG_SETMASK, previous)
+
+
 class NamespaceQualifier:
     """Exercise classic and AWG 3.1 only inside process-owned namespaces."""
 
@@ -647,22 +662,24 @@ class NamespaceQualifier:
 
     def _create_underlay(self) -> None:
         for namespace in (self.server_ns, self.client_ns):
-            self._run(["ip", "netns", "add", namespace])
-            self.resources.namespaces.append(namespace)
-        self._run(
-            [
-                "ip",
-                "link",
-                "add",
-                self.server_veth,
-                "type",
-                "veth",
-                "peer",
-                "name",
-                self.client_veth,
-            ]
-        )
-        self.resources.host_links.extend((self.server_veth, self.client_veth))
+            with _block_cleanup_signals():
+                self._run(["ip", "netns", "add", namespace])
+                self.resources.namespaces.append(namespace)
+        with _block_cleanup_signals():
+            self._run(
+                [
+                    "ip",
+                    "link",
+                    "add",
+                    self.server_veth,
+                    "type",
+                    "veth",
+                    "peer",
+                    "name",
+                    self.client_veth,
+                ]
+            )
+            self.resources.host_links.extend((self.server_veth, self.client_veth))
         self._run(
             ["ip", "link", "set", self.server_veth, "netns", self.server_ns]
         )
@@ -1227,6 +1244,71 @@ class LiveProtectedReader:
         return digest.hexdigest()
 
 
+@contextlib.contextmanager
+def qualification_mutation_exclusion(
+    *, timeout_seconds: float = 60,
+) -> Any:
+    """Hold the manager's exact flock without invoking mutation reconciliation."""
+    if os.geteuid() != 0:
+        _fail("non-root qualification is forbidden")
+    deadline = time.monotonic() + timeout_seconds
+    try:
+        parent_fd = os.open(LOCK_FILE.parent, _OPEN_DIRECTORY_FLAGS)
+    except OSError as exc:
+        raise QualificationError(
+            "protected manager mutation lock directory is unavailable"
+        ) from exc
+    lock_fd = -1
+    acquired = False
+    try:
+        parent = os.fstat(parent_fd)
+        if (
+            not stat.S_ISDIR(parent.st_mode)
+            or (parent.st_uid, parent.st_gid) != (0, 0)
+            or stat.S_IMODE(parent.st_mode) != 0o700
+        ):
+            _fail("protected manager mutation lock directory is unsafe")
+        try:
+            lock_fd = os.open(
+                LOCK_FILE.name,
+                os.O_RDWR | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0),
+                dir_fd=parent_fd,
+            )
+        except OSError as exc:
+            raise QualificationError(
+                "existing manager mutation lock file is unavailable"
+            ) from exc
+        opened = os.fstat(lock_fd)
+        named = os.stat(
+            LOCK_FILE.name, dir_fd=parent_fd, follow_symlinks=False
+        )
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or opened.st_nlink != 1
+            or (opened.st_uid, opened.st_gid) != (0, 0)
+            or stat.S_IMODE(opened.st_mode) != 0o600
+            or (opened.st_dev, opened.st_ino) != (named.st_dev, named.st_ino)
+        ):
+            _fail("existing manager mutation lock file is unsafe")
+        while True:
+            try:
+                fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                acquired = True
+                break
+            except BlockingIOError:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    _fail("manager mutation lock acquisition timed out")
+                time.sleep(min(0.05, remaining))
+        yield
+    finally:
+        if acquired:
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        if lock_fd >= 0:
+            os.close(lock_fd)
+        os.close(parent_fd)
+
+
 def _without_volatile_fields(value: Any) -> Any:
     if isinstance(value, dict):
         return {
@@ -1285,13 +1367,18 @@ def capture_production_snapshot(
         ),
         handshakes=True,
     )
+    live_configuration = _runner_output(
+        command_runner, ["awg", "showconf", "awg0"]
+    )
+    if not live_configuration or len(live_configuration) > 1024 * 1024:
+        _fail("complete live AWG configuration is unavailable or unbounded")
     interface_bytes = _canonical_json(
         {
             "address": _without_volatile_fields(interface_document),
             "peers": peers,
             "handshake_peers": handshake_peers,
         }
-    )
+    ) + b"\0" + live_configuration
 
     try:
         port = int(
@@ -1359,6 +1446,10 @@ class LiveAdapters:
         dt.timezone.utc
     ).replace(microsecond=0).isoformat().replace("+00:00", "Z")
     effective_uid: Callable[[], int] = os.geteuid
+    lock_factory: Callable[[], Any] = qualification_mutation_exclusion
+
+    def mutation_exclusion(self) -> Any:
+        return self.lock_factory()
 
     def verify_preflight(
         self, *, expected_tools: str, expected_module: str
@@ -1472,44 +1563,45 @@ def execute_qualification(
 ) -> pathlib.Path:
     """Execute preflight, isolated traffic, invariant comparison, then receipt."""
     started_at = adapters.now()
-    evidence = adapters.verify_preflight(
-        expected_tools=expected_tools,
-        expected_module=expected_module,
-    )
-    before = adapters.capture_snapshot()
-    qualification_error: BaseException | None = None
-    namespace_checks: Mapping[str, bool] | None = None
-    try:
-        namespace_checks = adapters.qualify_namespaces()
-    except BaseException as exc:
-        qualification_error = exc
-    after = adapters.capture_snapshot()
-    if before != after:
-        raise QualificationError(
-            "production invariants changed; no receipt was written and no repair was attempted"
-        ) from qualification_error
-    if qualification_error is not None:
-        raise qualification_error
-    if not isinstance(namespace_checks, Mapping):
-        _fail("isolated qualifier returned invalid checks")
-    checks = {
-        "version_parsing": True,
-        **dict(namespace_checks),
-        "production_invariants": True,
-    }
-    completed_at = adapters.now()
-    receipt = build_receipt(
-        source_commit=evidence.source_commit,
-        dirty_worktree=evidence.dirty_worktree,
-        os_version=evidence.os_version,
-        architecture=evidence.architecture,
-        kernel=evidence.kernel,
-        versions=evidence.versions,
-        checks=checks,
-        started_at=started_at,
-        completed_at=completed_at,
-    )
-    return receipt_writer(receipt)
+    with adapters.mutation_exclusion():
+        evidence = adapters.verify_preflight(
+            expected_tools=expected_tools,
+            expected_module=expected_module,
+        )
+        before = adapters.capture_snapshot()
+        qualification_error: BaseException | None = None
+        namespace_checks: Mapping[str, bool] | None = None
+        try:
+            namespace_checks = adapters.qualify_namespaces()
+        except BaseException as exc:
+            qualification_error = exc
+        after = adapters.capture_snapshot()
+        if before != after:
+            raise QualificationError(
+                "production invariants changed; no receipt was written and no repair was attempted"
+            ) from qualification_error
+        if qualification_error is not None:
+            raise qualification_error
+        if not isinstance(namespace_checks, Mapping):
+            _fail("isolated qualifier returned invalid checks")
+        checks = {
+            "version_parsing": True,
+            **dict(namespace_checks),
+            "production_invariants": True,
+        }
+        completed_at = adapters.now()
+        receipt = build_receipt(
+            source_commit=evidence.source_commit,
+            dirty_worktree=evidence.dirty_worktree,
+            os_version=evidence.os_version,
+            architecture=evidence.architecture,
+            kernel=evidence.kernel,
+            versions=evidence.versions,
+            checks=checks,
+            started_at=started_at,
+            completed_at=completed_at,
+        )
+        return receipt_writer(receipt)
 
 
 def _default_receipt_writer(receipt: Mapping[str, object]) -> pathlib.Path:
@@ -1586,6 +1678,18 @@ def main(
     except QualificationError as exc:
         output.write(
             json.dumps({"ok": False, "error": safe_error(exc)}, sort_keys=True)
+            + "\n"
+        )
+        return 1
+    except Exception:
+        output.write(
+            json.dumps(
+                {
+                    "ok": False,
+                    "error": "qualification failed at a protected operational boundary",
+                },
+                sort_keys=True,
+            )
             + "\n"
         )
         return 1

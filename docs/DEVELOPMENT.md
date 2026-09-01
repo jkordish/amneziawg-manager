@@ -44,8 +44,9 @@ sudo python3 tools/qualify_awg31_host.py \
 ```
 
 The qualifier requires healthy classic production with no active transition,
-captures production state before and after, and owns only token-scoped
-`awgq-*` namespaces and links. It never reloads or reconfigures `awg0`, changes
+holds the existing manager mutation lock from preflight through receipt,
+captures complete live and protected production state before and after, and
+owns only token-scoped `awgq-*` namespaces and links. It never reloads or reconfigures `awg0`, changes
 packages/DKMS, restarts a service, or changes host nftables. A passing root-only
 receipt under `/opt/amneziawg/qualification/` is exact-host isolated evidence;
 it is not disposable-host, package-upgrade, future-kernel, Russian-network, or

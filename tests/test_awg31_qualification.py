@@ -1,9 +1,11 @@
+import contextlib
 import dataclasses
 import importlib.util
 import io
 import json
 import os
 import pathlib
+import signal
 import stat
 import subprocess
 import sys
@@ -488,6 +490,37 @@ class NamespaceQualificationTests(unittest.TestCase):
             ["awgq-c-112233", "awgq-s-112233"],
         )
 
+    def test_signals_remain_blocked_until_created_resources_are_journaled(self):
+        runner = ScriptedRunner()
+        qualifier = qualification.NamespaceQualifier(
+            runner=runner, token="445566", sleeper=lambda _: None
+        )
+        restored_masks = []
+
+        def observe_mask(how, mask):
+            if how == signal.SIG_BLOCK:
+                return frozenset()
+            self.assertEqual(how, signal.SIG_SETMASK)
+            restored_masks.append(mask)
+            created_namespaces = {
+                name for name in runner.namespaces if name.startswith("awgq-")
+            }
+            created_links = {
+                name for name in runner.root_links if name.startswith("awgq-")
+            }
+            self.assertLessEqual(
+                created_namespaces, set(qualifier.resources.namespaces)
+            )
+            self.assertLessEqual(created_links, set(qualifier.resources.host_links))
+            return frozenset()
+
+        with mock.patch.object(signal, "pthread_sigmask", side_effect=observe_mask):
+            qualifier.qualify(
+                classic_obfuscation(), awg31_obfuscation(), b"h" * 32
+            )
+
+        self.assertEqual(len(restored_masks), 3)
+
 
 class StaticProtectedReader:
     def __init__(self, digest="f" * 64):
@@ -700,6 +733,7 @@ class QualificationCliTests(unittest.TestCase):
         common = {
             ("ip", "-j", "address", "show", "dev", "awg0"): b'[{"ifname":"awg0","ifindex":9,"addr_info":[{"local":"10.77.42.1","valid_life_time":100}]}]',
             ("awg", "show", "awg0", "peers"): peer + b"\n",
+            ("awg", "showconf", "awg0"): b"[Interface]\nPrivateKey = hidden\n\n[Peer]\nAllowedIPs = 10.77.42.2/32\n",
             ("awg", "show", "awg0", "listen-port"): b"55323\n",
             ("ss", "-H", "-lunp"): b"UNCONN 0 0 0.0.0.0:55323 0.0.0.0:*\n",
             ("systemctl", "is-active", "awg-quick@awg0.service"): b"active\n",
@@ -738,6 +772,49 @@ class QualificationCliTests(unittest.TestCase):
 
         self.assertEqual(before, after)
 
+    def test_snapshot_detects_any_complete_live_awg_configuration_change(self):
+        peer = b"A" * 43 + b"="
+        common = {
+            ("ip", "-j", "address", "show", "dev", "awg0"): b'[{"ifname":"awg0","addr_info":[{"local":"10.77.42.1"}]}]',
+            ("awg", "show", "awg0", "peers"): peer + b"\n",
+            ("awg", "show", "awg0", "latest-handshakes"): peer + b"\t0\n",
+            ("awg", "show", "awg0", "listen-port"): b"55323\n",
+            ("ss", "-H", "-lunp"): b"UNCONN 0 0 0.0.0.0:55323 0.0.0.0:*\n",
+            ("nft", "-j", "list", "ruleset"): b'{"nftables":[]}',
+            ("systemctl", "is-active", "awg-quick@awg0.service"): b"active\n",
+            ("systemctl", "is-enabled", "awg-quick@awg0.service"): b"enabled\n",
+            (
+                "dpkg-query",
+                "-W",
+                "-f=${Package}\\t${Version}\\n",
+                "amneziawg",
+                "amneziawg-tools",
+                "amneziawg-dkms",
+            ): b"packages\n",
+            ("dkms", "status"): b"dkms\n",
+        }
+        before = MappingRunner(
+            {
+                **common,
+                ("awg", "showconf", "awg0"): b"[Peer]\nAllowedIPs = 10.77.42.2/32\n",
+            }
+        )
+        after = MappingRunner(
+            {
+                **common,
+                ("awg", "showconf", "awg0"): b"[Peer]\nAllowedIPs = 10.77.42.99/32\n",
+            }
+        )
+
+        first = qualification.capture_production_snapshot(
+            before, StaticProtectedReader()
+        )
+        second = qualification.capture_production_snapshot(
+            after, StaticProtectedReader()
+        )
+
+        self.assertNotEqual(first.interface_sha256, second.interface_sha256)
+
     def test_snapshot_turns_malformed_native_json_into_a_bounded_error(self):
         runner = MappingRunner(
             {
@@ -762,6 +839,7 @@ class QualificationCliTests(unittest.TestCase):
         after = dataclasses.replace(before, nftables_sha256="b" * 64)
         writer = mock.Mock()
         adapters = mock.Mock(spec=qualification.LiveAdapters)
+        adapters.mutation_exclusion.return_value = contextlib.nullcontext()
         adapters.capture_snapshot.side_effect = (before, after)
 
         with self.assertRaisesRegex(
@@ -775,6 +853,86 @@ class QualificationCliTests(unittest.TestCase):
             )
 
         writer.assert_not_called()
+
+    def test_shared_mutation_exclusion_spans_preflight_snapshots_and_receipt(self):
+        events = []
+        snapshot = qualification.ProductionSnapshot(
+            protected_tree_sha256="a" * 64,
+            interface_sha256="b" * 64,
+            listener_sha256="c" * 64,
+            nftables_sha256="d" * 64,
+            service_state=("active", "enabled"),
+            package_sha256="e" * 64,
+        )
+
+        class RecordingAdapters:
+            def now(self):
+                return "2026-09-01T20:00:00Z"
+
+            @contextlib.contextmanager
+            def mutation_exclusion(self):
+                events.append("lock-enter")
+                try:
+                    yield
+                finally:
+                    events.append("lock-exit")
+
+            def verify_preflight(self, **_kwargs):
+                events.append("preflight")
+                return qualification.PreflightEvidence(
+                    source_commit="a" * 40,
+                    dirty_worktree=False,
+                    os_version="24.04",
+                    architecture="amd64",
+                    kernel="7.0.0-1011-aws",
+                    versions=qualification.VersionEvidence(
+                        tools="3.1.20260812",
+                        loaded_module="3.1.20260812",
+                        packaged_module="3.1.20260812",
+                        dkms="1.0.0",
+                    ),
+                )
+
+            def capture_snapshot(self):
+                events.append("snapshot")
+                return snapshot
+
+            def qualify_namespaces(self):
+                events.append("qualify")
+                return {
+                    "native_validation": True,
+                    "classic_traffic": True,
+                    "classic_recreation": True,
+                    "awg31_traffic": True,
+                    "awg31_counters": True,
+                    "awg31_recreation": True,
+                    "classic_rollback": True,
+                    "cleanup": True,
+                }
+
+        def writer(_receipt):
+            events.append("receipt")
+            return pathlib.Path("/receipt.json")
+
+        qualification.execute_qualification(
+            expected_tools="3.1.20260812",
+            expected_module="3.1.20260812",
+            adapters=RecordingAdapters(),
+            receipt_writer=writer,
+        )
+
+        self.assertEqual(
+            events,
+            [
+                "lock-enter",
+                "preflight",
+                "snapshot",
+                "qualify",
+                "snapshot",
+                "receipt",
+                "lock-exit",
+            ],
+        )
 
     def test_success_stdout_contains_only_receipt_path_and_nonsecret_summary(self):
         output = io.StringIO()
@@ -804,6 +962,34 @@ class QualificationCliTests(unittest.TestCase):
         )
         self.assertNotRegex(output.getvalue(), qualification.KEY_SHAPED_BASE64)
         self.assertNotIn("I1", output.getvalue())
+
+    def test_operational_exception_returns_one_generic_json_failure(self):
+        output = io.StringIO()
+        secret = "D" * 43 + "="
+        with mock.patch.object(
+            qualification,
+            "execute_qualification",
+            side_effect=OSError(
+                f"disk failed: PrivateKey = {secret}; I1 = <b 0xdeadbeef>; awgq-s-abcdef"
+            ),
+        ):
+            result = qualification.main(
+                [
+                    "--expected-tools",
+                    "3.1.20260812",
+                    "--expected-module",
+                    "3.1.20260812",
+                ],
+                stdout=output,
+            )
+
+        self.assertEqual(result, 1)
+        envelope = json.loads(output.getvalue())
+        self.assertFalse(envelope["ok"])
+        self.assertNotIn(secret, output.getvalue())
+        self.assertNotIn("deadbeef", output.getvalue())
+        self.assertNotIn("awgq-", output.getvalue())
+        self.assertNotIn("Traceback", output.getvalue())
 
 
 if __name__ == "__main__":
