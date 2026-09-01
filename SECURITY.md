@@ -35,6 +35,16 @@ explicitly attested Lightsail or equivalent external-firewall ingress boundary.
   and packaged module versions match a source-controlled qualification pair.
   The production allowlist is currently empty; repository behavior is not a
   claim that a package pair or Russian network path has been qualified.
+- The source-only AWG 3.1 qualifier is root/operator-triggered and refuses a
+  dirty or disconnected source revision, unhealthy/non-classic production, an
+  active transition, version drift, or pre-existing qualifier resources. It
+  may create only owned isolated `awgq-*` namespaces and links. After external
+  health/status preflight it holds the existing manager mutation lock, directly
+  revalidates locked state, and compares complete live plus aggregate
+  protected production snapshots before and after, never repairs a mismatch,
+  and writes a closed redacted receipt only after successful cleanup. That
+  receipt explicitly disclaims disposable-host, package-upgrade, future-kernel,
+  Russian-network, and physical-device evidence.
 - Direct cutover is one transaction and one live configuration. It binds a
   protected backup, pending artifacts, ingress attestation, package evidence,
   activation deadline, handshake, and bidirectional counter floor. A failed or

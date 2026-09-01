@@ -96,12 +96,33 @@ this release. Do not publish a release as AWG 3.1-capable merely because the
 model, dry runs, namespace renderer, or transaction tests pass, and do not add
 the currently installed/newest package pair merely because it is available.
 
-An allowlist change must name one exact native tools version and the matching
-loaded/packaged module version and retain disposable Ubuntu 24.04 amd64
-evidence for parsing, canonical native validation, classic compatibility,
-AWG 3.1 handshake/traffic, restart, rollback, and relevant kernel/package
-upgrade behavior. This qualifies the server pair only; it does not prove
-Russian-network reachability.
+The source-only qualifier may be run only by an operator, as root, from clean
+connected `main` after its implementation has merged:
+
+```bash
+sudo python3 tools/qualify_awg31_host.py \
+  --expected-tools 3.1.20260812 \
+  --expected-module 3.1.20260812
+```
+
+It requires healthy classic production with no active transition, creates only
+owned `awgq-*` network-namespace resources, exercises bidirectional classic and
+AWG 3.1 traffic/recreation plus rollback to classic, proves cleanup, and
+holds the existing manager mutation lock while requiring the complete live and
+protected production before/after snapshots to match before writing a root-only
+receipt. It does not modify or restart `awg0`, systemd, host nftables,
+packages, DKMS, manager state, clients, or transitions.
+
+An allowlist change must name the exact native tools and matching loaded and
+packaged module versions from a reviewed passing receipt. The current in-place
+policy supplies exact target-host Ubuntu 24.04 amd64 native traffic evidence.
+The receipt must explicitly retain
+`disposable_host=false`, `package_upgrade_test=false`,
+`future_kernel_test=false`, `russia_network=false`, and
+`physical_device=false`. The absence of those lanes must also remain explicit
+in the release notes. This qualifies only that exact server pair under the
+recorded host/kernel conditions; it does not prove fresh installation,
+upgrade behavior, future kernels, or Russian-network reachability.
 
 After a qualified pair exists, release acceptance must also exercise the direct
 cutover: prepared remains non-serving, the new external UDP rule precedes
