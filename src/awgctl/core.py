@@ -2465,6 +2465,15 @@ def _expected_managed_firewall_entities(
     interface = config["interface"]
     external = config["external_interface"]
     subnet = _nft_prefix(config["subnet"])
+    blocked = {
+        "set": [
+            _nft_prefix(str(network))
+            for network in ipaddress.collapse_addresses(
+                ipaddress.ip_network(value, strict=True)
+                for value in config["blocked_forward_ipv4"]
+            )
+        ]
+    }
     meta = lambda key: {"meta": {"key": key}}
     payload = lambda field: {"payload": {"protocol": "ip", "field": field}}
     counter = {"counter": {}}
@@ -2535,8 +2544,7 @@ def _expected_managed_firewall_entities(
                 _nft_match(meta("iifname"), interface),
                 _nft_match(
                     payload("daddr"),
-                    {"set": [_nft_prefix(value) for value in config["blocked_forward_ipv4"]]},
-                    "in",
+                    blocked,
                 ),
                 counter,
                 {"drop": None},
@@ -2769,8 +2777,8 @@ def run_firewall_action_locked(action: str) -> None:
         raise AwgctlError("invalid firewall hook action")
     intent = load_service_operation_intent(required=False)
     if intent is None:
-        if action == "down" and service_is_active_exact(load_config()["interface"]):
-            raise AwgctlError("firewall down is unsafe while the service is active")
+        if action == "down":
+            ensure_service_stopped_for_firewall_down(load_config()["interface"])
         apply_firewall() if action == "up" else firewall_cleanup()
         if not firewall_action_postcondition(action):
             raise AwgctlError("firewall lifecycle postcondition was not proven")
@@ -2791,8 +2799,8 @@ def run_firewall_action_locked(action: str) -> None:
     is_duplicate = position > 0 and action == expected[position - 1]
     if not is_current and not is_duplicate:
         raise AwgctlError("expected firewall action does not match service operation")
-    if action == "down" and service_is_active_exact(intent["interface"]):
-        raise AwgctlError("firewall down is unsafe while the service is active")
+    if action == "down":
+        ensure_service_stopped_for_firewall_down(intent["interface"])
     if is_current:
         apply_firewall() if action == "up" else firewall_cleanup()
     if not firewall_action_postcondition(action):
@@ -2824,6 +2832,27 @@ def service_is_active_exact(interface: str) -> bool:
     if result.returncode in {3, 4}:
         return False
     raise AwgctlError("cannot verify service lifecycle state")
+
+
+def kernel_interface_is_absent_exact(interface: str) -> bool:
+    if not isinstance(interface, str) or INTERFACE_RE.fullmatch(interface) is None:
+        raise AwgctlError("invalid service interface")
+    try:
+        index = socket.if_nametoindex(interface)
+    except OSError as exc:
+        if exc.errno == errno.ENODEV:
+            return True
+        raise AwgctlError("cannot verify service lifecycle state") from exc
+    if not isinstance(index, int) or isinstance(index, bool) or index <= 0:
+        raise AwgctlError("cannot verify service lifecycle state")
+    return False
+
+
+def ensure_service_stopped_for_firewall_down(interface: str) -> None:
+    if service_is_active_exact(interface):
+        raise AwgctlError("firewall down is unsafe while the service is active")
+    if not kernel_interface_is_absent_exact(interface):
+        raise AwgctlError("firewall down is unsafe while the kernel interface is still present")
 
 
 def current_firewall_up() -> bool:
@@ -2902,6 +2931,7 @@ def _service_prestate_postcondition(intent: dict[str, Any]) -> bool:
 def _service_stopped_postcondition(intent: dict[str, Any]) -> bool:
     return (
         not service_is_active_exact(intent["interface"])
+        and kernel_interface_is_absent_exact(intent["interface"])
         and firewall_action_postcondition("down")
     )
 
