@@ -178,6 +178,55 @@ def _same_open_directory(path: pathlib.Path, metadata: os.stat_result) -> bool:
     )
 
 
+def _remove_open_directory_contents(directory_fd: int) -> None:
+    flags = (
+        os.O_RDONLY
+        | os.O_DIRECTORY
+        | os.O_NOFOLLOW
+        | getattr(os, "O_CLOEXEC", 0)
+    )
+    for name in os.listdir(directory_fd):
+        try:
+            metadata = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            continue
+        if not stat.S_ISDIR(metadata.st_mode):
+            os.unlink(name, dir_fd=directory_fd)
+            continue
+        child_fd = os.open(name, flags, dir_fd=directory_fd)
+        try:
+            opened = os.fstat(child_fd)
+            if (opened.st_dev, opened.st_ino) != (metadata.st_dev, metadata.st_ino):
+                raise DiagnosticsError("diagnostic cleanup directory changed")
+            _remove_open_directory_contents(child_fd)
+        finally:
+            os.close(child_fd)
+        current = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+        if (
+            not stat.S_ISDIR(current.st_mode)
+            or (current.st_dev, current.st_ino) != (metadata.st_dev, metadata.st_ino)
+        ):
+            raise DiagnosticsError("diagnostic cleanup directory changed")
+        os.rmdir(name, dir_fd=directory_fd)
+
+
+def _remove_incomplete_candidate(
+    parent_fd: int,
+    candidate_name: str,
+    candidate_fd: int,
+) -> None:
+    _remove_open_directory_contents(candidate_fd)
+    opened = os.fstat(candidate_fd)
+    named = os.stat(candidate_name, dir_fd=parent_fd, follow_symlinks=False)
+    if (
+        not stat.S_ISDIR(named.st_mode)
+        or (named.st_dev, named.st_ino) != (opened.st_dev, opened.st_ino)
+    ):
+        raise DiagnosticsError("diagnostic candidate changed during cleanup")
+    os.rmdir(candidate_name, dir_fd=parent_fd)
+    os.fsync(parent_fd)
+
+
 def create_bundle(
     parent: pathlib.Path,
     *,
@@ -251,6 +300,14 @@ def create_bundle(
         os.fsync(parent_fd)
         if not _same_open_directory(parent, parent_metadata):
             raise DiagnosticsError("diagnostic parent path changed during bundle creation")
+    except BaseException as original:
+        try:
+            _remove_incomplete_candidate(parent_fd, candidate_name, candidate_fd)
+        except BaseException as cleanup_error:
+            raise DiagnosticsError(
+                "diagnostic bundle creation failed and incomplete bundle cleanup failed"
+            ) from cleanup_error
+        raise original
     finally:
         for _, fd in sorted(directory_fds.items(), key=lambda item: len(item[0]), reverse=True):
             os.close(fd)

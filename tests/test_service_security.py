@@ -3,6 +3,7 @@ import pathlib
 import random
 import sys
 import unittest
+from unittest import mock
 
 
 REPO_ROOT = pathlib.Path(__file__).parents[1]
@@ -47,6 +48,26 @@ class EntrypointBoundaryTests(unittest.TestCase):
         self.assertEqual(fresh.command, "_initialize-fresh")
         with self.assertRaises(SystemExit):
             parser.parse_args(["client", "list"])
+
+    def test_internal_update_health_uses_the_callers_existing_mutation_lock(self):
+        from awgctl import core
+
+        args = core.build_parser(entrypoint="internal").parse_args(
+            ["_health", "--json"]
+        )
+        with (
+            mock.patch.object(core, "require_root"),
+            mock.patch.object(
+                core,
+                "mutation_lock",
+                side_effect=AssertionError("must not reacquire the update lock"),
+            ),
+            mock.patch.object(core, "_cmd_health_locked", return_value=0) as health,
+        ):
+            result = core.dispatch(args)
+
+        self.assertEqual(result, 0)
+        health.assert_called_once_with(args)
 
     def test_server_hooks_use_root_only_internal_entrypoint(self):
         from awgctl import core

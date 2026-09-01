@@ -246,6 +246,17 @@ def _snapshot_owned_path(path: pathlib.Path) -> _OwnedPathSnapshot:
     raise InstallerError(f"owned entrypoint path has unsupported type: {path}")
 
 
+def _fsync_directory(path: pathlib.Path) -> None:
+    descriptor = os.open(
+        path,
+        os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0),
+    )
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
 def _atomic_owned_file(path: pathlib.Path, data: bytes, mode: int) -> None:
     if not path.parent.is_dir() or path.parent.is_symlink():
         raise InstallerError(f"entrypoint parent directory is unavailable: {path.parent}")
@@ -258,6 +269,7 @@ def _atomic_owned_file(path: pathlib.Path, data: bytes, mode: int) -> None:
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(temporary_path, path)
+        _fsync_directory(path.parent)
     except Exception:
         temporary_path.unlink(missing_ok=True)
         raise
@@ -271,6 +283,7 @@ def _atomic_owned_symlink(path: pathlib.Path, target: str) -> None:
     try:
         os.symlink(target, temporary)
         os.replace(temporary, path)
+        _fsync_directory(path.parent)
     except Exception:
         temporary.unlink(missing_ok=True)
         raise

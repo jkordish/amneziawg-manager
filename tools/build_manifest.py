@@ -25,7 +25,9 @@ def main() -> int:
     try:
         precedence_key(args.version)
     except InvalidVersion:
-        parser.error("--version must be a semantic release version without a leading v")
+        parser.error(
+            "--version must be a valid SemVer 2.0.0 release without a leading v"
+        )
     if not args.artifact.is_file():
         parser.error("--artifact must be an existing regular file")
     data = args.artifact.read_bytes()

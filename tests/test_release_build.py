@@ -65,6 +65,7 @@ class ReleaseBuildTests(unittest.TestCase):
                     check=False,
                 )
                 self.assertNotEqual(result.returncode, 0)
+                self.assertIn("valid SemVer 2.0.0", result.stderr)
                 self.assertNotIn("Traceback", result.stderr)
                 self.assertFalse(output.exists())
 

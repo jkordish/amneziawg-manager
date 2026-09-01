@@ -4753,7 +4753,7 @@ def _cmd_health_locked(args: argparse.Namespace) -> int:
     address = run(["ip", "-4", "-brief", "address", "show", config["interface"]], check=False).stdout.decode()
     add("PASS" if config["server_address"] in address else "FAIL", "tunnel address", config["server_address"])
     live_port = ""
-    if active and link_up:
+    if active == "active" and link_up:
         with contextlib.suppress(AwgctlError):
             live_port = safe_awg_query(config["interface"], "listen-port")
     add("PASS" if live_port == str(config["listen_port"]) else "FAIL", "UDP listener", live_port or "not verified")
@@ -4801,7 +4801,13 @@ def _cmd_health_locked(args: argparse.Namespace) -> int:
         clients = load_clients(include_secrets=True)
         duplicates = find_duplicate_client_state(clients)
         add("FAIL" if duplicates else "PASS", "client uniqueness", "; ".join(duplicates) if duplicates else f"{len(clients)} unique active clients")
-        checks.append(client_expiry_health_check(clients))
+        checks.append(
+            client_expiry_health_check(
+                clients,
+                interface=config["interface"],
+                interface_active=active == "active" and link_up,
+            )
+        )
         profile_drift: list[str] = []
         external_count = 0
         server_public = server_public_key()
@@ -4975,12 +4981,37 @@ def bind_expiry_records(
     return bound
 
 
-def client_expiry_health_check(clients: Sequence[dict[str, Any]]) -> tuple[str, str, str]:
-    expired = [client["name"] for client in clients if effective_client_status(client) == "expired"]
+def client_expiry_health_check(
+    clients: Sequence[dict[str, Any]],
+    *,
+    interface: str | None = None,
+    interface_active: bool = False,
+) -> tuple[str, str, str]:
+    expired = [
+        client for client in clients if effective_client_status(client) == "expired"
+    ]
+    if expired and interface_active:
+        if not interface:
+            raise AwgctlError("active interface is unavailable for client expiry verification")
+        live = live_peers(interface)
+        remaining = [
+            client["name"]
+            for client in expired
+            if client.get("public_key") in live
+        ]
+        if remaining:
+            return (
+                "FAIL",
+                "client expiry",
+                "expired peers still active: " + ", ".join(remaining),
+            )
+    expired_names = [client["name"] for client in expired]
     return (
         "PASS",
         "client expiry",
-        "expired: " + ", ".join(expired) if expired else "no expired clients",
+        "expired: " + ", ".join(expired_names)
+        if expired_names
+        else "no expired clients",
     )
 
 
@@ -7329,16 +7360,36 @@ def cmd_expire_clients(args: argparse.Namespace) -> int:
     if getattr(args, "dry_run", False):
         transaction_now = dt.datetime.now(dt.timezone.utc)
         clients = load_clients()
-        due = clients_due_for_expiry(clients, now=transaction_now)
+        selected = clients_requiring_expiry_reconciliation(
+            clients,
+            now=transaction_now,
+        )
+        due = [
+            client
+            for client in selected
+            if client.get("status", "active") == "active"
+        ]
+        reconciliation = [
+            client
+            for client in selected
+            if client.get("status", "active") != "active"
+        ]
         data = {
             "dry_run": True,
             "due_clients": [client["name"] for client in due],
-            "runtime_action": "reload" if due else "none",
+            "reconciliation_clients": [
+                client["name"] for client in reconciliation
+            ],
+            "runtime_action": "reload" if selected else "none",
         }
         if getattr(args, "json", False):
             print(json.dumps(json_envelope("client expire", data=data), indent=2, sort_keys=True))
         else:
             print("Due clients: " + (", ".join(data["due_clients"]) or "none"))
+            print(
+                "Reconciliation clients: "
+                + (", ".join(data["reconciliation_clients"]) or "none")
+            )
             print("No state was changed.")
         return 0
     with mutation_lock(transition_lifecycle=True):
@@ -8734,9 +8785,15 @@ def cmd_update(args: argparse.Namespace) -> int:
         backup = create_backup()
         artifact_path = pathlib.Path(directory) / "awgctl"
         atomic_write(artifact_path, artifact, 0o755)
+        health_entrypoint = pathlib.Path(directory) / "awgctl-internal"
+        health_entrypoint.symlink_to(ROOT / "bin/awgctl")
 
-        def health_check(executable: pathlib.Path) -> int:
-            return run([str(executable), "health", "--json"], check=False, timeout=90).returncode
+        def health_check(_executable: pathlib.Path) -> int:
+            return run(
+                [str(health_entrypoint), "_health", "--json"],
+                check=False,
+                timeout=90,
+            ).returncode
 
         upgrade_product(
             root=ROOT,
@@ -9020,6 +9077,8 @@ def build_parser(*, entrypoint: str = "public") -> argparse.ArgumentParser:
     subcommands = parser.add_subparsers(dest="command", required=True)
 
     if entrypoint == "internal":
+        health = subcommands.add_parser("_health", help=argparse.SUPPRESS)
+        health.add_argument("--json", action="store_true")
         firewall = subcommands.add_parser("_firewall", help=argparse.SUPPRESS)
         firewall.add_argument("firewall_action", choices=("up", "down"))
         migrate = subcommands.add_parser("_migrate-existing", help=argparse.SUPPRESS)
@@ -9213,6 +9272,8 @@ def dispatch(args: argparse.Namespace) -> int:
         return cmd_status(args)
     if args.command in {"health", "check"}:
         return cmd_health(args)
+    if args.command == "_health":
+        return _cmd_health_locked(args)
     if args.command in {"start", "stop", "restart", "reload"}:
         return cmd_service(args)
     if args.command == "backup":
