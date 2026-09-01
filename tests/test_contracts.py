@@ -6,7 +6,7 @@ import json
 import sys
 import tempfile
 import unittest
-from contextlib import redirect_stderr, redirect_stdout
+from contextlib import nullcontext, redirect_stderr, redirect_stdout
 from unittest import mock
 
 
@@ -103,6 +103,9 @@ class JsonContractTests(unittest.TestCase):
         }
         output = io.StringIO()
         with (
+            mock.patch.object(
+                core, "mutation_lock", return_value=nullcontext()
+            ),
             mock.patch.object(core, "load_config", return_value=config),
             mock.patch.object(
                 core,
