@@ -13,6 +13,7 @@ import zipapp
 
 REPO_ROOT = pathlib.Path(__file__).parents[1]
 SOURCE_PACKAGE = REPO_ROOT / "src/awgctl"
+INSTALL_PACKAGE = REPO_ROOT / "src/awginstall"
 
 
 def build(output: pathlib.Path) -> None:
@@ -23,6 +24,11 @@ def build(output: pathlib.Path) -> None:
         shutil.copytree(
             SOURCE_PACKAGE,
             staging / "awgctl",
+            ignore=shutil.ignore_patterns("__pycache__", "*.pyc"),
+        )
+        shutil.copytree(
+            INSTALL_PACKAGE,
+            staging / "awginstall",
             ignore=shutil.ignore_patterns("__pycache__", "*.pyc"),
         )
         (staging / "__main__.py").write_text(

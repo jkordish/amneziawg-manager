@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import argparse
+import datetime as dt
 import json
 import os
 import pathlib
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -34,7 +36,132 @@ def build_parser() -> argparse.ArgumentParser:
         command.add_argument("--dry-run", action="store_true")
         command.add_argument("--yes", action="store_true")
         command.add_argument("--json", action="store_true")
+        if name == "install":
+            command.add_argument("--endpoint")
+            command.add_argument("--subnet", default="10.77.42.0/24")
+            command.add_argument("--listen-port", type=int, default=55323)
+            command.add_argument("--external-interface")
+            command.add_argument("--dns", default="1.1.1.1,1.0.0.1")
+            command.add_argument("--mtu", type=int, default=1280)
+            command.add_argument("--keepalive", type=int, default=25)
+            command.add_argument("--first-client", default="admin-phone")
+            command.add_argument("--owner")
+            command.add_argument("--device")
+        elif name == "adopt":
+            command.add_argument("--server-config", type=pathlib.Path, default=pathlib.Path("/etc/amnezia/amneziawg/awg0.conf"))
+            command.add_argument("--client-config", type=pathlib.Path)
+            command.add_argument("--client-name", default="imported-device")
+            command.add_argument("--external-interface")
     return parser
+
+
+def package_install_plan(kernel: str) -> list[list[str]]:
+    if not kernel or "/" in kernel or any(character.isspace() for character in kernel):
+        raise InstallerError("invalid running kernel release")
+    return [
+        ["apt-get", "update"],
+        [
+            "apt-get", "install", "-y", "software-properties-common", "python3-launchpadlib",
+            "gnupg2", f"linux-headers-{kernel}", "linux-headers-generic", "qrencode", "nftables",
+        ],
+        ["add-apt-repository", "-y", "ppa:amnezia/ppa"],
+        ["apt-get", "update"],
+        ["apt-get", "install", "-y", "amneziawg", "qrencode", "nftables"],
+    ]
+
+
+def parse_default_interface(route_output: str) -> str:
+    devices: list[str] = []
+    for line in route_output.splitlines():
+        fields = line.split()
+        if not fields or fields[0] != "default" or "dev" not in fields:
+            continue
+        index = fields.index("dev")
+        if index + 1 < len(fields) and fields[index + 1] not in devices:
+            devices.append(fields[index + 1])
+    if len(devices) != 1:
+        raise InstallerError("could not determine one unambiguous IPv4 default route interface")
+    return devices[0]
+
+
+def _run(argv: list[str], *, timeout: int = 900) -> subprocess.CompletedProcess[bytes]:
+    try:
+        result = subprocess.run(
+            argv,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+            timeout=timeout,
+            env={**os.environ, "DEBIAN_FRONTEND": "noninteractive"},
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise InstallerError(f"could not run required command: {argv[0]}") from exc
+    if result.returncode != 0:
+        detail = result.stderr.decode("utf-8", "replace").strip().splitlines()
+        raise InstallerError(f"command failed: {argv[0]}{': ' + detail[-1] if detail else ''}")
+    return result
+
+
+def _detect_external_interface() -> str:
+    return parse_default_interface(_run(["ip", "-4", "route", "show", "default"], timeout=30).stdout.decode())
+
+
+def _install_amneziawg_packages() -> None:
+    usage = shutil.disk_usage("/")
+    if usage.free < 5 * 1024**3:
+        raise InstallerError("at least 5 GiB free on / is required before the DKMS/package installation")
+    for command in package_install_plan(os.uname().release):
+        _run(command)
+    _run(["modprobe", "amneziawg"], timeout=60)
+    for command in ("awg", "awg-quick", "nft", "ip", "systemctl", "qrencode", "dkms"):
+        if shutil.which(command) is None:
+            raise InstallerError(f"package installation did not provide required command: {command}")
+    dkms = _run(["dkms", "status"], timeout=60).stdout.decode("utf-8", "replace")
+    if "amneziawg" not in dkms or os.uname().release not in dkms or "installed" not in dkms:
+        raise InstallerError("AmneziaWG DKMS is not installed for the running kernel")
+
+
+def _install_entrypoints(root: pathlib.Path, repo_root: pathlib.Path) -> None:
+    if root != DEFAULT_ROOT:
+        return
+    public = pathlib.Path("/usr/local/sbin/awgctl")
+    public.parent.mkdir(parents=True, exist_ok=True)
+    temporary = public.parent / f".awgctl.{os.getpid()}"
+    temporary.unlink(missing_ok=True)
+    os.symlink(str(root / "bin/awgctl"), temporary)
+    os.replace(temporary, public)
+    completion_source = repo_root / "awgctl-completion.bash"
+    if completion_source.is_file():
+        completion = pathlib.Path("/etc/bash_completion.d/awgctl")
+        completion.parent.mkdir(parents=True, exist_ok=True)
+        completion.write_bytes(completion_source.read_bytes())
+        os.chmod(completion, 0o644)
+
+
+def _deploy_source_release(root: pathlib.Path, repo_root: pathlib.Path, *, health: bool) -> None:
+    with tempfile.TemporaryDirectory(prefix="awgctl-release-") as directory:
+        artifact = pathlib.Path(directory) / "awgctl"
+        _build_artifact(repo_root, artifact)
+        upgrade_product(
+            root=root,
+            artifact=artifact,
+            version=VERSION,
+            share_files=_share_files(repo_root),
+            health_check=_health_check if health else None,
+        )
+    _install_entrypoints(root, repo_root)
+
+
+def _adoption_backup(root: pathlib.Path, server: pathlib.Path, client: pathlib.Path) -> pathlib.Path:
+    timestamp = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    destination = root / "adoption-backups" / timestamp
+    destination.mkdir(parents=True, mode=0o700)
+    os.chmod(destination.parent, 0o700)
+    for source, name in ((server, "server.conf"), (client, "client.conf")):
+        target = destination / name
+        target.write_bytes(source.read_bytes())
+        os.chmod(target, 0o600)
+    return destination
 
 
 def _share_files(repo_root: pathlib.Path) -> dict[str, bytes]:
@@ -109,6 +236,132 @@ def main(
                 as_json=args.json,
             )
             return 0
+        platform_info = validate_platform(read_os_release())
+        if args.command == "install":
+            if not args.endpoint:
+                raise InstallerError("fresh install requires --endpoint HOSTNAME")
+            external = args.external_interface
+            if args.dry_run:
+                external = external or "auto-detect-default-route"
+                _emit(
+                    output,
+                    {
+                        "schema_version": 1,
+                        "ok": True,
+                        "dry_run": True,
+                        "platform": platform_info,
+                        "message": (
+                            f"Dry run: would install kernel headers and AmneziaWG from the official Amnezia PPA, "
+                            f"deploy awgctl {VERSION}, initialize awg0 on {args.endpoint}:{args.listen_port}, "
+                            f"and create {args.first_client}; external interface: {external}"
+                        ),
+                    },
+                    as_json=args.json,
+                )
+                return 0
+            if root == DEFAULT_ROOT and os.geteuid() != 0:
+                raise InstallerError("run installation with sudo")
+            if not args.yes:
+                raise InstallerError("fresh installation is mutating; rerun with --yes after reviewing --dry-run")
+            if (root / "config/server.json").exists() or pathlib.Path("/etc/amnezia/amneziawg/awg0.conf").exists():
+                raise InstallerError("existing awg0 state detected; use adopt or upgrade, not fresh install")
+            _install_amneziawg_packages()
+            external = external or _detect_external_interface()
+            _deploy_source_release(root, repo_root, health=False)
+            command = [
+                str(root / "bin/awgctl"), "_initialize-fresh",
+                "--endpoint", args.endpoint,
+                "--subnet", args.subnet,
+                "--listen-port", str(args.listen_port),
+                "--external-interface", external,
+                "--dns", args.dns,
+                "--mtu", str(args.mtu),
+                "--keepalive", str(args.keepalive),
+                "--first-client", args.first_client,
+            ]
+            if args.owner:
+                command.extend(["--owner", args.owner])
+            if args.device:
+                command.extend(["--device", args.device])
+            initialized = _run(command, timeout=120)
+            health = _health_check(root / "bin/awgctl")
+            if health != 0:
+                raise InstallerError("fresh installation completed but awgctl health failed")
+            message = initialized.stdout.decode("utf-8", "replace").strip()
+            _emit(
+                output,
+                {
+                    "schema_version": 1,
+                    "ok": True,
+                    "version": VERSION,
+                    "message": message or f"Installed AmneziaWG and awgctl {VERSION}",
+                },
+                as_json=args.json,
+            )
+            return 0
+        if args.command == "adopt":
+            if args.client_config is None:
+                raise InstallerError("adoption requires --client-config PATH for the existing device profile")
+            server = args.server_config.resolve()
+            client = args.client_config.resolve()
+            if not server.is_file() or not client.is_file():
+                raise InstallerError("existing server and client configuration files must both exist")
+            external = args.external_interface
+            if args.dry_run:
+                external = external or "auto-detect-default-route"
+                _emit(
+                    output,
+                    {
+                        "schema_version": 1,
+                        "ok": True,
+                        "dry_run": True,
+                        "platform": platform_info,
+                        "message": (
+                            f"Dry run: would back up and adopt {server} with client {args.client_name}, "
+                            f"preserving all existing credentials and runtime identity; external interface: {external}"
+                        ),
+                    },
+                    as_json=args.json,
+                )
+                return 0
+            if root == DEFAULT_ROOT and os.geteuid() != 0:
+                raise InstallerError("run adoption with sudo")
+            if not args.yes:
+                raise InstallerError("adoption is mutating; rerun with --yes after reviewing --dry-run")
+            if (root / "config/server.json").exists():
+                raise InstallerError("manager state already exists; use upgrade")
+            for command_name in ("awg", "awg-quick", "nft", "ip", "systemctl", "qrencode", "dkms"):
+                if shutil.which(command_name) is None:
+                    raise InstallerError(f"working-host adoption requires command: {command_name}")
+            external = external or _detect_external_interface()
+            backup = _adoption_backup(root, server, client)
+            _deploy_source_release(root, repo_root, health=False)
+            adopted = _run(
+                [
+                    str(root / "bin/awgctl"), "_migrate-existing",
+                    "--server-config", str(server),
+                    "--client-config", str(client),
+                    "--client-name", args.client_name,
+                    "--interface", "awg0",
+                    "--external-interface", external,
+                ],
+                timeout=120,
+            )
+            if _health_check(root / "bin/awgctl") != 0:
+                raise InstallerError("adoption completed but awgctl health failed")
+            message = adopted.stdout.decode("utf-8", "replace").strip()
+            _emit(
+                output,
+                {
+                    "schema_version": 1,
+                    "ok": True,
+                    "version": VERSION,
+                    "adoption_backup": str(backup),
+                    "message": message or f"Adopted existing awg0 into awgctl {VERSION}",
+                },
+                as_json=args.json,
+            )
+            return 0
         if args.command == "upgrade":
             if args.dry_run:
                 _emit(
@@ -125,16 +378,7 @@ def main(
                 return 0
             if root == DEFAULT_ROOT and os.geteuid() != 0:
                 raise InstallerError("run installation with sudo")
-            with tempfile.TemporaryDirectory(prefix="awgctl-release-") as directory:
-                artifact = pathlib.Path(directory) / "awgctl"
-                _build_artifact(repo_root, artifact)
-                upgrade_product(
-                    root=root,
-                    artifact=artifact,
-                    version=VERSION,
-                    share_files=_share_files(repo_root),
-                    health_check=_health_check,
-                )
+            _deploy_source_release(root, repo_root, health=True)
             _emit(
                 output,
                 {

@@ -14,6 +14,7 @@ import json
 import os
 import pathlib
 import re
+import secrets
 import shutil
 import socket
 import stat
@@ -26,7 +27,12 @@ from typing import Any, Iterable, Iterator, Sequence
 
 from .backups import BackupError, create_manifest as create_backup_manifest, verify_backup
 from .contracts import ContractError, health_envelope, json_envelope, normalize_client_metadata
+from .diagnostics import DiagnosticsError, create_bundle as create_diagnostic_bundle, redact_awg_config
+from .releases import ReleaseError, discover_release_tag, fetch_verified_release, version_key
+from .selftest import SelfTestError, run_namespace_selftest
 from .version import VERSION
+from awginstall.installer import InstallerError, upgrade_product
+from awginstall.platform import PlatformError, read_os_release, validate_platform
 
 
 ROOT = pathlib.Path("/opt/amneziawg")
@@ -40,8 +46,10 @@ GENERATED = ROOT / "generated"
 GENERATED_CONFIG = GENERATED / "awg0.conf"
 GENERATED_NFT = GENERATED / "nftables.nft"
 BACKUPS = ROOT / "backups"
+DIAGNOSTICS = ROOT / "diagnostics"
 RUNTIME_CONFIG = pathlib.Path("/etc/amnezia/amneziawg/awg0.conf")
 LOCK_FILE = pathlib.Path("/run/lock/awgctl.lock")
+SYSCTL_CONFIG = pathlib.Path("/etc/sysctl.d/90-amneziawg-forward.conf")
 SERVICE_TEMPLATE = "awg-quick@{interface}.service"
 OBFUSCATION_FIELDS = ("Jc", "Jmin", "Jmax", "S1", "S2", "H1", "H2", "H3", "H4")
 BLOCKED_FORWARD_IPV4 = (
@@ -197,6 +205,7 @@ def ensure_layout() -> None:
         REVOKED: 0o700,
         GENERATED: 0o700,
         BACKUPS: 0o700,
+        DIAGNOSTICS: 0o700,
     }
     for path, mode in directory_modes.items():
         path.mkdir(parents=True, exist_ok=True)
@@ -330,6 +339,76 @@ def validate_server_config(config: dict[str, Any]) -> dict[str, Any]:
     if config["paths"] != expected_paths:
         raise AwgctlError("managed paths differ from the fixed production layout")
     return config
+
+
+def generate_classic_obfuscation(random_source: Any | None = None) -> dict[str, int]:
+    """Generate classic, interoperable AmneziaWG parameters for a new server."""
+    source = random_source or secrets.SystemRandom()
+    s1 = source.randint(15, 150)
+    s2 = source.randint(15, 150)
+    while s1 + 56 == s2:
+        s2 = source.randint(15, 150)
+    headers: set[int] = set()
+    while len(headers) < 4:
+        headers.add(source.randint(5, 2_147_483_647))
+    h1, h2, h3, h4 = sorted(headers)
+    return {
+        "Jc": source.randint(4, 12),
+        "Jmin": 8,
+        "Jmax": 80,
+        "S1": s1,
+        "S2": s2,
+        "H1": h1,
+        "H2": h2,
+        "H3": h3,
+        "H4": h4,
+    }
+
+
+def build_fresh_server_config(
+    *,
+    endpoint: str,
+    subnet: str,
+    listen_port: int,
+    external_interface: str,
+    dns: str,
+    mtu: int,
+    keepalive: int,
+    obfuscation: dict[str, int],
+) -> dict[str, Any]:
+    try:
+        network = ipaddress.ip_network(subnet, strict=True)
+    except ValueError as exc:
+        raise AwgctlError("fresh-install subnet must be a canonical IPv4 network") from exc
+    if network.version != 4 or network.prefixlen < 16 or network.prefixlen > 30:
+        raise AwgctlError("fresh-install subnet must be IPv4 with a /16 through /30 prefix")
+    server_ip = next(network.hosts())
+    config = {
+        "schema_version": 1,
+        "interface": "awg0",
+        "subnet": str(network),
+        "server_address": f"{server_ip}/{network.prefixlen}",
+        "endpoint": validate_endpoint(endpoint),
+        "listen_port": listen_port,
+        "external_interface": external_interface,
+        "dns": validate_dns(dns.split(",")),
+        "mtu": mtu,
+        "keepalive": keepalive,
+        "use_psk": True,
+        "obfuscation": obfuscation,
+        "blocked_forward_ipv4": list(BLOCKED_FORWARD_IPV4),
+        "paths": {
+            "runtime_config": str(RUNTIME_CONFIG),
+            "generated_config": str(GENERATED_CONFIG),
+            "server_private_key": str(SERVER_PRIVATE),
+            "server_public_key": str(SERVER_PUBLIC),
+            "clients": str(CLIENTS),
+            "client_keys": str(CLIENT_KEYS),
+            "revoked": str(REVOKED),
+            "backups": str(BACKUPS),
+        },
+    }
+    return validate_server_config(config)
 
 
 def load_config() -> dict[str, Any]:
@@ -708,9 +787,8 @@ def apply_firewall() -> None:
     config = load_config()
     nft_text = render_nftables_config(config)
     validate_nftables_text(nft_text)
-    if not docker_user_chain_exists():
-        raise AwgctlError("Docker DOCKER-USER chain is absent; refusing to bypass the host FORWARD policy")
-    integration = docker_integration_text(config)
+    use_docker_integration = docker_user_chain_exists()
+    integration = docker_integration_text(config) if use_docker_integration else ""
     fd, integration_name = tempfile.mkstemp(prefix=".docker-integration-", suffix=".nft", dir=GENERATED)
     integration_path = pathlib.Path(integration_name)
     try:
@@ -719,12 +797,14 @@ def apply_firewall() -> None:
             handle.write(integration.encode("utf-8"))
             handle.flush()
             os.fsync(handle.fileno())
-        run(["nft", "-c", "-f", str(integration_path)])
+        if use_docker_integration:
+            run(["nft", "-c", "-f", str(integration_path)])
         firewall_cleanup()
         atomic_write(GENERATED_NFT, nft_text, 0o600)
         run(["nft", "-f", str(GENERATED_NFT)])
         try:
-            run(["nft", "-f", str(integration_path)])
+            if use_docker_integration:
+                run(["nft", "-f", str(integration_path)])
         except Exception:
             firewall_cleanup()
             raise
@@ -1072,7 +1152,7 @@ def extract_legacy_state(server_text: str, client_text: str, external_interface:
     server_sections = parse_awg_config(server_text)
     client_sections = parse_awg_config(client_text)
     if len(server_sections.get("Interface", [])) != 1 or len(server_sections.get("Peer", [])) != 1:
-        raise AwgctlError("migration expects one server Interface and the existing Kat peer")
+        raise AwgctlError("migration expects one server Interface and one existing client peer")
     if len(client_sections.get("Interface", [])) != 1 or len(client_sections.get("Peer", [])) != 1:
         raise AwgctlError("migration expects one client Interface and one server peer")
     server_interface = server_sections["Interface"][0]
@@ -1099,7 +1179,7 @@ def extract_legacy_state(server_text: str, client_text: str, external_interface:
     if server_address.version != 4 or client_address.version != 4 or client_address.ip not in server_address.network:
         raise AwgctlError("legacy server/client addresses do not share the expected IPv4 subnet")
     if server_peer.get("AllowedIPs") != str(client_address):
-        raise AwgctlError("legacy Kat AllowedIPs does not match her client address")
+        raise AwgctlError("legacy client AllowedIPs does not match its client address")
     if endpoint_port != listen_port:
         raise AwgctlError("legacy client endpoint port differs from the server listen port")
     if int(client_interface.get("MTU", "-1")) != mtu:
@@ -1107,7 +1187,7 @@ def extract_legacy_state(server_text: str, client_text: str, external_interface:
     if client_obfuscation != obfuscation:
         raise AwgctlError("legacy client obfuscation differs from the server")
     if client_peer.get("PresharedKey") != client_psk:
-        raise AwgctlError("legacy Kat preshared keys do not match")
+        raise AwgctlError("legacy client preshared keys do not match")
     validate_key(server_private, "legacy server private key")
     validate_key(server_public, "legacy server public key")
     validate_key(client_private, "legacy client private key")
@@ -1387,8 +1467,11 @@ def cmd_health(args: argparse.Namespace) -> int:
     add("PASS" if forwarding else "FAIL", "IPv4 forwarding", "enabled" if forwarding else "disabled")
     add("PASS" if nft_table_active("amneziawg_nat") else "FAIL", "VPN NAT", "table ip amneziawg_nat")
     add("PASS" if nft_table_active("amneziawg_forward") else "FAIL", "VPN isolation", "table ip amneziawg_forward")
-    docker_markers = tagged_docker_handles()
-    add("PASS" if len(docker_markers) == 3 else "FAIL", "Docker forwarding bridge", f"{len(docker_markers)} tagged rules")
+    if docker_user_chain_exists():
+        docker_markers = tagged_docker_handles()
+        add("PASS" if len(docker_markers) == 3 else "FAIL", "Docker forwarding bridge", f"{len(docker_markers)} tagged rules")
+    else:
+        add("PASS", "Docker forwarding bridge", "Docker DOCKER-USER chain absent; integration not required")
 
     for path, mode, label in (
         (RUNTIME_CONFIG, 0o600, "runtime config permissions"),
@@ -2325,6 +2408,201 @@ def cmd_restore(args: argparse.Namespace) -> int:
     return 0
 
 
+def redact_diagnostic_text(text: str) -> str:
+    text = redact_awg_config(text)
+    return re.sub(
+        r"(?<![A-Za-z0-9+/])[A-Za-z0-9+/]{43}=(?![A-Za-z0-9+/=])",
+        lambda match: f"[redacted-key sha256:{sha256_bytes(match.group(0).encode())[:16]}]",
+        text,
+    )
+
+
+def diagnostic_command(argv: Sequence[str]) -> bytes:
+    result = run(argv, check=False, timeout=30)
+    combined = result.stdout.decode("utf-8", "replace")
+    if result.stderr:
+        combined += "\n[stderr]\n" + result.stderr.decode("utf-8", "replace")
+    combined += f"\n[exit_status={result.returncode}]\n"
+    return redact_diagnostic_text(combined).encode("utf-8")
+
+
+def cmd_diagnose(args: argparse.Namespace) -> int:
+    config = load_config()
+    parent = args.output.expanduser().resolve() if args.output else DIAGNOSTICS
+    if args.dry_run:
+        data = {
+            "dry_run": True,
+            "output_parent": str(parent),
+            "contents": [
+                "redacted manager configuration and client metadata",
+                "redacted generated/runtime configuration",
+                "systemd, network, nftables, DKMS, disk, memory, listeners, and recent service journal",
+            ],
+        }
+        if getattr(args, "json", False):
+            print(json.dumps(json_envelope("diagnose", data=data), indent=2, sort_keys=True))
+        else:
+            print(f"Diagnostics dry run: would create a protected redacted bundle under {parent}")
+            print("No state was changed.")
+        return 0
+    with mutation_lock():
+        ensure_layout()
+        client_rows = []
+        for client in load_clients():
+            client_rows.append(
+                {
+                    key: value
+                    for key, value in client.items()
+                    if key not in {"public_key", "private_key", "psk"}
+                }
+            )
+        safe_config = json.loads(json.dumps(config))
+        files: dict[str, bytes] = {
+            "manager/server.json": (json.dumps(safe_config, indent=2, sort_keys=True) + "\n").encode(),
+            "manager/clients.json": (json.dumps(client_rows, indent=2, sort_keys=True) + "\n").encode(),
+            "system/uname.txt": diagnostic_command(["uname", "-a"]),
+            "system/systemd.txt": diagnostic_command(
+                ["systemctl", "show", SERVICE_TEMPLATE.format(interface=config["interface"]), "--no-pager"]
+            ),
+            "system/ip-link.txt": diagnostic_command(["ip", "-brief", "link"]),
+            "system/ip-address.txt": diagnostic_command(["ip", "-4", "-brief", "address"]),
+            "system/ip-route.txt": diagnostic_command(["ip", "-4", "route"]),
+            "system/dkms.txt": diagnostic_command(["dkms", "status"]),
+            "system/disk.txt": diagnostic_command(["df", "-h", "/"]),
+            "system/memory.txt": diagnostic_command(["free", "-h"]),
+            "system/listeners.txt": diagnostic_command(["ss", "-H", "-lntup"]),
+            "system/nft-forward.txt": diagnostic_command(["nft", "-a", "list", "table", "ip", "amneziawg_forward"]),
+            "system/nft-nat.txt": diagnostic_command(["nft", "-a", "list", "table", "ip", "amneziawg_nat"]),
+            "system/journal.txt": diagnostic_command(
+                ["journalctl", "-u", SERVICE_TEMPLATE.format(interface=config["interface"]), "-n", "200", "--no-pager"]
+            ),
+        }
+        for source, name in ((GENERATED_CONFIG, "manager/generated-awg0.conf"), (RUNTIME_CONFIG, "manager/runtime-awg0.conf")):
+            try:
+                files[name] = redact_diagnostic_text(source.read_text(encoding="utf-8")).encode()
+            except OSError as exc:
+                files[name] = f"unavailable: {exc}\n".encode()
+        bundle = create_diagnostic_bundle(parent, product_version=VERSION, created_at=iso_now(), files=files)
+        chmod_secret_tree(bundle)
+    audit(f"redacted diagnostics created: {bundle.name}")
+    data = {"path": str(bundle), "redacted": True, "manifest": str(bundle / "manifest.json")}
+    if getattr(args, "json", False):
+        print(json.dumps(json_envelope("diagnose", data=data), indent=2, sort_keys=True))
+    else:
+        print(f"Created protected redacted diagnostics: {bundle}")
+        print("Review the directory before sharing it; it contains host metadata but no managed VPN keys or profiles.")
+    return 0
+
+
+def cmd_update(args: argparse.Namespace) -> int:
+    platform_info = validate_platform(read_os_release())
+    platform_name = f"ubuntu-{platform_info['version']}-{platform_info['architecture']}"
+    tag = discover_release_tag(channel=args.channel)
+    include_artifact = args.update_action == "apply" or args.dry_run
+    manifest, artifact = fetch_verified_release(
+        tag,
+        expected_platform=platform_name,
+        include_artifact=include_artifact,
+    )
+    latest = manifest["version"]
+    comparison = (version_key(latest) > version_key(VERSION)) - (version_key(latest) < version_key(VERSION))
+    data: dict[str, Any] = {
+        "current_version": VERSION,
+        "available_version": latest,
+        "channel": args.channel,
+        "tag": tag,
+        "signature_verified": True,
+        "artifact_verified": artifact is not None,
+        "update_available": comparison > 0,
+    }
+    if args.update_action == "check":
+        if getattr(args, "json", False):
+            print(json.dumps(json_envelope("update check", data=data), indent=2, sort_keys=True))
+        else:
+            print(f"Installed: {VERSION}")
+            print(f"Published: {latest} ({args.channel}, signed manifest verified)")
+            print("Update available." if comparison > 0 else "Already current." if comparison == 0 else "Installed version is newer than published release.")
+        return 0
+    if comparison < 0:
+        raise AwgctlError("refusing to downgrade to an older published release")
+    if comparison == 0:
+        data["changed"] = False
+        if getattr(args, "json", False):
+            print(json.dumps(json_envelope("update", data=data), indent=2, sort_keys=True))
+        else:
+            print(f"Already current: awgctl {VERSION}")
+        return 0
+    if artifact is None:
+        raise AwgctlError("verified release artifact was not downloaded")
+    if args.dry_run:
+        data.update(dry_run=True, changed=False, runtime_action="none", rollback="previous release selector")
+        if getattr(args, "json", False):
+            print(json.dumps(json_envelope("update", data=data), indent=2, sort_keys=True))
+        else:
+            print(f"Update dry run: verified signed awgctl {latest} for {platform_name}")
+            print("Would install an immutable release, run health, and restore the prior selector on failure.")
+            print("No state was changed.")
+        return 0
+    with mutation_lock(), tempfile.TemporaryDirectory(prefix="awgctl-update-") as directory:
+        backup = create_backup()
+        artifact_path = pathlib.Path(directory) / "awgctl"
+        atomic_write(artifact_path, artifact, 0o755)
+
+        def health_check(executable: pathlib.Path) -> int:
+            return run([str(executable), "health", "--json"], check=False, timeout=90).returncode
+
+        upgrade_product(
+            root=ROOT,
+            artifact=artifact_path,
+            version=latest,
+            health_check=health_check,
+        )
+    audit(f"product updated: {VERSION} -> {latest}")
+    data.update(changed=True, backup=str(backup), runtime_action="none")
+    if getattr(args, "json", False):
+        print(json.dumps(json_envelope("update", data=data), indent=2, sort_keys=True))
+    else:
+        print(f"Updated awgctl: {VERSION} -> {latest}")
+        print(f"Pre-update state backup: {backup}")
+        print("VPN runtime was not restarted; the new manager passed health verification.")
+    return 0
+
+
+def cmd_self_test(args: argparse.Namespace) -> int:
+    if not args.experimental:
+        raise AwgctlError("namespace self-test is experimental; rerun with --experimental")
+    config = load_config()
+    if args.dry_run:
+        data = {
+            "dry_run": True,
+            "experimental": True,
+            "host_interface_unchanged": config["interface"],
+            "steps": [
+                "create two temporary Linux network namespaces",
+                "create ephemeral keys and a classic-parameter AmneziaWG tunnel",
+                "send ICMP echo traffic through the isolated tunnel",
+                "delete both namespaces and all ephemeral credentials",
+            ],
+        }
+        if getattr(args, "json", False):
+            print(json.dumps(json_envelope("self-test", data=data), indent=2, sort_keys=True))
+        else:
+            print("Experimental self-test dry run: awg0 and host nftables would remain unchanged.")
+            print("No state was changed.")
+        return 0
+    with mutation_lock():
+        report = run_namespace_selftest(config["obfuscation"])
+    audit("experimental namespace self-test passed")
+    if getattr(args, "json", False):
+        print(json.dumps(json_envelope("self-test", data=report), indent=2, sort_keys=True))
+    else:
+        print("Experimental namespace self-test: PASS")
+        print(f"  isolation: {report['isolation']}")
+        print(f"  packet test: {report['packet_test']}")
+        print("  cleanup: temporary namespaces and credentials removed")
+    return 0
+
+
 def cmd_firewall(args: argparse.Namespace) -> int:
     require_root()
     if args.firewall_action == "up":
@@ -2334,17 +2612,102 @@ def cmd_firewall(args: argparse.Namespace) -> int:
     return 0
 
 
-def cleanup_failed_migration() -> None:
+def cleanup_failed_fresh_install(client_name: str) -> None:
+    for path in (CONFIG_FILE, GENERATED_CONFIG, GENERATED_NFT, SERVER_PRIVATE, SERVER_PUBLIC):
+        with contextlib.suppress(FileNotFoundError):
+            path.unlink()
+    remove_client_state(client_name)
+
+
+def cmd_initialize_fresh(args: argparse.Namespace) -> int:
+    client_name = validate_client_name(args.first_client)
+    with mutation_lock():
+        if CONFIG_FILE.exists() or RUNTIME_CONFIG.exists():
+            raise AwgctlError("fresh initialization requires no existing managed or awg0 runtime configuration")
+        config = build_fresh_server_config(
+            endpoint=args.endpoint,
+            subnet=args.subnet,
+            listen_port=args.listen_port,
+            external_interface=args.external_interface,
+            dns=args.dns,
+            mtu=args.mtu,
+            keepalive=args.keepalive,
+            obfuscation=generate_classic_obfuscation(),
+        )
+        previous_sysctl = SYSCTL_CONFIG.read_bytes() if SYSCTL_CONFIG.exists() else None
+        service = SERVICE_TEMPLATE.format(interface=config["interface"])
+        ensure_layout()
+        try:
+            server_private, server_public, _ = generate_key_material(False)
+            client_private, client_public, client_psk = generate_key_material(True)
+            atomic_json(CONFIG_FILE, config, 0o600)
+            atomic_write(SERVER_PRIVATE, server_private + "\n", 0o600)
+            atomic_write(SERVER_PUBLIC, server_public + "\n", 0o600)
+            server_address = ipaddress.ip_interface(config["server_address"])
+            client_address = next_client_address(ipaddress.ip_network(config["subnet"]), server_address, set())
+            client = write_client_state(
+                config,
+                client_name,
+                str(client_address),
+                client_private,
+                client_public,
+                client_psk,
+                owner=getattr(args, "owner", None),
+                device=getattr(args, "device", None),
+            )
+            server_text = render_server_config(config, server_private, [client])
+            nft_text = render_nftables_config(config)
+            validate_native_server(server_text)
+            validate_nftables_text(nft_text)
+            atomic_write(GENERATED_CONFIG, server_text, 0o600)
+            atomic_write(GENERATED_NFT, nft_text, 0o600)
+            atomic_write(RUNTIME_CONFIG, server_text, 0o600)
+            atomic_write(SYSCTL_CONFIG, "net.ipv4.ip_forward = 1\n", 0o644)
+            run(["sysctl", "-p", str(SYSCTL_CONFIG)])
+            run(["systemctl", "enable", service], timeout=45)
+            service_action("start", config["interface"])
+            if safe_awg_query(config["interface"], "public-key") != server_public:
+                raise AwgctlError("fresh server identity verification failed")
+            verify_peer_state(config["interface"], client_public, present=True)
+            backup = create_backup()
+        except Exception as original:
+            run(["systemctl", "stop", service], check=False, timeout=45)
+            run(["systemctl", "disable", service], check=False, timeout=45)
+            firewall_cleanup()
+            cleanup_failed_fresh_install(client_name)
+            with contextlib.suppress(FileNotFoundError):
+                RUNTIME_CONFIG.unlink()
+            if previous_sysctl is None:
+                with contextlib.suppress(FileNotFoundError):
+                    SYSCTL_CONFIG.unlink()
+            else:
+                atomic_write(SYSCTL_CONFIG, previous_sysctl, 0o644)
+                run(["sysctl", "-p", str(SYSCTL_CONFIG)], check=False)
+            audit("fresh initialization failed; manager and runtime state rollback attempted")
+            raise AwgctlError("fresh initialization failed; state rollback was attempted") from original
+        audit(f"fresh server initialized: interface=awg0 first_client={client_name}")
+        print("Initialized a new AmneziaWG server.")
+        print(f"Created first client: {client_name}")
+        print(f"Address: {client_address.ip}")
+        print(f"Config: {CLIENTS / client_name / (client_name + '.conf')}")
+        print(f"QR: {CLIENTS / client_name / (client_name + '.png')}")
+        print(f"Initial verified backup: {backup}")
+        print(f"AWS LIGHTSAIL RULE REQUIRED: Custom / UDP / {config['listen_port']} / 0.0.0.0/0")
+    return 0
+
+
+def cleanup_failed_migration(client_name: str) -> None:
     for path in (CONFIG_FILE, GENERATED_CONFIG, GENERATED_NFT):
         with contextlib.suppress(FileNotFoundError):
             path.unlink()
-    remove_client_state("kat")
+    remove_client_state(client_name)
     for path in (SERVER_PRIVATE, SERVER_PUBLIC):
         with contextlib.suppress(FileNotFoundError):
             path.unlink()
 
 
 def cmd_migrate_existing(args: argparse.Namespace) -> int:
+    client_name = validate_client_name(getattr(args, "client_name", "kat"))
     with mutation_lock():
         if CONFIG_FILE.exists():
             raise AwgctlError("management state is already initialized")
@@ -2354,7 +2717,7 @@ def cmd_migrate_existing(args: argparse.Namespace) -> int:
             original_server = server_path.read_bytes()
             original_client = client_path.read_bytes()
         except OSError as exc:
-            raise AwgctlError("cannot read existing server or Kat configuration") from exc
+            raise AwgctlError("cannot read existing server or client configuration") from exc
         try:
             server_text = original_server.decode("utf-8")
             client_text = original_client.decode("utf-8")
@@ -2373,11 +2736,11 @@ def cmd_migrate_existing(args: argparse.Namespace) -> int:
         if derived_server != imported["server_public"]:
             raise AwgctlError("existing server keypair does not match")
         if derived_client != imported["client_public"]:
-            raise AwgctlError("existing Kat keypair does not match the server peer")
+            raise AwgctlError("existing client keypair does not match the server peer")
         live_server_before = safe_awg_query(args.interface, "public-key")
         live_peers_before = live_peers(args.interface)
         if live_server_before != derived_server or derived_client not in live_peers_before:
-            raise AwgctlError("live server/Kat identity differs from the files; migration stopped")
+            raise AwgctlError("live server/client identity differs from the files; migration stopped")
         ensure_layout()
         old_runtime = RUNTIME_CONFIG.read_bytes()
         try:
@@ -2386,7 +2749,7 @@ def cmd_migrate_existing(args: argparse.Namespace) -> int:
             atomic_write(SERVER_PUBLIC, imported["server_public"] + "\n", 0o600)
             client_record = write_client_state(
                 imported["config"],
-                "kat",
+                client_name,
                 imported["client_address"],
                 imported["client_private"],
                 imported["client_public"],
@@ -2394,13 +2757,13 @@ def cmd_migrate_existing(args: argparse.Namespace) -> int:
                 imported_from=str(client_path),
                 profile_text=client_text,
             )
-            metadata_path = CLIENTS / "kat/metadata.json"
+            metadata_path = CLIENTS / client_name / "metadata.json"
             metadata = json.loads(metadata_path.read_text())
             metadata["import_source_sha256"] = sha256_bytes(original_client)
             atomic_json(metadata_path, metadata, 0o600)
             existing_png = client_path.with_suffix(".png")
             if existing_png.is_file():
-                atomic_write(CLIENTS / "kat/kat.png", existing_png.read_bytes(), 0o600)
+                atomic_write(CLIENTS / client_name / f"{client_name}.png", existing_png.read_bytes(), 0o600)
             rendered = render_server_config(imported["config"], imported["server_private"], [client_record])
             if semantic_signature(server_text) != semantic_signature(rendered):
                 raise AwgctlError("generated server configuration does not preserve existing semantics")
@@ -2423,7 +2786,7 @@ def cmd_migrate_existing(args: argparse.Namespace) -> int:
             if legacy_helper.is_file():
                 run([str(legacy_helper), "up"], check=False)
             run(["systemctl", "reload", SERVICE_TEMPLATE.format(interface=args.interface)], check=False, timeout=45)
-            cleanup_failed_migration()
+            cleanup_failed_migration(client_name)
             audit("existing installation migration failed; legacy runtime restored")
             raise AwgctlError("migration failed; legacy runtime/configuration rollback was attempted") from original
         chmod_secret_tree(ROOT / "config")
@@ -2431,9 +2794,9 @@ def cmd_migrate_existing(args: argparse.Namespace) -> int:
         chmod_secret_tree(ROOT / "clients")
         chmod_secret_tree(ROOT / "generated")
         audit("existing server and Kat profile imported without credential rotation")
-        print("Imported existing AmneziaWG server and Kat profile.")
+        print(f"Imported existing AmneziaWG server and {client_name} profile.")
         print(f"Server identity fingerprint: {fingerprint(derived_server)}")
-        print(f"Kat identity fingerprint: {fingerprint(derived_client)}")
+        print(f"Client identity fingerprint: {fingerprint(derived_client)}")
         print("Existing credentials were preserved; the running interface was reloaded, not restarted.")
     return 0
 
@@ -2465,6 +2828,19 @@ def build_parser() -> argparse.ArgumentParser:
     restore.add_argument("backup", type=pathlib.Path)
     output_flag(restore)
     dry_run_flag(restore)
+    diagnose = subcommands.add_parser("diagnose")
+    diagnose.add_argument("--output", type=pathlib.Path, help="parent directory for the protected bundle")
+    output_flag(diagnose)
+    dry_run_flag(diagnose)
+    update = subcommands.add_parser("update")
+    update.add_argument("update_action", nargs="?", choices=("check", "apply"), default="apply")
+    update.add_argument("--channel", choices=("beta", "stable"), default="beta")
+    output_flag(update)
+    dry_run_flag(update)
+    self_test = subcommands.add_parser("self-test")
+    self_test.add_argument("--experimental", action="store_true")
+    output_flag(self_test)
+    dry_run_flag(self_test)
 
     config_parser = subcommands.add_parser("config")
     config_commands = config_parser.add_subparsers(dest="config_command", required=True)
@@ -2517,6 +2893,18 @@ def build_parser() -> argparse.ArgumentParser:
     migrate.add_argument("--client-config", type=pathlib.Path, required=True)
     migrate.add_argument("--interface", default="awg0")
     migrate.add_argument("--external-interface", default="ens5")
+    migrate.add_argument("--client-name", default="kat")
+    fresh = subcommands.add_parser("_initialize-fresh", help=argparse.SUPPRESS)
+    fresh.add_argument("--endpoint", required=True)
+    fresh.add_argument("--subnet", default="10.77.42.0/24")
+    fresh.add_argument("--listen-port", type=int, default=55323)
+    fresh.add_argument("--external-interface", required=True)
+    fresh.add_argument("--dns", default="1.1.1.1,1.0.0.1")
+    fresh.add_argument("--mtu", type=int, default=1280)
+    fresh.add_argument("--keepalive", type=int, default=25)
+    fresh.add_argument("--first-client", default="admin-phone")
+    fresh.add_argument("--owner")
+    fresh.add_argument("--device")
     return parser
 
 
@@ -2539,6 +2927,12 @@ def dispatch(args: argparse.Namespace) -> int:
         return cmd_backup(args)
     if args.command == "restore":
         return cmd_restore(args)
+    if args.command == "diagnose":
+        return cmd_diagnose(args)
+    if args.command == "update":
+        return cmd_update(args)
+    if args.command == "self-test":
+        return cmd_self_test(args)
     if args.command == "aws-rule":
         cmd_aws_rule(as_json=getattr(args, "json", False))
         return 0
@@ -2561,6 +2955,8 @@ def dispatch(args: argparse.Namespace) -> int:
         return cmd_firewall(args)
     if args.command == "_migrate-existing":
         return cmd_migrate_existing(args)
+    if args.command == "_initialize-fresh":
+        return cmd_initialize_fresh(args)
     raise AwgctlError("unknown command")
 
 
@@ -2573,7 +2969,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         audit(f"command failed: {args.command}")
         print(f"awgctl: {exc}", file=sys.stderr)
         return 1
-    except (BackupError, ContractError) as exc:
+    except (BackupError, ContractError, DiagnosticsError, InstallerError, PlatformError, ReleaseError, SelfTestError) as exc:
         audit(f"command failed: {args.command}")
         print(f"awgctl: {exc}", file=sys.stderr)
         return 1

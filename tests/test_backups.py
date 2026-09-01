@@ -81,6 +81,7 @@ class BackupManifestTests(unittest.TestCase):
                 "GENERATED_CONFIG": root / "generated/awg0.conf",
                 "GENERATED_NFT": root / "generated/nftables.nft",
                 "BACKUPS": root / "backups",
+                "DIAGNOSTICS": root / "diagnostics",
             }
             for name, value in replacements.items():
                 stack.enter_context(mock.patch.object(core, name, value))

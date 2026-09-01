@@ -6,13 +6,14 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 
 REPO_ROOT = pathlib.Path(__file__).parents[1]
 sys.path.insert(0, str(REPO_ROOT / "src"))
 
 from awginstall.deploy import active_release
-from awginstall.cli import build_parser, main as installer_main
+from awginstall.cli import build_parser, main as installer_main, package_install_plan, parse_default_interface
 from awginstall.installer import InstallerError, upgrade_product
 from awginstall.platform import PlatformError, validate_platform
 
@@ -108,6 +109,30 @@ class UpgradeTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("install", result.stdout)
         self.assertIn("adopt", result.stdout)
+
+    def test_fresh_package_plan_uses_official_ppa_and_running_kernel_without_a_shell(self):
+        plan = package_install_plan("6.8.0-79-generic")
+        self.assertIn(["add-apt-repository", "-y", "ppa:amnezia/ppa"], plan)
+        self.assertTrue(any("linux-headers-6.8.0-79-generic" in command for command in plan))
+        self.assertTrue(any("amneziawg" in command and command[:2] == ["apt-get", "install"] for command in plan))
+        self.assertTrue(all(isinstance(command, list) for command in plan))
+
+    def test_default_interface_parser_requires_one_unambiguous_device(self):
+        self.assertEqual(parse_default_interface("default via 172.26.0.1 dev ens5 proto dhcp\n"), "ens5")
+        with self.assertRaisesRegex(InstallerError, "default route"):
+            parse_default_interface("")
+
+    def test_fresh_install_dry_run_requires_no_root_and_performs_no_commands(self):
+        output = io.StringIO()
+        with mock.patch("awginstall.cli._run", side_effect=AssertionError("must not mutate")):
+            result = installer_main(
+                ["install", "--dry-run", "--endpoint", "vpn.example.com", "--external-interface", "ens5"],
+                root=pathlib.Path("/opt/amneziawg"),
+                repo_root=REPO_ROOT,
+                output=output,
+            )
+        self.assertEqual(result, 0)
+        self.assertIn("official Amnezia PPA", output.getvalue())
 
 
 if __name__ == "__main__":
