@@ -76,10 +76,13 @@ class FreshConfigurationTests(unittest.TestCase):
             obfuscation=obfuscation,
         )
         self.assertEqual(config["server_address"], "10.77.42.1/24")
-        self.assertEqual(set(config["obfuscation"]), set(core.OBFUSCATION_FIELDS))
+        self.assertEqual(config["schema_version"], 2)
+        self.assertEqual(config["obfuscation"]["mode"], "classic")
+        parameters = config["obfuscation"]["profile"]["parameters"]
+        self.assertEqual(set(parameters), set(core.OBFUSCATION_FIELDS))
         self.assertNotIn("PrivateKey", repr(config))
-        self.assertLessEqual(config["obfuscation"]["Jmin"], config["obfuscation"]["Jmax"])
-        self.assertEqual(len({config["obfuscation"][name] for name in ("H1", "H2", "H3", "H4")}), 4)
+        self.assertLessEqual(parameters["Jmin"], parameters["Jmax"])
+        self.assertEqual(len({parameters[name] for name in ("H1", "H2", "H3", "H4")}), 4)
         self.assertTrue(ipaddress.ip_interface(config["server_address"]).ip in ipaddress.ip_network(config["subnet"]))
 
     def test_fresh_configuration_accepts_named_dns_policy(self):

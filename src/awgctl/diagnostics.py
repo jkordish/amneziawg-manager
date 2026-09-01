@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
 import os
@@ -12,7 +13,11 @@ import stat
 from collections.abc import Mapping
 
 
-_KEY_LINE = re.compile(r"^(\s*(?:PrivateKey|PublicKey|PresharedKey)\s*=\s*)(\S+)(\s*)$", re.MULTILINE)
+_KEY_LINE = re.compile(
+    r"^(\s*(?P<name>PrivateKey|PublicKey|PresharedKey|HeaderProtectionKey)\s*=\s*)"
+    r"(?P<value>\S+)(\s*)$",
+    re.MULTILINE,
+)
 
 
 class DiagnosticsError(RuntimeError):
@@ -23,8 +28,18 @@ def redact_awg_config(text: str) -> str:
     """Replace all key values while retaining a correlation-safe fingerprint."""
 
     def replace(match: re.Match[str]) -> str:
-        digest = hashlib.sha256(match.group(2).encode("utf-8")).hexdigest()[:16]
-        return f"{match.group(1)}[redacted sha256:{digest}]{match.group(3)}"
+        value = match.group("value").encode("utf-8")
+        length = 16
+        if match.group("name") == "HeaderProtectionKey":
+            length = 12
+            try:
+                decoded = base64.b64decode(value, validate=True)
+            except (ValueError, base64.binascii.Error):
+                decoded = b""
+            if len(decoded) == 32:
+                value = decoded
+        digest = hashlib.sha256(value).hexdigest()[:length]
+        return f"{match.group(1)}[redacted sha256:{digest}]{match.group(4)}"
 
     return _KEY_LINE.sub(replace, text)
 

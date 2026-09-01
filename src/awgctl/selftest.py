@@ -15,9 +15,6 @@ class SelfTestError(RuntimeError):
     """The isolated AmneziaWG self-test failed."""
 
 
-CLASSIC_FIELDS = ("Jc", "Jmin", "Jmax", "S1", "S2", "H1", "H2", "H3", "H4")
-
-
 def render_peer_configs(
     *,
     server_private: str,
@@ -25,18 +22,26 @@ def render_peer_configs(
     client_private: str,
     client_public: str,
     psk: str,
-    obfuscation: Mapping[str, int],
+    obfuscation: Mapping[str, object],
+    header_protection_key: bytes | None = None,
     port: int,
 ) -> tuple[str, str]:
-    if set(obfuscation) != set(CLASSIC_FIELDS):
-        raise SelfTestError("self-test requires exactly the classic AmneziaWG obfuscation fields")
-    classic = "\n".join(f"{name} = {obfuscation[name]}" for name in CLASSIC_FIELDS)
+    from .core import AwgctlError, canonical_obfuscation_lines
+
+    try:
+        rendered = canonical_obfuscation_lines(
+            {"obfuscation": dict(obfuscation)},
+            header_protection_key=header_protection_key,
+        )
+    except AwgctlError as exc:
+        raise SelfTestError("self-test received invalid obfuscation state") from exc
+    native = "\n".join(rendered)
     server = (
-        f"[Interface]\nPrivateKey = {server_private}\nListenPort = {port}\n{classic}\n\n"
+        f"[Interface]\nPrivateKey = {server_private}\nListenPort = {port}\n{native}\n\n"
         f"[Peer]\nPublicKey = {client_public}\nPresharedKey = {psk}\nAllowedIPs = 10.200.0.2/32\n"
     )
     client = (
-        f"[Interface]\nPrivateKey = {client_private}\n{classic}\n\n"
+        f"[Interface]\nPrivateKey = {client_private}\n{native}\n\n"
         f"[Peer]\nPublicKey = {server_public}\nPresharedKey = {psk}\n"
         f"Endpoint = 192.0.2.1:{port}\nAllowedIPs = 10.200.0.1/32\nPersistentKeepalive = 5\n"
     )
@@ -71,7 +76,9 @@ def _public(private: str) -> str:
     return _run(["awg", "pubkey"], input_data=(private + "\n").encode("ascii")).stdout.decode("ascii").strip()
 
 
-def run_namespace_selftest(obfuscation: Mapping[str, int]) -> dict[str, object]:
+def run_namespace_selftest(
+    obfuscation: Mapping[str, object], *, header_protection_key: bytes | None = None
+) -> dict[str, object]:
     if os.geteuid() != 0:
         raise SelfTestError("namespace self-test requires root")
     token = secrets.token_hex(3)
@@ -94,6 +101,7 @@ def run_namespace_selftest(obfuscation: Mapping[str, int]) -> dict[str, object]:
             client_public=client_public,
             psk=psk,
             obfuscation=obfuscation,
+            header_protection_key=header_protection_key,
             port=51871,
         )
         server_path = root / "server.conf"
