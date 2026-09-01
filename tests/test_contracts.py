@@ -104,6 +104,11 @@ class JsonContractTests(unittest.TestCase):
         output = io.StringIO()
         with (
             mock.patch.object(core, "load_config", return_value=config),
+            mock.patch.object(
+                core,
+                "obfuscation_status",
+                return_value={"mode": "classic", "profile": "classic-v1"},
+            ),
             mock.patch.object(core, "systemctl_state", return_value=("active", "enabled")),
             mock.patch.object(core, "run", return_value=completed),
             mock.patch.object(core, "imds_value", return_value="203.0.113.7"),
@@ -355,6 +360,7 @@ class ClientMetadataTests(unittest.TestCase):
                 mock.patch.object(core, "CLIENTS", clients),
                 mock.patch.object(core, "CLIENT_KEYS", keys),
                 mock.patch.object(core, "server_public_key", return_value="server-public"),
+                mock.patch.object(core, "header_protection_key_for_config", return_value=None),
                 mock.patch.object(core, "render_client_config", return_value="profile\n"),
                 mock.patch.object(core, "generate_qr"),
             ):

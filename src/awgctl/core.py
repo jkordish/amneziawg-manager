@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import copy
 import contextlib
 import datetime as dt
 import fcntl
@@ -58,6 +59,7 @@ CONFIG_FILE = ROOT / "config/server.json"
 INSTALLATION_CONFIG = ROOT / "config/installation.json"
 SERVER_PRIVATE = ROOT / "keys/server/private"
 SERVER_PUBLIC = ROOT / "keys/server/public"
+HEADER_PROTECTION_KEY = ROOT / "keys/server/header-protection"
 CLIENT_KEYS = ROOT / "keys/clients"
 CLIENTS = ROOT / "clients"
 REVOKED = ROOT / "revoked"
@@ -78,6 +80,30 @@ MODULE_LOAD_CONFIG = pathlib.Path("/etc/modules-load.d/amneziawg-manager.conf")
 SYSCTL_CONFIG = pathlib.Path("/etc/sysctl.d/90-amneziawg-forward.conf")
 SERVICE_TEMPLATE = "awg-quick@{interface}.service"
 OBFUSCATION_FIELDS = ("Jc", "Jmin", "Jmax", "S1", "S2", "H1", "H2", "H3", "H4")
+AWG31_INTEGER_FIELDS = ("Jc", "Jmin", "Jmax", "S1", "S2", "S3", "S4")
+AWG31_HEADER_FIELDS = ("H1", "H2", "H3", "H4")
+AWG31_CPS_FIELDS = ("I1", "I2", "I3", "I4", "I5")
+AWG31_RANGE_FIELDS = (
+    "ContentPaddingAddition",
+    "RekeyAfterTime",
+    "RekeyTimeout",
+    "RejectAfterTime",
+    "KeepaliveTimeout",
+    "MaxHandshakeAttempts",
+)
+AWG31_BOOLEAN_FIELDS = ("RandomTrailers", "DisableCookies")
+AWG31_PARAMETER_FIELDS = (
+    *AWG31_INTEGER_FIELDS,
+    *AWG31_HEADER_FIELDS,
+    *AWG31_CPS_FIELDS,
+    *AWG31_RANGE_FIELDS,
+    *AWG31_BOOLEAN_FIELDS,
+)
+AWG31_QUALIFICATION_POLICY_VERSION = 1
+# Qualification is intentionally empty until a server pair completes the external
+# compatibility process. Tests inject this impossible future fixture explicitly.
+AWG31_QUALIFIED_PAIRS_V1: frozenset[tuple[str, str]] = frozenset()
+AWG31_TEST_FIXTURE_PAIR = ("3.1.20990101", "3.1.20990102")
 BLOCKED_FORWARD_IPV4 = (
     "0.0.0.0/8",
     "10.0.0.0/8",
@@ -120,6 +146,12 @@ def iso_now() -> str:
 
 def sha256_bytes(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
+
+
+def header_protection_fingerprint(material: bytes) -> str:
+    if not isinstance(material, bytes) or len(material) != 32:
+        raise AwgctlError("invalid header-protection key material")
+    return hashlib.sha256(material).hexdigest()[:12]
 
 
 def fingerprint(public_key: str) -> str:
@@ -166,6 +198,68 @@ def run(
         suffix = f": {detail[-1]}" if detail else ""
         raise AwgctlError(f"command failed: {argv[0]}{suffix}")
     return result
+
+
+_AWG_TOOLS_VERSION = re.compile(
+    r"amneziawg-tools v(?P<version>[0-9]+\.[0-9]+\.[0-9]+) - https://amnezia\.org\n?"
+)
+_AWG_MODULE_VERSION = re.compile(r"(?P<version>[0-9]+\.[0-9]+\.[0-9]+)\n?")
+
+
+def parse_awg_tools_version(output: str) -> str:
+    match = _AWG_TOOLS_VERSION.fullmatch(output)
+    if match is None:
+        raise AwgctlError("unrecognized awg tools version output")
+    return match.group("version")
+
+
+def parse_awg_module_version(output: str) -> str:
+    match = _AWG_MODULE_VERSION.fullmatch(output)
+    if match is None:
+        raise AwgctlError("unrecognized AmneziaWG module version output")
+    return match.group("version")
+
+
+def _loaded_awg_module_version() -> str:
+    try:
+        return pathlib.Path("/sys/module/amneziawg/version").read_text(encoding="ascii")
+    except (OSError, UnicodeError) as exc:
+        raise AwgctlError("loaded AmneziaWG module version is unavailable") from exc
+
+
+def require_awg31_capability(
+    *,
+    command_runner: Any = run,
+    loaded_version_reader: Any = _loaded_awg_module_version,
+    qualified_pairs: set[tuple[str, str]] | frozenset[tuple[str, str]] = AWG31_QUALIFIED_PAIRS_V1,
+) -> dict[str, Any]:
+    """Fail closed unless exact tools and loaded/packaged module versions are qualified."""
+    try:
+        tools_result = command_runner(["awg", "--version"])
+        module_result = command_runner(["modinfo", "-F", "version", "amneziawg"])
+        if tools_result.returncode != 0 or module_result.returncode != 0:
+            raise AwgctlError("AWG 3.1 capability inspection command failed")
+        tools_output = tools_result.stdout.decode("ascii")
+        module_output = module_result.stdout.decode("ascii")
+        loaded_output = loaded_version_reader()
+    except AwgctlError:
+        raise
+    except (AttributeError, OSError, UnicodeError, subprocess.SubprocessError) as exc:
+        raise AwgctlError("AWG 3.1 capability inspection failed") from exc
+    tools_version = parse_awg_tools_version(tools_output)
+    packaged_module_version = parse_awg_module_version(module_output)
+    loaded_module_version = parse_awg_module_version(loaded_output)
+    if packaged_module_version != loaded_module_version:
+        raise AwgctlError("loaded and packaged AmneziaWG module versions do not match")
+    pair = (tools_version, loaded_module_version)
+    if pair not in qualified_pairs:
+        raise AwgctlError("installed AWG 3.1 tools/module pair is not qualified")
+    return {
+        "policy_version": AWG31_QUALIFICATION_POLICY_VERSION,
+        "tools_version": tools_version,
+        "module_version": loaded_module_version,
+        "qualified": True,
+    }
 
 
 def require_root() -> None:
@@ -217,6 +311,120 @@ def atomic_write(path: pathlib.Path, data: bytes | str, mode: int = 0o600) -> No
 
 def atomic_json(path: pathlib.Path, value: Any, mode: int = 0o600) -> None:
     atomic_write(path, json.dumps(value, indent=2, sort_keys=True) + "\n", mode)
+
+
+def write_header_protection_key(
+    path: pathlib.Path = HEADER_PROTECTION_KEY,
+    *,
+    token_bytes: Any = secrets.token_bytes,
+    owner_uid: int = 0,
+    owner_gid: int = 0,
+) -> str:
+    """Atomically create fresh raw key material without returning the secret."""
+    material = token_bytes(32)
+    if not isinstance(material, bytes) or len(material) != 32:
+        raise AwgctlError("CSPRNG returned invalid header-protection key material")
+    parent_fd = -1
+    descriptor = -1
+    temporary_name: str | None = None
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        parent_fd = os.open(
+            path.parent,
+            os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0),
+        )
+        parent_metadata = os.fstat(parent_fd)
+        if (
+            not stat.S_ISDIR(parent_metadata.st_mode)
+            or (parent_metadata.st_uid, parent_metadata.st_gid) != (owner_uid, owner_gid)
+            or stat.S_IMODE(parent_metadata.st_mode) & 0o077
+        ):
+            raise AwgctlError("header-protection key parent is not a private owned directory")
+        for _ in range(128):
+            temporary_name = f".{path.name}.{secrets.token_hex(16)}"
+            try:
+                descriptor = os.open(
+                    temporary_name,
+                    os.O_WRONLY
+                    | os.O_CREAT
+                    | os.O_EXCL
+                    | os.O_NOFOLLOW
+                    | getattr(os, "O_CLOEXEC", 0),
+                    0o600,
+                    dir_fd=parent_fd,
+                )
+                break
+            except FileExistsError:
+                temporary_name = None
+        if descriptor < 0 or temporary_name is None:
+            raise AwgctlError("cannot allocate protected header-protection key file")
+        os.fchmod(descriptor, 0o600)
+        os.fchown(descriptor, owner_uid, owner_gid)
+        view = memoryview(material)
+        while view:
+            written = os.write(descriptor, view)
+            if written <= 0:
+                raise OSError("short write")
+            view = view[written:]
+        os.fsync(descriptor)
+        os.close(descriptor)
+        descriptor = -1
+        os.replace(
+            temporary_name,
+            path.name,
+            src_dir_fd=parent_fd,
+            dst_dir_fd=parent_fd,
+        )
+        temporary_name = None
+        os.fsync(parent_fd)
+    except AwgctlError:
+        raise
+    except OSError as exc:
+        raise AwgctlError("cannot store header-protection key") from exc
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        if temporary_name is not None and parent_fd >= 0:
+            with contextlib.suppress(OSError):
+                os.unlink(temporary_name, dir_fd=parent_fd)
+        if parent_fd >= 0:
+            os.close(parent_fd)
+    return header_protection_fingerprint(material)
+
+
+def read_header_protection_key(
+    path: pathlib.Path = HEADER_PROTECTION_KEY,
+    *,
+    expected_uid: int = 0,
+    expected_gid: int = 0,
+) -> bytes:
+    """Read exactly one private key through the descriptor whose metadata was checked."""
+    flags = os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as exc:
+        raise AwgctlError("cannot read protected header-protection key") from exc
+    try:
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+            raise AwgctlError("header-protection key must be one regular non-linked file")
+        if (metadata.st_uid, metadata.st_gid) != (expected_uid, expected_gid):
+            raise AwgctlError("header-protection key has invalid ownership")
+        if stat.S_IMODE(metadata.st_mode) != 0o600:
+            raise AwgctlError("header-protection key must have mode 0600")
+        material = b""
+        while len(material) <= 32:
+            chunk = os.read(descriptor, 33 - len(material))
+            if not chunk:
+                break
+            material += chunk
+    except OSError as exc:
+        raise AwgctlError("cannot read protected header-protection key") from exc
+    finally:
+        os.close(descriptor)
+    if len(material) != 32:
+        raise AwgctlError("header-protection key must contain exactly 32 bytes")
+    return material
 
 
 def ensure_layout() -> None:
@@ -420,10 +628,12 @@ def validate_key(value: str, label: str) -> str:
 
 
 def validate_dns(values: Sequence[str]) -> list[str]:
-    if not values:
+    if not isinstance(values, (list, tuple)) or not values:
         raise AwgctlError("at least one DNS server is required")
     result: list[str] = []
     for value in values:
+        if not isinstance(value, str):
+            raise AwgctlError("DNS addresses must be text")
         try:
             address = ipaddress.ip_address(value.strip())
         except ValueError as exc:
@@ -444,7 +654,214 @@ def parse_dns_value(value: str) -> list[str]:
         raise AwgctlError(str(exc)) from exc
 
 
-def validate_server_config(config: dict[str, Any]) -> dict[str, Any]:
+def _reject_unknown_fields(value: dict[str, Any], allowed: set[str], label: str) -> None:
+    unknown = sorted(set(value) - allowed)
+    if unknown:
+        raise AwgctlError(f"{label} has unexpected fields: {', '.join(unknown)}")
+
+
+def _strict_integer(value: Any, field: str, *, minimum: int = 0, maximum: int) -> int:
+    if not isinstance(value, int) or isinstance(value, bool) or not minimum <= value <= maximum:
+        raise AwgctlError(f"invalid obfuscation value: {field}")
+    return value
+
+
+def normalize_closed_range(value: Any, *, field: str, maximum: int) -> int | dict[str, int]:
+    """Normalize one native scalar or inclusive range without accepting bools."""
+    if isinstance(value, int) and not isinstance(value, bool):
+        return _strict_integer(value, field, maximum=maximum)
+    if not isinstance(value, dict):
+        raise AwgctlError(f"invalid obfuscation range: {field}")
+    _reject_unknown_fields(value, {"min", "max"}, f"obfuscation range {field}")
+    if set(value) != {"min", "max"}:
+        raise AwgctlError(f"invalid obfuscation range: {field}")
+    lower = _strict_integer(value["min"], field, maximum=maximum)
+    upper = _strict_integer(value["max"], field, maximum=maximum)
+    if lower > upper:
+        raise AwgctlError(f"invalid obfuscation range: {field}")
+    return {"min": lower, "max": upper}
+
+
+def _range_bounds(value: int | dict[str, int]) -> tuple[int, int]:
+    return (value, value) if isinstance(value, int) else (value["min"], value["max"])
+
+
+def validate_header_ranges(parameters: dict[str, Any]) -> dict[str, int | dict[str, int]]:
+    result = {
+        field: normalize_closed_range(parameters[field], field=field, maximum=0xFFFFFFFF)
+        for field in AWG31_HEADER_FIELDS
+    }
+    for index, left_name in enumerate(AWG31_HEADER_FIELDS):
+        left_min, left_max = _range_bounds(result[left_name])
+        for right_name in AWG31_HEADER_FIELDS[index + 1:]:
+            right_min, right_max = _range_bounds(result[right_name])
+            if max(left_min, right_min) <= min(left_max, right_max):
+                raise AwgctlError("obfuscation header ranges overlap")
+    return result
+
+
+_CPS_TAG = re.compile(
+    r"<(?:b 0x(?P<bytes>[0-9a-fA-F]+)|(?P<timestamp>t)|(?P<random>r|rc|rd) (?P<size>[1-9][0-9]{0,3}))>"
+)
+
+
+def validate_cps(value: Any, *, field: str, mtu: int) -> str:
+    """Validate one canonical custom-packet specification without echoing it."""
+    if not isinstance(value, str) or not value:
+        raise AwgctlError(f"invalid custom packet specification: {field}")
+    position = 0
+    rendered_size = 0
+    while position < len(value):
+        match = _CPS_TAG.match(value, position)
+        if match is None:
+            raise AwgctlError(f"invalid custom packet specification: {field}")
+        if match.group("bytes") is not None:
+            encoded = match.group("bytes")
+            if len(encoded) % 2:
+                raise AwgctlError(f"invalid custom packet specification: {field}")
+            contribution = len(encoded) // 2
+            if contribution == 0 or contribution > 1000:
+                raise AwgctlError(f"invalid custom packet specification: {field}")
+        elif match.group("timestamp") is not None:
+            contribution = 4
+        else:
+            contribution = int(match.group("size"))
+            if contribution > 1000:
+                raise AwgctlError(f"invalid custom packet specification: {field}")
+        rendered_size += contribution
+        if rendered_size > 1000:
+            raise AwgctlError(f"custom packet specification exceeds size limit: {field}")
+        position = match.end()
+    if rendered_size >= mtu:
+        raise AwgctlError(f"custom packet specification exceeds configured MTU: {field}")
+    return value
+
+
+def _classic_profile(parameters: dict[str, Any]) -> dict[str, Any]:
+    if not isinstance(parameters, dict):
+        raise AwgctlError("classic obfuscation parameters must be an object")
+    if set(parameters) != set(OBFUSCATION_FIELDS):
+        raise AwgctlError("classic AmneziaWG obfuscation fields are incomplete or unexpected")
+    result = {
+        field: _strict_integer(
+            parameters[field],
+            field,
+            maximum=0xFFFFFFFF if field in AWG31_HEADER_FIELDS else 0xFFFF,
+        )
+        for field in OBFUSCATION_FIELDS
+    }
+    if result["Jmin"] > result["Jmax"]:
+        raise AwgctlError("Jmin must not exceed Jmax")
+    validate_header_ranges(result)
+    if result["S1"] + 56 == result["S2"]:
+        raise AwgctlError("classic handshake packet lengths are ambiguous")
+    return {
+        "schema_version": 1,
+        "name": "classic-v1",
+        "parameters": result,
+    }
+
+
+def _normalize_awg31_profile(profile: dict[str, Any], *, mtu: int) -> dict[str, Any]:
+    if not isinstance(profile, dict):
+        raise AwgctlError("obfuscation profile must be an object")
+    allowed = {"schema_version", "name", "parameters", "header_protection_key_path"}
+    _reject_unknown_fields(profile, allowed, "obfuscation profile")
+    if set(profile) != allowed or profile.get("schema_version") != 1:
+        raise AwgctlError("invalid AWG 3.1 obfuscation profile contract")
+    if profile.get("name") != "russia-ios-v1":
+        raise AwgctlError("unsupported AWG 3.1 obfuscation profile")
+    if profile.get("header_protection_key_path") != str(HEADER_PROTECTION_KEY):
+        raise AwgctlError("AWG 3.1 header-protection key path is outside the protected layout")
+    parameters = profile.get("parameters")
+    if not isinstance(parameters, dict):
+        raise AwgctlError("AWG 3.1 obfuscation parameters must be an object")
+    _reject_unknown_fields(parameters, set(AWG31_PARAMETER_FIELDS), "AWG 3.1 parameters")
+    if set(parameters) != set(AWG31_PARAMETER_FIELDS):
+        raise AwgctlError("AWG 3.1 obfuscation fields are incomplete")
+    result: dict[str, Any] = {
+        field: _strict_integer(parameters[field], field, maximum=0xFFFF)
+        for field in AWG31_INTEGER_FIELDS
+    }
+    if result["Jmin"] > result["Jmax"]:
+        raise AwgctlError("Jmin must not exceed Jmax")
+    result.update(validate_header_ranges(parameters))
+    for field in AWG31_CPS_FIELDS:
+        value = parameters[field]
+        result[field] = None if value is None else validate_cps(value, field=field, mtu=mtu)
+    if result["I1"] is None:
+        raise AwgctlError("russia-ios-v1 requires nonempty I1")
+    for field in AWG31_RANGE_FIELDS:
+        result[field] = normalize_closed_range(parameters[field], field=field, maximum=0xFFFF)
+    for field in AWG31_BOOLEAN_FIELDS:
+        if not isinstance(parameters[field], bool):
+            raise AwgctlError(f"invalid obfuscation switch: {field}")
+        result[field] = parameters[field]
+    if result["RandomTrailers"] or not result["DisableCookies"]:
+        raise AwgctlError("russia-ios-v1 requires trailers off and cookies disabled")
+    required_bounds = {
+        "Jc": (6, 12),
+        "S1": (20, 120),
+        "S2": (20, 120),
+        "S3": (12, 60),
+        "S4": (12, 30),
+    }
+    if any(not lower <= result[field] <= upper for field, (lower, upper) in required_bounds.items()):
+        raise AwgctlError("russia-ios-v1 randomized value is outside its profile bounds")
+    if result["S1"] + 56 == result["S2"]:
+        raise AwgctlError("classic handshake packet lengths are ambiguous")
+    if (result["Jmin"], result["Jmax"]) != (8, 80):
+        raise AwgctlError("russia-ios-v1 requires fixed junk-size bounds")
+    if [
+        _range_bounds(result[field]) for field in AWG31_HEADER_FIELDS
+    ] != [(1, 1), (2, 2), (3, 3), (4, 4)]:
+        raise AwgctlError("russia-ios-v1 requires fixed header values")
+    if any(result[field] is not None for field in AWG31_CPS_FIELDS[1:]):
+        raise AwgctlError("russia-ios-v1 leaves I2-I5 unset")
+    required_ranges = {
+        "ContentPaddingAddition": {"min": 0, "max": 64},
+        "RekeyAfterTime": {"min": 105, "max": 135},
+        "RekeyTimeout": {"min": 4, "max": 7},
+        "RejectAfterTime": {"min": 165, "max": 195},
+        "KeepaliveTimeout": {"min": 8, "max": 12},
+        "MaxHandshakeAttempts": {"min": 15, "max": 21},
+    }
+    if any(result[field] != expected for field, expected in required_ranges.items()):
+        raise AwgctlError("russia-ios-v1 timing or padding range differs from policy")
+    return {
+        "schema_version": 1,
+        "name": "russia-ios-v1",
+        "parameters": result,
+        "header_protection_key_path": str(HEADER_PROTECTION_KEY),
+    }
+
+
+def _normalize_obfuscation(value: Any, *, mtu: int) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        raise AwgctlError("obfuscation must be an object")
+    _reject_unknown_fields(value, {"mode", "profile"}, "obfuscation")
+    if set(value) != {"mode", "profile"}:
+        raise AwgctlError("obfuscation mode and profile are required")
+    mode = value.get("mode")
+    profile = value.get("profile")
+    if mode == "classic":
+        if not isinstance(profile, dict):
+            raise AwgctlError("obfuscation profile must be an object")
+        _reject_unknown_fields(profile, {"schema_version", "name", "parameters"}, "obfuscation profile")
+        if set(profile) != {"schema_version", "name", "parameters"}:
+            raise AwgctlError("invalid classic obfuscation profile contract")
+        if profile.get("schema_version") != 1 or profile.get("name") != "classic-v1":
+            raise AwgctlError("unsupported classic obfuscation profile")
+        return {"mode": "classic", "profile": _classic_profile(profile["parameters"])}
+    if mode == "awg31":
+        return {"mode": "awg31", "profile": _normalize_awg31_profile(profile, mtu=mtu)}
+    raise AwgctlError("obfuscation mode must be classic or awg31")
+
+
+def normalize_server_config(config: dict[str, Any]) -> dict[str, Any]:
+    """Normalize historical server state into the strict schema-2 contract."""
+    if not isinstance(config, dict):
+        raise AwgctlError("server configuration must be an object")
     required = {
         "schema_version",
         "interface",
@@ -461,45 +878,59 @@ def validate_server_config(config: dict[str, Any]) -> dict[str, Any]:
         "blocked_forward_ipv4",
         "paths",
     }
+    _reject_unknown_fields(config, required, "server configuration")
     missing = sorted(required - config.keys())
     if missing:
         raise AwgctlError(f"server configuration missing fields: {', '.join(missing)}")
-    if config["schema_version"] != 1:
+    schema = config["schema_version"]
+    if not isinstance(schema, int) or isinstance(schema, bool) or schema not in {1, 2}:
         raise AwgctlError("unsupported server configuration schema")
-    if not INTERFACE_RE.fullmatch(str(config["interface"])):
+    result = copy.deepcopy(config)
+    if not isinstance(result["interface"], str) or not INTERFACE_RE.fullmatch(result["interface"]):
         raise AwgctlError("invalid interface name")
-    if not INTERFACE_RE.fullmatch(str(config["external_interface"])):
+    if not isinstance(result["external_interface"], str) or not INTERFACE_RE.fullmatch(result["external_interface"]):
         raise AwgctlError("invalid external interface name")
+    if not isinstance(result["blocked_forward_ipv4"], list) or any(
+        not isinstance(value, str) for value in result["blocked_forward_ipv4"]
+    ):
+        raise AwgctlError("blocked_forward_ipv4 must be a list of networks")
+    if not isinstance(result["subnet"], str) or not isinstance(result["server_address"], str):
+        raise AwgctlError("managed subnet and server address must be text")
     try:
-        subnet = ipaddress.ip_network(config["subnet"], strict=True)
-        server = ipaddress.ip_interface(config["server_address"])
-    except ValueError as exc:
+        subnet = ipaddress.ip_network(result["subnet"], strict=True)
+        server = ipaddress.ip_interface(result["server_address"])
+    except (TypeError, ValueError) as exc:
         raise AwgctlError("invalid managed subnet or server address") from exc
     if subnet.version != 4 or server.version != 4 or server.ip not in subnet or server.network != subnet:
         raise AwgctlError("server address must use the managed IPv4 subnet prefix")
-    validate_endpoint(str(config["endpoint"]))
-    port = config["listen_port"]
+    if not isinstance(result["endpoint"], str):
+        raise AwgctlError("endpoint must be text")
+    validate_endpoint(result["endpoint"])
+    port = result["listen_port"]
     if not isinstance(port, int) or isinstance(port, bool) or not 1 <= port <= 65535:
         raise AwgctlError("listen_port must be an integer from 1 to 65535")
-    mtu = config["mtu"]
+    mtu = result["mtu"]
     if not isinstance(mtu, int) or isinstance(mtu, bool) or not 576 <= mtu <= 9000:
         raise AwgctlError("mtu must be an integer from 576 to 9000")
-    keepalive = config["keepalive"]
+    keepalive = result["keepalive"]
     if not isinstance(keepalive, int) or isinstance(keepalive, bool) or not 0 <= keepalive <= 65535:
         raise AwgctlError("keepalive must be an integer from 0 to 65535")
-    validate_dns(config["dns"])
-    if not isinstance(config["use_psk"], bool):
+    if not isinstance(result["dns"], list):
+        raise AwgctlError("dns must be a list")
+    result["dns"] = validate_dns(result["dns"])
+    if not isinstance(result["use_psk"], bool):
         raise AwgctlError("use_psk must be boolean")
-    obfuscation = config["obfuscation"]
-    if set(obfuscation) != set(OBFUSCATION_FIELDS):
-        raise AwgctlError("classic AmneziaWG obfuscation fields are incomplete or unexpected")
-    for field in OBFUSCATION_FIELDS:
-        value = obfuscation[field]
-        if not isinstance(value, int) or isinstance(value, bool) or not 0 <= value <= 0xFFFFFFFF:
-            raise AwgctlError(f"invalid obfuscation value: {field}")
-    if obfuscation["Jmin"] > obfuscation["Jmax"]:
-        raise AwgctlError("Jmin must not exceed Jmax")
-    blocked = tuple(str(ipaddress.ip_network(value, strict=True)) for value in config["blocked_forward_ipv4"])
+    if schema == 1:
+        result["obfuscation"] = {
+            "mode": "classic",
+            "profile": _classic_profile(result["obfuscation"]),
+        }
+    else:
+        result["obfuscation"] = _normalize_obfuscation(result["obfuscation"], mtu=mtu)
+    try:
+        blocked = tuple(str(ipaddress.ip_network(value, strict=True)) for value in result["blocked_forward_ipv4"])
+    except (TypeError, ValueError) as exc:
+        raise AwgctlError("blocked_forward_ipv4 is invalid") from exc
     if blocked != BLOCKED_FORWARD_IPV4:
         raise AwgctlError("blocked_forward_ipv4 does not match the managed isolation policy")
     expected_paths = {
@@ -512,9 +943,105 @@ def validate_server_config(config: dict[str, Any]) -> dict[str, Any]:
         "revoked": str(REVOKED),
         "backups": str(BACKUPS),
     }
-    if config["paths"] != expected_paths:
+    if not isinstance(result["paths"], dict) or result["paths"] != expected_paths:
         raise AwgctlError("managed paths differ from the fixed production layout")
-    return config
+    result["schema_version"] = 2
+    return result
+
+
+def validate_server_config(config: dict[str, Any]) -> dict[str, Any]:
+    return normalize_server_config(config)
+
+
+def build_russia_ios_obfuscation(
+    header_protection_key_path: pathlib.Path,
+    *,
+    random_source: Any | None = None,
+    token_bytes: Any = secrets.token_bytes,
+    mtu: int,
+) -> dict[str, Any]:
+    """Create the initial AWG 3.1 profile using only CSPRNG-derived variation."""
+    source = random_source or secrets.SystemRandom()
+    entropy = token_bytes(32)
+    if not isinstance(entropy, bytes) or len(entropy) != 32:
+        raise AwgctlError("CSPRNG returned invalid profile entropy")
+    transaction_id = entropy[:2]
+    label = bytes(ord("a") + (value % 26) for value in entropy[2:10])
+    address = entropy[-4:]
+    qname = bytes([len(label)]) + label + b"\x03cdn\x00"
+    dns_packet = (
+        transaction_id
+        + b"\x81\x80\x00\x01\x00\x01\x00\x00\x00\x00"
+        + qname
+        + b"\x00\x01\x00\x01"
+        + b"\xc0\x0c\x00\x01\x00\x01\x00\x00\x00\x3c\x00\x04"
+        + address
+    )
+    jc = source.randint(6, 12)
+    s1 = source.randint(20, 120)
+    s2 = source.randint(20, 120)
+    while s1 + 56 == s2:
+        s2 = source.randint(20, 120)
+    parameters: dict[str, Any] = {
+        "Jc": jc,
+        "Jmin": 8,
+        "Jmax": 80,
+        "S1": s1,
+        "S2": s2,
+        "S3": source.randint(12, 60),
+        "S4": source.randint(12, 30),
+        "H1": 1,
+        "H2": 2,
+        "H3": 3,
+        "H4": 4,
+        "I1": f"<b 0x{dns_packet.hex()}>",
+        "I2": None,
+        "I3": None,
+        "I4": None,
+        "I5": None,
+        "ContentPaddingAddition": {"min": 0, "max": 64},
+        "RekeyAfterTime": {"min": 105, "max": 135},
+        "RekeyTimeout": {"min": 4, "max": 7},
+        "RejectAfterTime": {"min": 165, "max": 195},
+        "KeepaliveTimeout": {"min": 8, "max": 12},
+        "MaxHandshakeAttempts": {"min": 15, "max": 21},
+        "RandomTrailers": False,
+        "DisableCookies": True,
+    }
+    value = {
+        "mode": "awg31",
+        "profile": {
+            "schema_version": 1,
+            "name": "russia-ios-v1",
+            "parameters": parameters,
+            "header_protection_key_path": str(header_protection_key_path),
+        },
+    }
+    return _normalize_obfuscation(value, mtu=mtu)
+
+
+def prepare_awg31_profile(
+    *,
+    key_path: pathlib.Path = HEADER_PROTECTION_KEY,
+    mtu: int,
+    capability_checker: Any = require_awg31_capability,
+    random_source: Any | None = None,
+    profile_token_bytes: Any = secrets.token_bytes,
+    key_token_bytes: Any = secrets.token_bytes,
+) -> tuple[dict[str, Any], str]:
+    """Prepare validated non-live profile material after the source-policy gate."""
+    capability_checker()
+    obfuscation = build_russia_ios_obfuscation(
+        key_path,
+        random_source=random_source,
+        token_bytes=profile_token_bytes,
+        mtu=mtu,
+    )
+    fingerprint_value = write_header_protection_key(
+        key_path,
+        token_bytes=key_token_bytes,
+    )
+    return obfuscation, fingerprint_value
 
 
 def generate_classic_obfuscation(random_source: Any | None = None) -> dict[str, int]:
@@ -597,6 +1124,109 @@ def load_config() -> dict[str, Any]:
     except (OSError, json.JSONDecodeError) as exc:
         raise AwgctlError("cannot read managed server configuration") from exc
     return validate_server_config(config)
+
+
+def _render_config(config: dict[str, Any]) -> dict[str, Any]:
+    if "schema_version" in config:
+        return normalize_server_config(config)
+    legacy = {
+        "schema_version": 1,
+        "interface": "awg0",
+        "subnet": "10.0.0.0/24",
+        "server_address": "10.0.0.1/24",
+        "external_interface": "eth0",
+        "use_psk": True,
+        "blocked_forward_ipv4": list(BLOCKED_FORWARD_IPV4),
+        "paths": {
+            "runtime_config": str(RUNTIME_CONFIG),
+            "generated_config": str(GENERATED_CONFIG),
+            "server_private_key": str(SERVER_PRIVATE),
+            "server_public_key": str(SERVER_PUBLIC),
+            "clients": str(CLIENTS),
+            "client_keys": str(CLIENT_KEYS),
+            "revoked": str(REVOKED),
+            "backups": str(BACKUPS),
+        },
+        **config,
+    }
+    return normalize_server_config(legacy)
+
+
+def _native_range(value: int | dict[str, int]) -> str:
+    if isinstance(value, int):
+        return str(value)
+    return f"{value['min']}-{value['max']}"
+
+
+def effective_obfuscation(
+    config: dict[str, Any], *, header_protection_key: bytes | None = None
+) -> dict[str, str]:
+    """Return the single canonical native model shared by every renderer."""
+    if set(config) == {"obfuscation"}:
+        supplied = config["obfuscation"]
+        if isinstance(supplied, dict) and set(supplied) == set(OBFUSCATION_FIELDS):
+            obfuscation = {"mode": "classic", "profile": _classic_profile(supplied)}
+        else:
+            obfuscation = _normalize_obfuscation(supplied, mtu=1280)
+    else:
+        obfuscation = _render_config(config)["obfuscation"]
+    parameters = obfuscation["profile"]["parameters"]
+    if obfuscation["mode"] == "classic":
+        if header_protection_key is not None:
+            raise AwgctlError("classic mode cannot use a header-protection key")
+        return {field: str(parameters[field]) for field in OBFUSCATION_FIELDS}
+    if header_protection_key is None:
+        raise AwgctlError("AWG 3.1 rendering requires explicit header-protection key material")
+    if not isinstance(header_protection_key, bytes) or len(header_protection_key) != 32:
+        raise AwgctlError("invalid explicit header-protection key material")
+    result: dict[str, str] = {
+        field: str(parameters[field]) for field in AWG31_INTEGER_FIELDS
+    }
+    result.update({field: _native_range(parameters[field]) for field in AWG31_HEADER_FIELDS})
+    result.update(
+        {
+            field: parameters[field]
+            for field in AWG31_CPS_FIELDS
+            if parameters[field] is not None
+        }
+    )
+    result["HeaderProtectionKey"] = base64.b64encode(header_protection_key).decode("ascii")
+    result.update({field: _native_range(parameters[field]) for field in AWG31_RANGE_FIELDS})
+    result.update(
+        {field: "on" if parameters[field] else "off" for field in AWG31_BOOLEAN_FIELDS}
+    )
+    return result
+
+
+def canonical_obfuscation_lines(
+    config: dict[str, Any], *, header_protection_key: bytes | None = None
+) -> list[str]:
+    return [
+        f"{field} = {value}"
+        for field, value in effective_obfuscation(
+            config, header_protection_key=header_protection_key
+        ).items()
+    ]
+
+
+def header_protection_key_for_config(config: dict[str, Any]) -> bytes | None:
+    normalized = _render_config(config)
+    if normalized["obfuscation"]["mode"] == "classic":
+        return None
+    path = pathlib.Path(
+        normalized["obfuscation"]["profile"]["header_protection_key_path"]
+    )
+    return read_header_protection_key(path)
+
+
+def obfuscation_status(config: dict[str, Any]) -> dict[str, str]:
+    normalized = _render_config(config)
+    profile = normalized["obfuscation"]["profile"]
+    result = {"mode": normalized["obfuscation"]["mode"], "profile": profile["name"]}
+    if normalized["obfuscation"]["mode"] == "awg31":
+        material = read_header_protection_key(pathlib.Path(profile["header_protection_key_path"]))
+        result["header_protection_key_fingerprint"] = header_protection_fingerprint(material)
+    return result
 
 
 def parse_awg_config(text: str) -> dict[str, list[dict[str, str]]]:
@@ -684,12 +1314,9 @@ def render_server_config(
     clients: Sequence[dict[str, Any]],
     *,
     now: dt.datetime | None = None,
+    header_protection_key: bytes | None = None,
 ) -> str:
-    validate_server_config({"schema_version": 1, "blocked_forward_ipv4": list(BLOCKED_FORWARD_IPV4), "paths": {
-        "runtime_config": str(RUNTIME_CONFIG), "generated_config": str(GENERATED_CONFIG),
-        "server_private_key": str(SERVER_PRIVATE), "server_public_key": str(SERVER_PUBLIC),
-        "clients": str(CLIENTS), "client_keys": str(CLIENT_KEYS), "revoked": str(REVOKED),
-        "backups": str(BACKUPS)}, **config}) if "schema_version" not in config else validate_server_config(config)
+    config = _render_config(config)
     validate_key(server_private, "server private key")
     lines = [
         "[Interface]",
@@ -698,7 +1325,11 @@ def render_server_config(
         f"PrivateKey = {server_private}",
         f"MTU = {config['mtu']}",
     ]
-    lines.extend(f"{field} = {config['obfuscation'][field]}" for field in OBFUSCATION_FIELDS)
+    lines.extend(
+        canonical_obfuscation_lines(
+            config, header_protection_key=header_protection_key
+        )
+    )
     lines.extend([
         "PostUp = /opt/amneziawg/libexec/awgctl-internal _firewall up",
         "PostDown = /opt/amneziawg/libexec/awgctl-internal _firewall down",
@@ -724,8 +1355,15 @@ def render_server_config(
 
 
 def render_client_config(
-    config: dict[str, Any], private_key: str, psk: str | None, server_public: str, address: str
+    config: dict[str, Any],
+    private_key: str,
+    psk: str | None,
+    server_public: str,
+    address: str,
+    *,
+    header_protection_key: bytes | None = None,
 ) -> str:
+    config = _render_config(config)
     validate_key(private_key, "client private key")
     validate_key(server_public, "server public key")
     if config["use_psk"]:
@@ -740,7 +1378,11 @@ def render_client_config(
         f"DNS = {', '.join(config['dns'])}",
         f"MTU = {config['mtu']}",
     ]
-    lines.extend(f"{field} = {config['obfuscation'][field]}" for field in OBFUSCATION_FIELDS)
+    lines.extend(
+        canonical_obfuscation_lines(
+            config, header_protection_key=header_protection_key
+        )
+    )
     lines.extend([
         "",
         "[Peer]",
@@ -853,8 +1495,13 @@ def render_current_server(
     *,
     now: dt.datetime | None = None,
 ) -> str:
+    config = load_config()
     return render_server_config(
-        load_config(), server_private_key(), server_records_for_render(clients), now=now
+        config,
+        server_private_key(),
+        server_records_for_render(clients),
+        now=now,
+        header_protection_key=header_protection_key_for_config(config),
     )
 
 
@@ -1156,7 +1803,14 @@ def write_client_state(
     atomic_write(key_dir / "public", public + "\n", 0o600)
     if psk:
         atomic_write(key_dir / "psk", psk + "\n", 0o600)
-    profile = profile_text or render_client_config(config, private, psk, server_public_key(), address)
+    profile = profile_text or render_client_config(
+        config,
+        private,
+        psk,
+        server_public_key(),
+        address,
+        header_protection_key=header_protection_key_for_config(config),
+    )
     atomic_write(client_dir / f"{name}.conf", profile, 0o600)
     generate_qr(profile, client_dir / f"{name}.png")
     atomic_json(client_dir / "metadata.json", metadata, 0o600)
@@ -1260,18 +1914,53 @@ def validate_restore_stage(stage: pathlib.Path) -> dict[str, Any]:
         generated_nft = (stage / "generated/nftables.nft").read_text(encoding="utf-8")
     except (OSError, UnicodeError, json.JSONDecodeError) as exc:
         raise AwgctlError("backup is missing required managed state") from exc
-    validate_server_config(config)
+    config = validate_server_config(config)
     validate_key(server_private, "server private key")
     validate_key(server_public, "server public key")
     derived_public = run(["awg", "pubkey"], input_data=(server_private + "\n").encode("ascii")).stdout.decode().strip()
     if derived_public != server_public:
         raise AwgctlError("backup server keypair does not match")
-    validate_native_server(generated_server)
-    validate_nftables_text(generated_nft)
     parsed = parse_awg_config(generated_server)
+    unknown_sections = sorted(set(parsed) - {"Interface", "Peer"})
+    if unknown_sections:
+        raise AwgctlError("backup generated configuration has unsupported sections")
     interface_sections = parsed.get("Interface", [])
     if len(interface_sections) != 1 or interface_sections[0].get("PrivateKey") != server_private:
         raise AwgctlError("backup generated configuration does not use the backed-up server key")
+    header_key = None
+    if config["obfuscation"]["mode"] == "awg31":
+        header_key = read_header_protection_key(
+            stage / "keys/server/header-protection",
+            expected_uid=os.geteuid(),
+            expected_gid=os.getegid(),
+        )
+    expected_obfuscation = effective_obfuscation(
+        config,
+        header_protection_key=header_key,
+    )
+    server_interface_fields = {
+        "Address",
+        "ListenPort",
+        "PrivateKey",
+        "MTU",
+        "PostUp",
+        "PostDown",
+        *expected_obfuscation,
+    }
+    server_peer_fields = {"PublicKey", "PresharedKey", "AllowedIPs"}
+    if set(interface_sections[0]) - server_interface_fields or any(
+        set(peer) - server_peer_fields for peer in parsed.get("Peer", [])
+    ):
+        raise AwgctlError("backup generated configuration has unsupported directives")
+    rendered_obfuscation = {
+        field: interface_sections[0].get(field) for field in expected_obfuscation
+    }
+    if rendered_obfuscation != expected_obfuscation:
+        raise AwgctlError(
+            "backup generated configuration header-protection or obfuscation differs from managed state"
+        )
+    validate_native_server(generated_server)
+    validate_nftables_text(generated_nft)
     return config
 
 
@@ -1475,7 +2164,7 @@ def extract_legacy_state(server_text: str, client_text: str, external_interface:
         "blocked_forward_ipv4": list(BLOCKED_FORWARD_IPV4),
         "paths": paths,
     }
-    validate_server_config(config)
+    config = validate_server_config(config)
     return {
         "config": config,
         "server_private": server_private,
@@ -1538,8 +2227,13 @@ def parse_import_profile(
     *,
     expected_server_public: str,
     derive_public: Any | None = None,
+    header_protection_key: bytes | None = None,
 ) -> dict[str, Any]:
     """Validate a client profile against managed server semantics."""
+    config = _render_config(config)
+    expected_obfuscation = effective_obfuscation(
+        config, header_protection_key=header_protection_key
+    )
     parsed = parse_awg_config(profile_text)
     unknown_sections = sorted(set(parsed) - {"Interface", "Peer"})
     if unknown_sections:
@@ -1550,7 +2244,7 @@ def parse_import_profile(
         raise AwgctlError("client profile must contain exactly one Interface and one Peer")
     interface = interfaces[0]
     peer = peers[0]
-    interface_fields = {"PrivateKey", "Address", "DNS", "MTU", *config.get("obfuscation", {})}
+    interface_fields = {"PrivateKey", "Address", "DNS", "MTU", *expected_obfuscation}
     peer_fields = {"PublicKey", "PresharedKey", "Endpoint", "AllowedIPs", "PersistentKeepalive"}
     unknown_interface = sorted(set(interface) - interface_fields)
     unknown_peer = sorted(set(peer) - peer_fields)
@@ -1562,20 +2256,20 @@ def parse_import_profile(
         private = validate_key(interface["PrivateKey"], "client private key")
         address = ipaddress.ip_interface(interface["Address"])
         mtu = int(interface["MTU"])
-        profile_obfuscation = {field: int(interface[field]) for field in OBFUSCATION_FIELDS}
+        profile_obfuscation = {field: interface[field] for field in expected_obfuscation}
         server_public = validate_key(peer["PublicKey"], "server public key")
         endpoint_host, endpoint_port_text = peer["Endpoint"].rsplit(":", 1)
         endpoint_port = int(endpoint_port_text)
         keepalive = int(peer["PersistentKeepalive"])
     except (KeyError, ValueError) as exc:
-        raise AwgctlError("client profile is missing required classic AmneziaWG fields") from exc
+        raise AwgctlError("client profile is missing required AmneziaWG fields") from exc
     if address.version != 4 or address.network.prefixlen != 32:
         raise AwgctlError("client profile address must be an IPv4 /32")
     if validate_dns([value.strip() for value in interface["DNS"].split(",")]) != config["dns"]:
         raise AwgctlError("client profile DNS differs from managed state")
     if mtu != config["mtu"]:
         raise AwgctlError("client profile MTU differs from managed state")
-    if profile_obfuscation != config["obfuscation"]:
+    if profile_obfuscation != expected_obfuscation:
         raise AwgctlError("client profile obfuscation differs from managed state")
     if server_public != expected_server_public:
         raise AwgctlError("client profile server public key differs from managed identity")
@@ -1602,7 +2296,14 @@ def parse_import_profile(
         "public_key": public,
         "psk": psk,
         "address": str(address),
-        "profile": render_client_config(canonical_config, private, psk, server_public, str(address)),
+        "profile": render_client_config(
+            canonical_config,
+            private,
+            psk,
+            server_public,
+            str(address),
+            header_protection_key=header_protection_key,
+        ),
     }
 
 
@@ -1639,6 +2340,7 @@ def cmd_aws_rule(config: dict[str, Any] | None = None, *, as_json: bool = False)
 
 def cmd_status(args: argparse.Namespace) -> int:
     config = load_config()
+    obfuscation_data = obfuscation_status(config)
     boundary = ingress_boundary_attestation()
     active, enabled = systemctl_state(config["interface"])
     link_result = run(["ip", "-brief", "link", "show", config["interface"]], check=False)
@@ -1669,6 +2371,7 @@ def cmd_status(args: argparse.Namespace) -> int:
         "endpoint": {"host": config["endpoint"], "port": config["listen_port"]},
         "public_ipv4": public_ip,
         "subnet": config["subnet"],
+        "obfuscation": obfuscation_data,
         "forwarding": forwarding,
         "nat": nft_table_active("amneziawg_nat"),
         "isolation": nft_table_active("amneziawg_forward"),
@@ -1693,6 +2396,15 @@ def cmd_status(args: argparse.Namespace) -> int:
     print(f"  endpoint:       {config['endpoint']}:{config['listen_port']}")
     print(f"  public IPv4:    {public_ip}")
     print(f"  subnet:         {config['subnet']}")
+    print(
+        f"  obfuscation:    {obfuscation_data['mode']} "
+        f"({obfuscation_data['profile']})"
+    )
+    if "header_protection_key_fingerprint" in obfuscation_data:
+        print(
+            "  header key:     sha256:"
+            + obfuscation_data["header_protection_key_fingerprint"]
+        )
     print(f"  forwarding:     {'enabled' if forwarding else 'disabled'}")
     print(f"  NAT:            {'active' if nft_table_active('amneziawg_nat') else 'inactive'}")
     print(f"  isolation:      {'active' if nft_table_active('amneziawg_forward') else 'inactive'}")
@@ -1928,12 +2640,18 @@ def cmd_health(args: argparse.Namespace) -> int:
         profile_drift: list[str] = []
         external_count = 0
         server_public = server_public_key()
+        header_key = header_protection_key_for_config(config)
         for client in clients:
             if client.get("management", "managed") != "managed":
                 external_count += 1
                 continue
             expected_profile = render_client_config(
-                config, client["private_key"], client.get("psk"), server_public, client["address"]
+                config,
+                client["private_key"],
+                client.get("psk"),
+                server_public,
+                client["address"],
+                header_protection_key=header_key,
             ).encode()
             actual_profile = (CLIENTS / client["name"] / f"{client['name']}.conf").read_bytes()
             if expected_profile != actual_profile:
@@ -2412,14 +3130,24 @@ def cmd_client_add(args: argparse.Namespace) -> int:
                 expires=getattr(args, "expires", None),
             )
             new_clients = load_clients(include_secrets=True)
-            new_server = render_server_config(config, server_private_key(), new_clients)
+            new_server = render_server_config(
+                config,
+                server_private_key(),
+                new_clients,
+                header_protection_key=header_protection_key_for_config(config),
+            )
             active = commit_server_config(new_server, runtime_action="reload")
             committed = True
             if active:
                 verify_peer_state(config["interface"], public, present=True)
         except Exception:
             if committed:
-                rollback_text = render_server_config(config, server_private_key(), old_clients)
+                rollback_text = render_server_config(
+                    config,
+                    server_private_key(),
+                    old_clients,
+                    header_protection_key=header_protection_key_for_config(config),
+                )
                 with contextlib.suppress(Exception):
                     commit_server_config(rollback_text, runtime_action="reload")
             remove_client_state(name)
@@ -2514,6 +3242,7 @@ def cmd_client_import(args: argparse.Namespace) -> int:
             profile_text,
             config,
             expected_server_public=server_public_key(),
+            header_protection_key=header_protection_key_for_config(config),
         )
         peer = _server_peer_for_public(imported["public_key"])
         if peer.get("AllowedIPs") != imported["address"]:
@@ -2735,14 +3464,24 @@ def cmd_client_revoke(args: argparse.Namespace) -> int:
         remaining = [client for client in old_clients if client["name"] != name]
         committed = False
         try:
-            new_server = render_server_config(config, server_private_key(), remaining)
+            new_server = render_server_config(
+                config,
+                server_private_key(),
+                remaining,
+                header_protection_key=header_protection_key_for_config(config),
+            )
             active = commit_server_config(new_server, runtime_action="reload")
             committed = True
             if active:
                 verify_peer_state(config["interface"], target["public_key"], present=False)
         except Exception:
             if committed:
-                rollback_text = render_server_config(config, server_private_key(), old_clients)
+                rollback_text = render_server_config(
+                    config,
+                    server_private_key(),
+                    old_clients,
+                    header_protection_key=header_protection_key_for_config(config),
+                )
                 with contextlib.suppress(Exception):
                     commit_server_config(rollback_text, runtime_action="reload")
             shutil.rmtree(archive, ignore_errors=True)
@@ -2839,7 +3578,12 @@ def cmd_client_rotate(args: argparse.Namespace) -> int:
             metadata["previous_public_key_fingerprint"] = target["public_key_fingerprint"]
             atomic_json(metadata_path, metadata, 0o600)
             new_clients = load_clients(include_secrets=True)
-            new_server = render_server_config(config, server_private_key(), new_clients)
+            new_server = render_server_config(
+                config,
+                server_private_key(),
+                new_clients,
+                header_protection_key=header_protection_key_for_config(config),
+            )
             active = commit_server_config(new_server, runtime_action="reload")
             committed = True
             if active:
@@ -2848,7 +3592,12 @@ def cmd_client_rotate(args: argparse.Namespace) -> int:
                     raise AwgctlError("rotated peer state did not verify in the running interface")
         except Exception:
             if committed:
-                rollback_text = render_server_config(config, server_private_key(), old_clients)
+                rollback_text = render_server_config(
+                    config,
+                    server_private_key(),
+                    old_clients,
+                    header_protection_key=header_protection_key_for_config(config),
+                )
                 with contextlib.suppress(Exception):
                     commit_server_config(rollback_text, runtime_action="reload")
             restore_client_from_archive(name, archive)
@@ -3124,9 +3873,15 @@ def cmd_config_set(args: argparse.Namespace) -> int:
         artifacts = snapshot_client_artifacts(clients)
         backup = create_backup()
         server_public = server_public_key()
+        header_key = header_protection_key_for_config(new_config)
         new_profiles = {
             client["name"]: render_client_config(
-                new_config, client["private_key"], client.get("psk"), server_public, client["address"]
+                new_config,
+                client["private_key"],
+                client.get("psk"),
+                server_public,
+                client["address"],
+                header_protection_key=header_key,
             )
             for client in clients
             if client.get("management", "managed") == "managed"
@@ -3141,7 +3896,12 @@ def cmd_config_set(args: argparse.Namespace) -> int:
             for client in clients
             if client.get("management", "managed") == "managed"
         }
-        new_server = render_server_config(new_config, server_private_key(), clients)
+        new_server = render_server_config(
+            new_config,
+            server_private_key(),
+            clients,
+            header_protection_key=header_key,
+        )
         new_nft = render_nftables_config(new_config)
         validate_nftables_text(new_nft)
         try:
@@ -3501,7 +4261,7 @@ def cmd_self_test(args: argparse.Namespace) -> int:
             "host_interface_unchanged": config["interface"],
             "steps": [
                 "create two temporary Linux network namespaces",
-                "create ephemeral keys and a classic-parameter AmneziaWG tunnel",
+                "create ephemeral keys and a state-derived AmneziaWG tunnel",
                 "send ICMP echo traffic through the isolated tunnel",
                 "delete both namespaces and all ephemeral credentials",
             ],
@@ -3513,7 +4273,12 @@ def cmd_self_test(args: argparse.Namespace) -> int:
             print("No state was changed.")
         return 0
     with mutation_lock():
-        report = run_namespace_selftest(config["obfuscation"])
+        if config["obfuscation"]["mode"] == "awg31":
+            require_awg31_capability()
+        report = run_namespace_selftest(
+            config["obfuscation"],
+            header_protection_key=header_protection_key_for_config(config),
+        )
     audit("experimental namespace self-test passed")
     if getattr(args, "json", False):
         print(json.dumps(json_envelope("self-test", data=report), indent=2, sort_keys=True))
@@ -3579,7 +4344,12 @@ def cmd_initialize_fresh(args: argparse.Namespace) -> int:
                 owner=getattr(args, "owner", None),
                 device=getattr(args, "device", None),
             )
-            server_text = render_server_config(config, server_private, [client])
+            server_text = render_server_config(
+                config,
+                server_private,
+                [client],
+                header_protection_key=header_protection_key_for_config(config),
+            )
             nft_text = render_nftables_config(config)
             validate_native_server(server_text)
             validate_nftables_text(nft_text)
@@ -3696,7 +4466,12 @@ def cmd_migrate_existing(args: argparse.Namespace) -> int:
             existing_png = client_path.with_suffix(".png")
             if existing_png.is_file():
                 atomic_write(CLIENTS / client_name / f"{client_name}.png", existing_png.read_bytes(), 0o600)
-            rendered = render_server_config(imported["config"], imported["server_private"], [client_record])
+            rendered = render_server_config(
+                imported["config"],
+                imported["server_private"],
+                [client_record],
+                header_protection_key=header_protection_key_for_config(imported["config"]),
+            )
             if semantic_signature(server_text) != semantic_signature(rendered):
                 raise AwgctlError("generated server configuration does not preserve existing semantics")
             nft_text = render_nftables_config(imported["config"])

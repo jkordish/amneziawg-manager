@@ -239,6 +239,7 @@ class ClientAddWizardTests(unittest.TestCase):
                 mock.patch.object(awgctl, "generate_key_material", return_value=("private", "public", "psk")),
                 mock.patch.object(awgctl, "write_client_state"),
                 mock.patch.object(awgctl, "server_private_key", return_value="server-private"),
+                mock.patch.object(awgctl, "header_protection_key_for_config", return_value=None),
                 mock.patch.object(awgctl, "render_server_config", return_value="server-config"),
                 mock.patch.object(awgctl, "commit_server_config", return_value=True),
                 mock.patch.object(awgctl, "verify_peer_state"),
@@ -563,7 +564,12 @@ class OperationalContractTests(unittest.TestCase):
             "Endpoint = staging.honeywire.ai:55323\nAllowedIPs = 0.0.0.0/0, ::/0\nPersistentKeepalive = 25\n"
         )
         imported = awgctl.extract_legacy_state(server, client, "ens5")
-        self.assertEqual(imported["config"]["obfuscation"], self_config_obfuscation())
+        self.assertEqual(imported["config"]["schema_version"], 2)
+        self.assertEqual(imported["config"]["obfuscation"]["mode"], "classic")
+        self.assertEqual(
+            imported["config"]["obfuscation"]["profile"]["parameters"],
+            self_config_obfuscation(),
+        )
         self.assertEqual(imported["config"]["endpoint"], "staging.honeywire.ai")
         self.assertEqual(imported["config"]["dns"], ["1.1.1.1", "1.0.0.1"])
         self.assertEqual(imported["client_psk"], key(3))
