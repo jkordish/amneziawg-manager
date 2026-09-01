@@ -82,6 +82,7 @@ class SystemdSandboxTests(unittest.TestCase):
             "RuntimeDirectory=awgctl",
             "RuntimeDirectoryMode=0700",
             "RuntimeDirectoryPreserve=yes",
+            "PassEnvironment=AWGCTL_FIREWALL_HOOK_OPERATION_ID",
             "ProtectHome=yes",
             "PrivateDevices=yes",
             "ProtectKernelModules=yes",
