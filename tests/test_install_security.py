@@ -326,7 +326,315 @@ class IdentityPlanTests(unittest.TestCase):
                 copy_validated_worker_output(link, root / "copy-link", expected_uid=os.getuid(), max_size=1024)
 
 
+class _StatefulTimerRunner:
+    """Small systemd state model for transactional expiry-timer tests."""
+
+    def __init__(
+        self,
+        timer_path: pathlib.Path,
+        *,
+        unit_file_state: str,
+        active_state: str,
+    ) -> None:
+        self.timer_path = timer_path
+        self.unit_file_state = unit_file_state
+        self.active_state = active_state
+        self.commands: list[tuple[str, ...]] = []
+        self.noop_stop = False
+        self.fail_start = False
+        self.fail_stop = False
+
+    def __call__(self, argv):
+        command = tuple(argv)
+        self.commands.append(command)
+        if command[:2] == ("systemctl", "is-enabled"):
+            code = {
+                "enabled": 0,
+                "enabled-runtime": 0,
+                "disabled": 1,
+                "not-found": 4,
+            }[self.unit_file_state]
+            return subprocess.CompletedProcess(
+                argv, code, (self.unit_file_state + "\n").encode(), b""
+            )
+        if command[:2] == ("systemctl", "is-active"):
+            code = {"active": 0, "inactive": 3}[self.active_state]
+            return subprocess.CompletedProcess(
+                argv, code, (self.active_state + "\n").encode(), b""
+            )
+        if command == ("systemctl", "daemon-reload"):
+            if self.timer_path.exists() and self.unit_file_state == "not-found":
+                self.unit_file_state = "disabled"
+            elif not self.timer_path.exists():
+                self.unit_file_state = "not-found"
+        elif command[:2] == ("systemctl", "enable"):
+            self.unit_file_state = (
+                "enabled-runtime" if "--runtime" in command else "enabled"
+            )
+        elif command[:2] == ("systemctl", "disable"):
+            if "--runtime" in command:
+                if self.unit_file_state == "enabled-runtime":
+                    self.unit_file_state = "disabled"
+            elif self.unit_file_state == "enabled":
+                self.unit_file_state = "disabled"
+        elif command[:2] == ("systemctl", "start"):
+            self.active_state = "active"
+            if self.fail_start:
+                raise RuntimeError("injected start failure")
+        elif command[:2] == ("systemctl", "stop"):
+            if self.fail_stop:
+                raise RuntimeError("injected rollback stop failure")
+            if not self.noop_stop:
+                self.active_state = "inactive"
+        return subprocess.CompletedProcess(argv, 0, b"", b"")
+
+
 class HostConfigurationTests(unittest.TestCase):
+    def test_absent_not_found_timer_is_stopped_and_proven_after_outer_rollback(self):
+        from awginstall.host import HostPaths, configure_host, rollback_host_configuration
+        from awginstall.identity import IdentitySnapshot, UserRecord
+        from awginstall.settings import resolve_installation_settings
+
+        snapshot = IdentitySnapshot(
+            users={}, groups={}, locked_users=set(), supplementary_groups={}
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            paths = HostPaths.under(root)
+            runner = _StatefulTimerRunner(
+                paths.expiry_timer,
+                unit_file_state="not-found",
+                active_state="inactive",
+            )
+            settings = resolve_installation_settings(sudo_user=None)
+            with (
+                mock.patch(
+                    "awginstall.host._resolve_created_user",
+                    return_value=UserRecord(
+                        "awgctl",
+                        os.getuid(),
+                        os.getgid(),
+                        str(settings.staging_root),
+                        "/usr/sbin/nologin",
+                    ),
+                ),
+                mock.patch("awginstall.host._prepare_staging_root"),
+            ):
+                report = configure_host(
+                    settings,
+                    product_root=root / "opt/amneziawg",
+                    paths=paths,
+                    allow_existing=False,
+                    dry_run=False,
+                    snapshot=snapshot,
+                    runner=runner,
+                )
+                self.assertEqual(
+                    (runner.unit_file_state, runner.active_state),
+                    ("enabled", "active"),
+                )
+                rollback_host_configuration(report, runner=runner)
+
+            self.assertFalse(paths.expiry_timer.exists())
+            self.assertEqual(
+                (runner.unit_file_state, runner.active_state),
+                ("not-found", "inactive"),
+            )
+            self.assertIn(
+                ("systemctl", "stop", "amneziawg-client-expiry.timer"),
+                runner.commands,
+            )
+            final_probes = [
+                command
+                for command in runner.commands
+                if command[:2]
+                in {
+                    ("systemctl", "is-enabled"),
+                    ("systemctl", "is-active"),
+                }
+            ]
+            self.assertEqual(
+                final_probes[-2:],
+                [
+                    ("systemctl", "is-enabled", "amneziawg-client-expiry.timer"),
+                    ("systemctl", "is-active", "amneziawg-client-expiry.timer"),
+                ],
+            )
+
+    def test_present_timer_with_pre_reload_not_found_state_is_rejected_before_mutation(self):
+        from awginstall.host import HostConfigurationError, HostPaths, configure_host
+        from awginstall.identity import IdentitySnapshot, UserRecord
+        from awginstall.settings import resolve_installation_settings
+
+        snapshot = IdentitySnapshot(
+            users={}, groups={}, locked_users=set(), supplementary_groups={}
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            paths = HostPaths.under(root)
+            paths.expiry_timer.parent.mkdir(parents=True)
+            paths.expiry_timer.write_bytes(b"prior timer\n")
+            paths.expiry_timer.chmod(0o640)
+            runner = _StatefulTimerRunner(
+                paths.expiry_timer,
+                unit_file_state="not-found",
+                active_state="inactive",
+            )
+            settings = resolve_installation_settings(sudo_user=None)
+
+            with (
+                mock.patch(
+                    "awginstall.host._resolve_created_user",
+                    return_value=UserRecord(
+                        "awgctl",
+                        os.getuid(),
+                        os.getgid(),
+                        str(settings.staging_root),
+                        "/usr/sbin/nologin",
+                    ),
+                ),
+                mock.patch("awginstall.host._prepare_staging_root"),
+                self.assertRaisesRegex(
+                    HostConfigurationError, "present expiry timer.*not-found"
+                ),
+            ):
+                configure_host(
+                    settings,
+                    product_root=root / "opt/amneziawg",
+                    paths=paths,
+                    allow_existing=False,
+                    dry_run=False,
+                    snapshot=snapshot,
+                    runner=runner,
+                )
+
+            self.assertEqual(paths.expiry_timer.read_bytes(), b"prior timer\n")
+            self.assertEqual(paths.expiry_timer.stat().st_mode & 0o777, 0o640)
+            self.assertEqual(
+                runner.commands,
+                [
+                    ("systemctl", "is-enabled", "amneziawg-client-expiry.timer"),
+                    ("systemctl", "is-active", "amneziawg-client-expiry.timer"),
+                ],
+            )
+
+    def test_outer_rollback_detects_a_noop_systemctl_stop(self):
+        from awginstall.host import (
+            HostConfigurationError,
+            HostPaths,
+            configure_host,
+            rollback_host_configuration,
+        )
+        from awginstall.identity import IdentitySnapshot, UserRecord
+        from awginstall.settings import resolve_installation_settings
+
+        snapshot = IdentitySnapshot(
+            users={}, groups={}, locked_users=set(), supplementary_groups={}
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            paths = HostPaths.under(root)
+            runner = _StatefulTimerRunner(
+                paths.expiry_timer,
+                unit_file_state="not-found",
+                active_state="inactive",
+            )
+            settings = resolve_installation_settings(sudo_user=None)
+            with (
+                mock.patch(
+                    "awginstall.host._resolve_created_user",
+                    return_value=UserRecord(
+                        "awgctl",
+                        os.getuid(),
+                        os.getgid(),
+                        str(settings.staging_root),
+                        "/usr/sbin/nologin",
+                    ),
+                ),
+                mock.patch("awginstall.host._prepare_staging_root"),
+            ):
+                report = configure_host(
+                    settings,
+                    product_root=root / "opt/amneziawg",
+                    paths=paths,
+                    allow_existing=False,
+                    dry_run=False,
+                    snapshot=snapshot,
+                    runner=runner,
+                )
+                runner.noop_stop = True
+                with self.assertRaisesRegex(
+                    HostConfigurationError, "timer rollback postcondition.*active"
+                ):
+                    rollback_host_configuration(report, runner=runner)
+
+            self.assertEqual(
+                (runner.unit_file_state, runner.active_state),
+                ("not-found", "active"),
+            )
+
+    def test_inner_configuration_failure_surfaces_compensation_errors(self):
+        from awginstall.host import HostConfigurationError, HostPaths, configure_host
+        from awginstall.identity import IdentitySnapshot, UserRecord
+        from awginstall.settings import resolve_installation_settings
+
+        snapshot = IdentitySnapshot(
+            users={}, groups={}, locked_users=set(), supplementary_groups={}
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            paths = HostPaths.under(root)
+            paths.expiry_timer.parent.mkdir(parents=True)
+            paths.expiry_timer.write_bytes(b"prior timer\n")
+            runner = _StatefulTimerRunner(
+                paths.expiry_timer,
+                unit_file_state="disabled",
+                active_state="inactive",
+            )
+            runner.fail_start = True
+            runner.fail_stop = True
+            settings = resolve_installation_settings(sudo_user=None)
+            with (
+                mock.patch(
+                    "awginstall.host._resolve_created_user",
+                    return_value=UserRecord(
+                        "awgctl",
+                        os.getuid(),
+                        os.getgid(),
+                        str(settings.staging_root),
+                        "/usr/sbin/nologin",
+                    ),
+                ),
+                mock.patch("awginstall.host._prepare_staging_root"),
+                self.assertRaises(HostConfigurationError) as raised,
+            ):
+                configure_host(
+                    settings,
+                    product_root=root / "opt/amneziawg",
+                    paths=paths,
+                    allow_existing=False,
+                    dry_run=False,
+                    snapshot=snapshot,
+                    runner=runner,
+                )
+
+            self.assertIn("injected start failure", str(raised.exception))
+            self.assertIn("injected rollback stop failure", str(raised.exception))
+            last_stop = max(
+                index
+                for index, command in enumerate(runner.commands)
+                if command[:2] == ("systemctl", "stop")
+            )
+            for probe in ("is-enabled", "is-active"):
+                self.assertGreater(
+                    max(
+                        index
+                        for index, command in enumerate(runner.commands)
+                        if command[:2] == ("systemctl", probe)
+                    ),
+                    last_stop,
+                )
+
     def test_outer_rollback_restores_exact_prior_expiry_timer_states(self):
         from awginstall.host import HostPaths, configure_host, rollback_host_configuration
         from awginstall.identity import IdentitySnapshot, UserRecord
@@ -394,18 +702,30 @@ class HostConfigurationTests(unittest.TestCase):
                     if command == ("systemctl", "daemon-reload")
                 )
                 restoration = commands[final_reload + 1:]
+                final_probes = [
+                    command
+                    for command in restoration
+                    if command[:2]
+                    in {
+                        ("systemctl", "is-enabled"),
+                        ("systemctl", "is-active"),
+                    }
+                ]
                 if unit_file_state == "not-found":
-                    self.assertFalse(
-                        any(
-                            command[:2]
-                            in {
-                                ("systemctl", "enable"),
-                                ("systemctl", "disable"),
-                                ("systemctl", "start"),
-                                ("systemctl", "stop"),
-                            }
-                            for command in restoration
-                        )
+                    self.assertEqual(
+                        final_probes,
+                        [
+                            (
+                                "systemctl",
+                                "is-enabled",
+                                "amneziawg-client-expiry.timer",
+                            ),
+                            (
+                                "systemctl",
+                                "is-active",
+                                "amneziawg-client-expiry.timer",
+                            ),
+                        ],
                     )
                 else:
                     expected_enablement = {
@@ -425,6 +745,21 @@ class HostConfigurationTests(unittest.TestCase):
                     self.assertIn(
                         ("systemctl", expected_active, "amneziawg-client-expiry.timer"),
                         restoration,
+                    )
+                    self.assertEqual(
+                        final_probes,
+                        [
+                            (
+                                "systemctl",
+                                "is-enabled",
+                                "amneziawg-client-expiry.timer",
+                            ),
+                            (
+                                "systemctl",
+                                "is-active",
+                                "amneziawg-client-expiry.timer",
+                            ),
+                        ],
                     )
                 if file_exists:
                     self.assertEqual(paths.expiry_timer.read_text(), "prior timer\n")
